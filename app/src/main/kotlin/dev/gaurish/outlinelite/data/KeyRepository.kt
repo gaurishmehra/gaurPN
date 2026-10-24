@@ -66,7 +66,12 @@ object KeyRepository {
             val list = decodeKeys(prefs[KEYS]).filterNot { it.id == id }
             prefs[KEYS] = encodeKeys(list)
             if (prefs[ACTIVE] == id) {
-                prefs[ACTIVE] = list.firstOrNull()?.id
+                val next = list.firstOrNull()?.id
+                if (next != null) {
+                    prefs[ACTIVE] = next
+                } else {
+                    prefs.remove(ACTIVE)
+                }
             }
         }
     }

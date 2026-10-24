@@ -3,6 +3,7 @@ package dev.gaurish.outlinelite.tunnel
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -105,7 +106,7 @@ class TunnelService : VpnService() {
                 lastError = null
             )
         }
-        notifyState()
+        notifyExternal(this)
     }
 
     private fun stopTunnel() {

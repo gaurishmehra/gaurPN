@@ -9,7 +9,8 @@ import androidx.glance.GlanceId
 import androidx.glance.GlanceModifier
 import androidx.glance.GlanceTheme
 import androidx.glance.action.ActionParameters
-import androidx.glance.action.actionParameters
+import androidx.glance.action.actionParametersOf
+import androidx.glance.action.clickable
 import androidx.glance.appwidget.GlanceAppWidget
 import androidx.glance.appwidget.GlanceAppWidgetReceiver
 import androidx.glance.appwidget.action.ActionCallback
@@ -18,6 +19,7 @@ import androidx.glance.appwidget.cornerRadius
 import androidx.glance.appwidget.provideContent
 import androidx.glance.background
 import androidx.glance.layout.Alignment
+import androidx.glance.layout.Box
 import androidx.glance.layout.Column
 import androidx.glance.layout.Row
 import androidx.glance.layout.fillMaxSize
@@ -64,7 +66,7 @@ class OutlineWidget : GlanceAppWidget() {
                         style = TextStyle(
                             color = ColorProvider(Color(0xFFE7ECF3)),
                             fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
+                            fontWeight = FontWeight.Bold,
                         ),
                     )
                     Text(
@@ -81,13 +83,23 @@ class OutlineWidget : GlanceAppWidget() {
                         ),
                     )
                     androidx.glance.layout.Spacer(modifier = GlanceModifier.defaultWeight())
-                    Button(
-                        text = if (connected) "Disconnect" else "Connect",
-                        textColor = ColorProvider(Color(0xFF221602)),
-                        backgroundColor = ColorProvider(accent),
-                        modifier = GlanceModifier.fillMaxWidth(),
-                        action = actionRunCallback<ToggleAction>(actionParametersOf()),
-                    )
+                    Box(
+                        modifier = GlanceModifier
+                            .fillMaxWidth()
+                            .cornerRadius(14.dp)
+                            .background(ColorProvider(accent))
+                            .clickable(actionRunCallback<ToggleAction>(actionParametersOf())),
+                    ) {
+                        Text(
+                            if (connected) "Disconnect" else "Connect",
+                            modifier = GlanceModifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                            style = TextStyle(
+                                color = ColorProvider(Color(0xFF221602)),
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Bold,
+                            ),
+                        )
+                    }
                 }
             }
         }

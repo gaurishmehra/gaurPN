@@ -95,26 +95,31 @@ object SsKeyParser {
 
     /** Accepts `method:password`, percent-encoded within the URL, or base64 of that. */
     private fun decodeUserinfo(userinfo: String): Pair<String, String>? {
-        val direct = if (userinfo.contains(':')) {
-            val idx = userinfo.indexOf(':')
-            // Password may contain raw ':' after the first separator.
-            userinfo.substring(0, idx) to userinfo.substring(idx + 1)
-        } else {
-            val decoded = base64Decode(userinfo, urlSafe = true)
-                ?: base64Decode(userinfo, urlSafe = false)
-                ?: return null
-            val s = String(decoded, Charsets.UTF_8)
+        // Percent-encoded or raw plaintext: "method:password" — password may itself contain ':'.
+        if (userinfo.contains('%') || userinfo.contains(':')) {
+            val s = if (userinfo.contains('%')) urlDecode(userinfo) else userinfo
             val idx = s.indexOf(':')
             if (idx < 0) return null
-            s.substring(0, idx) to s.substring(idx + 1)
+            return s.substring(0, idx) to s.substring(idx + 1)
         }
-        return urlDecode(direct.first) to urlDecode(direct.second)
+        val decoded = base64Decode(userinfo, urlSafe = true)
+            ?: base64Decode(userinfo, urlSafe = false)
+            ?: return null
+        val s = String(decoded, Charsets.UTF_8)
+        val idx = s.indexOf(':')
+        if (idx < 0) return null
+        return s.substring(0, idx) to s.substring(idx + 1)
     }
 
     private fun urlDecode(s: String): String =
         runCatching { URLDecoder.decode(s, "UTF-8") }.getOrDefault(s)
 
     internal fun parseHostPort(href: String): Pair<String, Int>? {
+        val parsed = parseHostPortRaw(href) ?: return null
+        return if (parsed.second in 1..65535) parsed else null
+    }
+
+    private fun parseHostPortRaw(href: String): Pair<String, Int>? {
         val open = href.indexOf('[')
         if (open >= 0) {
             val close = href.indexOf(']') + 1
@@ -130,27 +135,18 @@ object SsKeyParser {
 
     private fun base64Decode(input: String, urlSafe: Boolean): ByteArray? {
         val alphabet = if (urlSafe) URL_ALPHABET else STD_ALPHABET
-        var pad = input.trim().length % 4
-        if (pad >= 2) {
-            // Tolerate missing padding, but reject garbage (any padding is fine at >2 modulo)
-        }
         if (input.isEmpty()) {
             return null
         }
         val clean = input.trim().replace("=", "")
-        val sb = StringBuilder()
+        val lookup = HashMap<String, Int>(alphabet.length)
+        for (i in alphabet.indices) lookup[alphabet[i].toString()] = i
+        var bitBuf = 0L
+        var bitCount = 0
+        val out = ArrayList<Byte>(clean.length * 6 / 8 + 1)
         for (c in clean) {
             val v = alphabet.indexOf(c)
             if (v < 0) return null
-            sb.append(v)
-        }
-        var bitBuf = 0L
-        var bitCount = 0
-        val out = ArrayList<Byte>(clean.size * 6 / 8 + 1)
-        val lookup = HashMap<String, Int>(alphabet.length)
-        for (i in alphabet.indices) lookup[alphabet[i].toString()] = i
-        for (c in clean) {
-            val v = lookup[c.toString()]!!
             bitBuf = (bitBuf shl 6) or v.toLong()
             bitCount += 6
             if (bitCount >= 8) {

@@ -1,5 +1,6 @@
 package dev.gaurish.outlinelite.tile
 
+import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import dev.gaurish.outlinelite.R
@@ -29,18 +30,16 @@ class QsTileService : TileService() {
             TunnelPhase.CONNECTED -> Tile.STATE_ACTIVE
             else -> Tile.STATE_INACTIVE
         }
-        tile.runCatchingTile {
-            subtitle = when (s.phase) {
-                TunnelPhase.CONNECTED -> s.activeName ?: getString(R.string.status_connected)
-                TunnelPhase.CONNECTING -> getString(R.string.status_connecting)
-                TunnelPhase.STOPPING -> getString(R.string.status_stopping)
-                TunnelPhase.DISCONNECTED -> s.activeName ?: getString(R.string.status_disconnected)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching {
+                tile.subtitle = when (s.phase) {
+                    TunnelPhase.CONNECTED -> s.activeName ?: getString(R.string.status_connected)
+                    TunnelPhase.CONNECTING -> getString(R.string.status_connecting)
+                    TunnelPhase.STOPPING -> getString(R.string.status_stopping)
+                    TunnelPhase.DISCONNECTED -> s.activeName ?: getString(R.string.status_disconnected)
+                }
             }
         }
-        updateTile()
-    }
-
-    private inline fun Tile.runCatchingTile(block: Tile.() -> Unit) {
-        runCatching { block() }
+        tile.updateTile()
     }
 }
