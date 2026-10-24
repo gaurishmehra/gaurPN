@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Outline Lite</string>
+    <string name="widget_description">Toggle and monitor your Outline connection</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_connect">Connect</string>
+    <string name="notif_connecting">Connecting…</string>
+    <string name="notif_connected">Connected to %1$s</string>
+    <string name="status_disconnected">Not connected</string>
+    <string name="status_connected">Protected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_stopping">Stopping…</string>
+    <string name="add_key_title">Add server</string>
+    <string name="add_key_hint">Paste an ss:// access key</string>
+    <string name="add_key_import">Import</string>
+    <string name="add_key_cancel">Cancel</string>
+    <string name="key_added">Server added</string>
+    <string name="key_invalid">That doesn\'t look like a valid ss:// key</string>
+    <string name="key_exists">This server is already in your list</string>
+    <string name="no_active_key">No server selected yet</string>
+</resources>

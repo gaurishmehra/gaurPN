@@ -1,0 +1,15 @@
+.gradle/
+build/
+buildSrc/build/
+.kotlin/
+local.properties
+.devcache/
+third_party/
+third_party
+go/outlinev/bin/
+go/*.aar
+app/libs/*.aar
+captures/
+.idea/
+*.iml
+.DS_Store
