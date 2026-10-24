@@ -1,28 +1,27 @@
 # gaurPN
 
-A custom Android client for **Outline (Shadowsocks)** — Material 3 dark UI,
-Quick Settings tile, background keep-alive, protected tun2socks engine.
+A custom Android client for Outline (Shadowsocks). Material 3 dark UI, a Quick
+Settings tile, background keep-alive, and a protected tun2socks engine.
 
 ## Why this exists
 
-The official Outline app works well but its UI is, honestly, bad. gaurPN keeps
-everything that makes Outline solid — the Go tunnel, protected sockets, AEAD
-ciphers — and replaces **all** of the app chrome with a UI that respects its
-users: calm dark neutrals, one accent, Material You on Android 12+, no
-congratulatory onboarding, no pointless chrome.
+I like the official Outline app. I don't like using it. Every session, I tap
+through screens, read labels I already know, and stare at an interface that
+looks the same on every phone. So I kept the part Jigsaw got right (the Go
+tunnel and its protected sockets) and rewrote everything you actually touch.
 
-Same engine. Better UI. That's the whole pitch.
+The result: one dark screen, one status ring, one button. It boots into the
+tile, it reconnects itself, and it gets out of the way.
 
 ## What it does
 
-- **Connect/disconnect** with adaptive phone + tablet layouts (window size class)
-- **Animated status ring** with live uptime
-- **Quick Settings tile**: 1-tap toggle from anywhere
-- **Background keep-alive**: auto-reconnect with backoff (5 attempts),
-  battery-optimization exemption prompt, start-on-boot toggle
-- **ss:// import**: open access keys straight from Outline Manager, or paste
-  them; parser with unit tests (IPV6, percent-encoded + legacy base64 userinfo,
-  plugin rejection, port validation)
+- Connect and disconnect on adaptive phone and tablet layouts
+- Animated status ring with live uptime
+- Quick Settings tile that toggles instantly, both ways
+- Auto-reconnect with backoff, battery-optimization exemption, start on boot
+- ss:// import from Outline Manager or a paste box, with tested parsing
+  (IPv6 hosts, percent-encoded userinfo, legacy base64, plugin rejection,
+  port validation)
 
 ## Architecture
 
@@ -34,8 +33,8 @@ Same engine. Better UI. That's the whole pitch.
 │            └── libgojni.so (Go: lwIP TUN stack + Shadowsocks)                    │
 │                  └── every outbound socket ← Protector.protect(fd)              │
 │                     = VpnService.protect() → no routing loop                    │
-│  QsTileService ─ tile/          WidgetReceiver (Glance) ─ widget/               │
-│  BootReceiver ─ boot/           KeyRepository (DataStore) ─ data/               │
+│  QsTileService ─ tile/          BootReceiver ─ boot/                            │
+│  Settings (keep-alive, boot, battery)           KeyRepository (DataStore) ─ data│
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -43,21 +42,21 @@ Same engine. Better UI. That's the whole pitch.
 
 The stock `outline.aar` dials the proxy with unprotected sockets, so the VPN's
 own traffic would loop back through itself. `go/outlinev` wraps the SDK's
-`TCPEndpoint`/`UDPEndpoint` with `intra/protect.MakeDialer(protector)`, whose
-`net.Dialer.Control` hook calls back into Kotlin → `VpnService.protect()`
-before every outbound connect, and routes DNS through the phone's protected
-system resolvers. Same trick [Intra](https://github.com/Jigsaw-Code/Intra)
-uses; applied to plain Shadowsocks.
+`TCPEndpoint`/`UDPEndpoint` with `intra/protect.MakeDialer(protector)`. That
+dialer installs a `net.Dialer.Control` hook, which calls into Kotlin and runs
+`VpnService.protect()` before every outbound connect. DNS resolves through the
+phone's protected system resolvers. [Intra](https://github.com/Jigsaw-Code/Intra)
+does the same thing; I applied it to plain Shadowsocks.
 
 ## Building
 
-Requires JDK 21, Android SDK (android-35, build-tools 35), NDK r27+, Go 1.22+.
+You need JDK 21, Android SDK (android-35, build-tools 35), NDK r27+, and Go 1.22+.
 
-> `third_party/` and the built AAR are not committed — fetch and build them
-> first. `gradle.properties` pins `org.gradle.java.home`; adjust it to your
-> JDK path (or delete the line to use your default JDK).
+`third_party/` and the built AAR are not committed. Fetch and build them first.
+`gradle.properties` pins `org.gradle.java.home`; point it at your JDK or delete
+the line and use your default.
 
-1. **Fetch the engine** (do this from the repo root):
+1. Fetch the engine, from the repo root:
 
    ```bash
    git clone --depth 1 https://github.com/Jigsaw-Code/outline-go-tun2socks.git \
@@ -69,7 +68,7 @@ Requires JDK 21, Android SDK (android-35, build-tools 35), NDK r27+, Go 1.22+.
    cd ../../go/outlinev
    ```
 
-2. **Build the AAR** (`app/libs/tun2socks.aar`):
+2. Build the AAR (`app/libs/tun2socks.aar`):
 
    ```bash
    ANDROID_HOME=<sdk> ANDROID_NDK_HOME=<ndk> \
@@ -81,7 +80,7 @@ Requires JDK 21, Android SDK (android-35, build-tools 35), NDK r27+, Go 1.22+.
      ../../third_party/outline-go-tun2socks/outline/shadowsocks
    ```
 
-3. **App + tests**:
+3. App and tests:
 
    ```bash
    ./gradlew :app:assembleDebug            # → app/build/outputs/apk/debug/app-debug.apk
@@ -91,17 +90,19 @@ Requires JDK 21, Android SDK (android-35, build-tools 35), NDK r27+, Go 1.22+.
 ## Using it
 
 - Get an access key (`ss://…`) from your Outline Manager and open the link on
-  your phone — the app imports it. Or tap **+** and paste the key.
-- Pick a server, hit **Connect**, allow the VPN permission prompt once.
-- Pin the **gaurPN** tile in Quick Settings for a 1-tap toggle anywhere.
-- Settings (gear icon): keep-alive auto-reconnect, start-on-boot, and the
-  battery-optimization exemption so the VPN never turns off in the background.
+  your phone. The app imports it. Or tap the + button and paste it.
+- Pick a server, hit Connect, allow the VPN prompt once.
+- Pin the gaurPN tile in Quick Settings for a 1-tap toggle anywhere.
+- Settings (gear icon): keep-alive auto-reconnect, start on boot, and the
+  battery exemption that keeps the VPN running in the background.
 
 ## Notes
 
-- Requires an Outline/Shadowsocks server you control (any Outline Manager or
-  compatible `ss://` endpoint). gaurPN does not come with servers and does
-  not talk to any third party.
-- No analytics, no accounts, no logging. Keys stay on device.
-- Not affiliated with Jigsaw/Google's Outline; the engine is theirs and this
-  repo is a UI layer over it.
+- You need an Outline or Shadowsocks server you control. Any Outline Manager
+  endpoint works. gaurPN ships no servers and talks to no third party.
+- No analytics. No accounts. No logging. Keys stay on your device.
+- Not affiliated with Jigsaw or Google. Their engine, my UI.
+
+## License
+
+MIT. The outline-go-tun2socks engine keeps its own Apache-2.0 license.
