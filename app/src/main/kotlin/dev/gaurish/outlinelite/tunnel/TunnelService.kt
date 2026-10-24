@@ -16,14 +16,13 @@ import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import androidx.glance.appwidget.GlanceAppWidgetManager
 import dev.gaurish.outlinelite.MainActivity
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.AccessKey
+import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.outlinev.Outlinev
 import dev.gaurish.outlinelite.outlinev.Protector
 import dev.gaurish.outlinelite.tile.QsTileService
-import dev.gaurish.outlinelite.widget.OutlineWidget
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -322,16 +321,12 @@ class TunnelService : VpnService() {
             ContextCompat.startForegroundService(context, intent)
         }
 
-        /** Push the current state to the QS tile and home-screen widgets. */
+        /** Push the current state to the QS tile. */
         fun notifyExternal(context: Context) {
-            appScope.launch {
-                runCatching {
-                    val ids = GlanceAppWidgetManager(context).getGlanceIds(OutlineWidget::class.java)
-                    ids.forEach { id -> OutlineWidget().update(context, id) }
-                }
-                runCatching {
-                    TileService.requestListeningState(context, ComponentName(context, QsTileService::class.java))
-                }
+            runCatching {
+                TileService.requestListeningState(
+                    context, ComponentName(context, QsTileService::class.java)
+                )
             }
         }
 
@@ -339,11 +334,19 @@ class TunnelService : VpnService() {
             context.startService(Intent(context, TunnelService::class.java).setAction(ACTION_STOP))
         }
 
-        /** Connect/disconnect with the currently active key. */
-        fun toggle(context: Context) {
+        /**
+         * Phase-aware toggle for entry points that may not know the current
+         * state (QS tile): running → stop; idle → connect with the active key.
+         */
+        fun requestToggle(context: Context) {
             appScope.launch {
-                val key = runCatching { dev.gaurish.outlinelite.data.KeyRepository.activeKey(context) }.getOrNull()
-                if (key != null) start(context, key) else stop(context)
+                val phase = TunnelState.status.phase
+                if (phase != TunnelPhase.DISCONNECTED) {
+                    stop(context)
+                    return@launch
+                }
+                val key = runCatching { KeyRepository.activeKey(context) }.getOrNull()
+                if (key != null) start(context, key)
             }
         }
     }

@@ -1,7 +1,7 @@
 # gaurPN
 
 A custom Android client for **Outline (Shadowsocks)** — Material 3 dark UI,
-home-screen widget, Quick Settings tile, protected tun2socks engine.
+Quick Settings tile, background keep-alive, protected tun2socks engine.
 
 ## Why this exists
 
@@ -17,7 +17,6 @@ Same engine. Better UI. That's the whole pitch.
 
 - **Connect/disconnect** with adaptive phone + tablet layouts (window size class)
 - **Animated status ring** with live uptime
-- **Home-screen widget** (Glance): status + one-tap toggle
 - **Quick Settings tile**: 1-tap toggle from anywhere
 - **Background keep-alive**: auto-reconnect with backoff (5 attempts),
   battery-optimization exemption prompt, start-on-boot toggle
@@ -94,8 +93,7 @@ Requires JDK 21, Android SDK (android-35, build-tools 35), NDK r27+, Go 1.22+.
 - Get an access key (`ss://…`) from your Outline Manager and open the link on
   your phone — the app imports it. Or tap **+** and paste the key.
 - Pick a server, hit **Connect**, allow the VPN permission prompt once.
-- Pin the **gaurPN** tile in Quick Settings; drop the widget on your home
-  screen for status + toggle.
+- Pin the **gaurPN** tile in Quick Settings for a 1-tap toggle anywhere.
 - Settings (gear icon): keep-alive auto-reconnect, start-on-boot, and the
   battery-optimization exemption so the VPN never turns off in the background.
 

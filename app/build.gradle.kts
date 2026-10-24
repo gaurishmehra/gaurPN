@@ -48,7 +48,8 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3:1.3.1")
     implementation("androidx.compose.material3:material3-window-size-class:1.3.1")
-    implementation("androidx.glance:glance-appwidget:1.1.1")
+    // Glance home-screen widget was removed in v0.2; QS tile is the 1-tap surface.
+
     implementation("androidx.datastore:datastore-preferences:1.1.1")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
 
