@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Outline Lite</string>
+    <string name="app_name">gaurPN</string>
+    <string name="section_servers">Servers</string>
+    <string name="empty_servers">No servers yet. Add one with the + button to get started.</string>
     <string name="widget_description">Toggle and monitor your Outline connection</string>
     <string name="action_disconnect">Disconnect</string>
     <string name="action_connect">Connect</string>

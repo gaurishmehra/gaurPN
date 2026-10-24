@@ -102,7 +102,7 @@ class TunnelService : VpnService() {
 
     private fun connectTunnel(configJson: String) {
         val builder = Builder()
-            .setSession("Outline Lite")
+            .setSession("gaurPN")
             .setMtu(MTU)
             .addAddress("26.26.26.1", 32)
             .addRoute("0.0.0.0", 0)
@@ -275,7 +275,7 @@ class TunnelService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
         val builder = NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(R.drawable.ic_launcher)
+            .setSmallIcon(R.drawable.ic_key)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(notificationBody())
             .setOngoing(true)

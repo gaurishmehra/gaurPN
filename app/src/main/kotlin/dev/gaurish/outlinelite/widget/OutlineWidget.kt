@@ -40,14 +40,14 @@ class OutlineWidget : GlanceAppWidget() {
     override suspend fun provideGlance(context: Context, id: GlanceId) {
         val status = TunnelState.status
         val connected = status.phase == TunnelPhase.CONNECTED
-        val accent = if (connected) Color(0xFF39D98A) else Color(0xFFF5A524)
+        val accent = if (connected) Color(0xFF5BD9A3) else Color(0xFF98A2B0)
 
         provideContent {
             GlanceTheme {
                 Column(
                     modifier = GlanceModifier
                         .fillMaxSize()
-                        .background(ColorProvider(Color(0xE6101825.toInt())))
+                        .background(ColorProvider(Color(0xE60F1219.toInt())))
                         .cornerRadius(20.dp)
                         .padding(12.dp)
                 ) {
@@ -62,7 +62,7 @@ class OutlineWidget : GlanceAppWidget() {
                     androidx.glance.layout.Spacer(modifier = GlanceModifier.padding(2.dp))
                     Text(
                         status.activeName
-                            ?: context.getString(R.string.status_disconnected).replace("Not ", ""),
+                            ?: "No server selected",
                         style = TextStyle(
                             color = ColorProvider(Color(0xFFE7ECF3)),
                             fontSize = 14.sp,
@@ -94,7 +94,7 @@ class OutlineWidget : GlanceAppWidget() {
                             if (connected) "Disconnect" else "Connect",
                             modifier = GlanceModifier.padding(horizontal = 16.dp, vertical = 10.dp),
                             style = TextStyle(
-                                color = ColorProvider(Color(0xFF221602)),
+                                color = ColorProvider(Color(0xFF0B111B)),
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.Bold,
                             ),

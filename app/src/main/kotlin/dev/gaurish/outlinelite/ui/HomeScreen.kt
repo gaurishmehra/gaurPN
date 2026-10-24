@@ -8,7 +8,6 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -26,10 +25,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -44,7 +41,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,6 +57,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -76,17 +73,17 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private fun phaseColor(phase: TunnelPhase, scheme: ColorScheme): Color = when (phase) {
-    TunnelPhase.CONNECTED -> Mint
-    TunnelPhase.CONNECTING -> Accent
+    TunnelPhase.CONNECTED -> scheme.primary
+    TunnelPhase.CONNECTING -> scheme.secondary
     TunnelPhase.STOPPING -> scheme.onSurfaceVariant
-    TunnelPhase.DISCONNECTED -> Color(0xFF39424E)
+    TunnelPhase.DISCONNECTED -> scheme.outlineVariant
 }
 
 private fun phaseLabel(phase: TunnelPhase): String = when (phase) {
-    TunnelPhase.CONNECTED -> "Protected"
-    TunnelPhase.CONNECTING -> "Connecting"
-    TunnelPhase.STOPPING -> "Stopping"
-    TunnelPhase.DISCONNECTED -> "Not connected"
+    TunnelPhase.CONNECTED -> "Connected"
+    TunnelPhase.CONNECTING -> "Connecting…"
+    TunnelPhase.STOPPING -> "Stopping…"
+    TunnelPhase.DISCONNECTED -> "Idle"
 }
 
 @Composable
@@ -107,11 +104,7 @@ fun HomeScreen(
     Box(
         Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF0A0E14), Color(0xFF0D1520), Color(0xFF150F07))
-                )
-            )
+            .background(MaterialTheme.colorScheme.background)
             .systemBarsPadding()
     ) {
         Column(
@@ -120,8 +113,8 @@ fun HomeScreen(
                 .padding(horizontal = 20.dp, vertical = 16.dp)
         ) {
             HomeHeader(onAdd = { showAdd = true }, onSettings = onOpenSettings)
+            Spacer(Modifier.height(10.dp))
             status.lastError?.let { err ->
-                Spacer(Modifier.height(8.dp))
                 Text(
                     err,
                     fontSize = 12.sp,
@@ -129,6 +122,7 @@ fun HomeScreen(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
+                Spacer(Modifier.height(8.dp))
             }
             if (compact) {
                 Column(Modifier.fillMaxSize()) {
@@ -192,27 +186,32 @@ fun HomeScreen(
     }
 }
 
+// ---------- header ----------
+
 @Composable
 private fun HomeHeader(onAdd: () -> Unit, onSettings: () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
     Row(verticalAlignment = Alignment.CenterVertically) {
-        androidx.compose.foundation.Image(
-            painter = painterResource(R.drawable.ic_launcher),
+        Icon(
+            painter = painterResource(R.drawable.ic_key),
             contentDescription = null,
-            modifier = Modifier.size(26.dp),
+            tint = scheme.primary,
+            modifier = Modifier.size(24.dp),
         )
-        Spacer(Modifier.width(10.dp))
+        Spacer(Modifier.width(12.dp))
         Text(
-            "Outline Lite",
-            fontSize = 19.sp,
+            stringResource(R.string.app_name),
+            fontSize = 20.sp,
             fontWeight = FontWeight.SemiBold,
-            color = MaterialTheme.colorScheme.onBackground,
+            letterSpacing = 0.3.sp,
+            color = scheme.onBackground,
         )
         Spacer(Modifier.weight(1f))
         IconButton(onClick = onAdd) {
             Icon(
                 painter = painterResource(R.drawable.ic_add),
                 contentDescription = "Add server",
-                tint = MaterialTheme.colorScheme.primary,
+                tint = scheme.onSurfaceVariant,
                 modifier = Modifier.size(22.dp),
             )
         }
@@ -220,12 +219,14 @@ private fun HomeHeader(onAdd: () -> Unit, onSettings: () -> Unit) {
             Icon(
                 painter = painterResource(R.drawable.ic_settings),
                 contentDescription = "Settings",
-                tint = MaterialTheme.colorScheme.primary,
+                tint = scheme.onSurfaceVariant,
                 modifier = Modifier.size(22.dp),
             )
         }
     }
 }
+
+// ---------- hero ----------
 
 @Composable
 private fun ConnectHero(
@@ -234,7 +235,6 @@ private fun ConnectHero(
     onConnectToggle: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
-    val ring = phaseColor(status.phase, scheme)
     val connected = status.phase == TunnelPhase.CONNECTED
 
     Column(
@@ -243,20 +243,29 @@ private fun ConnectHero(
         verticalArrangement = Arrangement.Center,
     ) {
         StatusRing(status = status)
-        Spacer(Modifier.height(26.dp))
+        Spacer(Modifier.height(24.dp))
         Button(
             onClick = onConnectToggle,
-            shape = CircleShape,
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (connected) ring else scheme.primary,
-                contentColor = if (connected) Color(0xFF06231A) else scheme.onPrimary,
-            ),
-            contentPadding = PaddingValues(horizontal = 34.dp, vertical = 12.dp),
+            shape = RoundedCornerShape(27.dp),
+            elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp),
+            colors = if (connected) {
+                ButtonDefaults.buttonColors(
+                    containerColor = scheme.surface,
+                    contentColor = scheme.onSurface,
+                )
+            } else {
+                ButtonDefaults.buttonColors(
+                    containerColor = scheme.primary,
+                    contentColor = scheme.onPrimary,
+                )
+            },
+            contentPadding = PaddingValues(horizontal = 36.dp, vertical = 13.dp),
         ) {
             Text(
                 if (connected) "Disconnect" else "Connect",
                 fontWeight = FontWeight.SemiBold,
-                fontSize = 16.sp,
+                fontSize = 15.sp,
+                letterSpacing = 0.2.sp,
             )
         }
     }
@@ -271,16 +280,16 @@ private fun StatusRing(status: TunnelStatus) {
     val spin by infinite.animateFloat(
         initialValue = 0f,
         targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(1100, easing = LinearEasing)),
+        animationSpec = infiniteRepeatable(tween(1200, easing = LinearEasing)),
         label = "spin",
     )
     val rotation = if (connecting) spin else 0f
 
-    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(236.dp)) {
-        Canvas(Modifier.size(224.dp).rotate(rotation)) {
-            val stroke = Stroke(width = 14.dp.toPx(), cap = StrokeCap.Round)
+    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(212.dp)) {
+        Canvas(Modifier.size(204.dp).rotate(rotation)) {
+            val stroke = Stroke(width = 10.dp.toPx(), cap = StrokeCap.Round)
             drawArc(
-                color = Color(0xFF222B3A),
+                color = scheme.outlineVariant.copy(alpha = 0.55f),
                 startAngle = 0f,
                 sweepAngle = 360f,
                 useCenter = false,
@@ -288,16 +297,18 @@ private fun StatusRing(status: TunnelStatus) {
             )
             when (status.phase) {
                 TunnelPhase.CONNECTED -> drawArc(
-                    brush = Brush.sweepGradient(listOf(ring.copy(alpha = 0.25f), ring, ring)),
-                    startAngle = 0f,
+                    brush = Brush.sweepGradient(listOf(ring.copy(alpha = 0.4f), ring, ring)),
+                    startAngle = 270f,
                     sweepAngle = 360f,
                     useCenter = false,
                     style = stroke,
                 )
                 TunnelPhase.CONNECTING -> drawArc(
-                    brush = Brush.sweepGradient(listOf(ring, ring.copy(alpha = 0.25f), ring.copy(alpha = 0.05f))),
+                    brush = Brush.sweepGradient(
+                        listOf(ring, ring.copy(alpha = 0.35f), ring.copy(alpha = 0.08f))
+                    ),
                     startAngle = 270f,
-                    sweepAngle = 110f,
+                    sweepAngle = 120f,
                     useCenter = false,
                     style = stroke,
                 )
@@ -306,15 +317,19 @@ private fun StatusRing(status: TunnelStatus) {
         }
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             Icon(
-                painter = painterResource(R.drawable.ic_launcher),
+                painter = painterResource(R.drawable.ic_key),
                 contentDescription = null,
-                tint = if (status.phase == TunnelPhase.DISCONNECTED) scheme.onSurfaceVariant else ring,
-                modifier = Modifier.size(46.dp),
+                tint = if (status.phase == TunnelPhase.DISCONNECTED) {
+                    scheme.onSurfaceVariant.copy(alpha = 0.85f)
+                } else {
+                    ring
+                },
+                modifier = Modifier.size(44.dp),
             )
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(14.dp))
             Text(
                 phaseLabel(status.phase),
-                fontSize = 23.sp,
+                fontSize = 24.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = scheme.onBackground,
             )
@@ -359,6 +374,8 @@ private fun formatUptime(ms: Long): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
 }
 
+// ---------- servers ----------
+
 @Composable
 private fun ServersSection(
     modifier: Modifier,
@@ -369,41 +386,54 @@ private fun ServersSection(
     onDelete: (AccessKey) -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Servers", fontSize = 13.sp, color = scheme.onSurfaceVariant)
+            Text(
+                stringResource(R.string.section_servers).uppercase(),
+                fontSize = 11.sp,
+                letterSpacing = 1.6.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = scheme.onSurfaceVariant,
+            )
             Spacer(Modifier.width(8.dp))
             Text(
                 "${keys.size}",
-                fontSize = 12.sp,
-                color = scheme.onSurfaceVariant.copy(alpha = 0.7f),
+                fontSize = 11.sp,
+                color = scheme.onSurfaceVariant.copy(alpha = 0.65f),
             )
             Spacer(Modifier.weight(1f))
-            Text(
-                if (phase == TunnelPhase.CONNECTED) "tunnel active" else "",
-                fontSize = 11.sp,
-                color = Mint,
-            )
+            if (phase == TunnelPhase.CONNECTED) {
+                Text(
+                    "connected",
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = scheme.primary,
+                )
+            }
         }
         Surface(
             shape = RoundedCornerShape(22.dp),
-            color = scheme.onSurface.copy(alpha = 0.03f),
-            border = BorderStroke(1.dp, scheme.onSurface.copy(alpha = 0.07f)),
+            color = scheme.surface,
             modifier = Modifier.fillMaxWidth().weight(1f),
         ) {
             when {
-                keys.isEmpty() -> Box(Modifier.fillMaxSize().padding(16.dp), contentAlignment = Alignment.Center) {
-                    Text(
-                        "No servers yet — tap ＋ to paste an ss:// access key.",
-                        fontSize = 13.sp,
-                        color = scheme.onSurfaceVariant,
-                        modifier = Modifier.fillMaxWidth(),
-                        textAlign = TextAlign.Center,
-                    )
-                }
+                keys.isEmpty() ->
+                    Box(
+                        Modifier.fillMaxSize().padding(24.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            stringResource(R.string.empty_servers),
+                            fontSize = 13.sp,
+                            lineHeight = 19.sp,
+                            color = scheme.onSurfaceVariant,
+                            modifier = Modifier.fillMaxWidth(),
+                            textAlign = TextAlign.Center,
+                        )
+                    }
                 else -> LazyColumn(
                     Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(8.dp),
+                    contentPadding = PaddingValues(10.dp),
                     verticalArrangement = Arrangement.spacedBy(6.dp),
                 ) {
                     items(keys.size) { i ->
@@ -434,44 +464,56 @@ private fun ServerRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(15.dp))
             .clickable { onSelect(key) }
-            .background(scheme.onSurface.copy(alpha = if (selected) 0.06f else 0.0f))
-            .padding(horizontal = 12.dp, vertical = 11.dp),
+            .background(if (selected) scheme.primary.copy(alpha = 0.10f) else Color.Transparent)
+            .padding(start = 12.dp, end = 4.dp, top = 9.dp, bottom = 9.dp),
     ) {
-        if (selected) {
-            Box(
-                Modifier.size(9.dp).clip(CircleShape).background(scheme.primary)
+        Box(
+            Modifier
+                .size(34.dp)
+                .clip(CircleShape)
+                .background(
+                    if (selected) scheme.primary.copy(alpha = 0.18f)
+                    else scheme.outlineVariant.copy(alpha = 0.30f)
+                ),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_key),
+                contentDescription = null,
+                tint = if (selected) scheme.primary else scheme.onSurfaceVariant,
+                modifier = Modifier.size(17.dp),
             )
-            Spacer(Modifier.width(10.dp))
-        } else {
-            Spacer(Modifier.width(19.dp))
         }
+        Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(
                 key.name.ifBlank { key.displayAddress() },
                 fontSize = 15.sp,
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                color = if (selected) scheme.primary else scheme.onSurface,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                color = scheme.onSurface,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                "${key.displayAddress()} · ${key.method}",
-                fontSize = 11.5.sp,
+                key.displayAddress(),
+                fontSize = 12.sp,
                 color = scheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        IconButton(onClick = { onDelete(key) }) {
+        IconButton(onClick = { onDelete(key) }, modifier = Modifier.size(34.dp)) {
             Icon(
                 painter = painterResource(R.drawable.ic_delete),
                 contentDescription = "Delete",
-                tint = scheme.onSurfaceVariant,
+                tint = scheme.onSurfaceVariant.copy(alpha = 0.75f),
                 modifier = Modifier.size(17.dp),
             )
         }
     }
 }
+
+// ---------- add dialog ----------
 
 @Composable
 private fun AddKeyDialog(
@@ -500,14 +542,14 @@ private fun AddKeyDialog(
                 Spacer(Modifier.height(8.dp))
                 Text(
                     when {
-                        draft.isBlank() -> "Paste an Outline access key (ss://…)"
+                        draft.isBlank() -> "Paste an ss:// access key."
                         parsed != null -> "✓ OK — ${parsed!!.name}"
                         else -> "Not recognized as an ss:// key"
                     },
                     fontSize = 12.sp,
                     color = when {
                         draft.isBlank() -> scheme.onSurfaceVariant.copy(alpha = 0.7f)
-                        parsed != null -> Mint
+                        parsed != null -> scheme.primary
                         else -> scheme.error
                     },
                 )

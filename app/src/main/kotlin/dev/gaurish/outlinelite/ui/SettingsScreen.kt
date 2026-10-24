@@ -36,7 +36,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -85,11 +84,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     Box(
         Modifier
             .fillMaxSize()
-            .background(
-                Brush.verticalGradient(
-                    listOf(Color(0xFF0A0E14), Color(0xFF0D1520), Color(0xFF150F07))
-                )
-            )
+            .background(MaterialTheme.colorScheme.background)
             .systemBarsPadding()
     ) {
         Column(
@@ -129,7 +124,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         scope.launch { KeyRepository.setAutoReconnect(context, enabled) }
                     },
                     colors = SwitchDefaults.colors(
-                        checkedTrackColor = Mint,
+                        checkedTrackColor = MaterialTheme.colorScheme.primary,
                         checkedThumbColor = Color(0xFF0B111B),
                     ),
                 )
@@ -144,7 +139,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                         scope.launch { KeyRepository.setAutostart(context, enabled) }
                     },
                     colors = SwitchDefaults.colors(
-                        checkedTrackColor = Mint,
+                        checkedTrackColor = MaterialTheme.colorScheme.primary,
                         checkedThumbColor = Color(0xFF0B111B),
                     ),
                 )
@@ -190,9 +185,10 @@ fun SettingsScreen(onBack: () -> Unit) {
                             }
                         },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (batteryExempt) Color(0xFF232F3E) else Mint,
-                            contentColor = if (batteryExempt) resources.onBackground
-                            else Color(0xFF0B111B),
+                            containerColor = if (batteryExempt) Color(0xFF232F3E)
+                            else MaterialTheme.colorScheme.primary,
+                            contentColor = if (batteryExempt) MaterialTheme.colorScheme.onBackground
+                            else Color(0xFF04231A),
                         ),
                         contentPadding =
                             androidx.compose.foundation.layout.PaddingValues(
@@ -229,7 +225,7 @@ private fun SectionLabel(text: String) {
         fontSize = 11.sp,
         letterSpacing = 1.4.sp,
         fontWeight = FontWeight.SemiBold,
-        color = Color(0xFF6B7A8D),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier.padding(bottom = 8.dp, top = 12.dp),
     )
 }

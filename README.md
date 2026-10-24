@@ -1,4 +1,4 @@
-# Outline Lite
+# gaurPN
 
 A custom, native Android client for Outline (Shadowsocks) with Material 3 UI,
 a home-screen widget, a Quick Settings tile, and a protected tun2socks engine.
@@ -48,7 +48,7 @@ and Go 1.22+.
 - Get an access key (`ss://…`) from your Outline Manager and open the link on
   your phone — the app imports it. Or tap **＋** and paste the key.
 - Pick a server, hit **Connect**, allow the VPN permission prompt once.
-- Pin **Outline Lite** in Quick Settings for a 1-tap toggle; drop the widget on
+- Pin **gaurPN** in Quick Settings for a 1-tap toggle; drop the widget on
   your home screen for status + toggle.
 
 ## Why the custom wrapper?
