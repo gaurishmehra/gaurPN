@@ -26,7 +26,10 @@ import dev.gaurish.outlinelite.tile.QsTileService
 import dev.gaurish.outlinelite.widget.OutlineWidget
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 
@@ -41,8 +44,12 @@ class TunnelService : VpnService() {
 
     private var goTunnel: dev.gaurish.outlinelite.tun2socks.Tunnel? = null
     private var tunPfd: ParcelFileDescriptor? = null
-    private var activeConfig: Pair<String, AccessKey>? = null
+    private var activeConfig: Pair<String, String>? = null
     private val executor = Executors.newSingleThreadExecutor()
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var watchdog: Job? = null
+    private var userStopped = false
+    private var failedAttempts = 0
 
     private val protector: Protector = object : Protector {
         override fun protect(socket: Int): Boolean = this@TunnelService.protect(socket)
@@ -52,6 +59,7 @@ class TunnelService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
+                userStopped = true
                 stopTunnel()
                 return START_NOT_STICKY
             }
@@ -59,9 +67,19 @@ class TunnelService : VpnService() {
                 val config = intent.getStringExtra(EXTRA_CONFIG_JSON)
                 val name = intent.getStringExtra(EXTRA_NAME) ?: "Server"
                 if (config == null) {
+                    userStopped = true
                     stopTunnel()
                     return START_NOT_STICKY
                 }
+                if (goTunnel != null &&
+                    TunnelState.status.phase == TunnelPhase.CONNECTED &&
+                    activeConfig?.first == config
+                ) {
+                    return START_REDELIVER_INTENT // already up with the same server
+                }
+                userStopped = false
+                failedAttempts = 0
+                activeConfig = config to name
                 TunnelState.update {
                     it.copy(
                         phase = TunnelPhase.CONNECTING,
@@ -92,6 +110,7 @@ class TunnelService : VpnService() {
             .addDnsServer("1.1.1.1")
         val pfd = builder.establish()
         if (pfd == null) {
+            userStopped = true // consent not granted; retrying would be futile
             fail("VPN permission was denied")
             return
         }
@@ -99,6 +118,7 @@ class TunnelService : VpnService() {
         // Go does not own the fd: the caller closes it (see the AAR docs).
         val tunnel = Outlinev.connectTunnel(pfd.getFd().toLong(), configJson, protector, true)
         goTunnel = tunnel
+        failedAttempts = 0
         TunnelState.update {
             it.copy(
                 phase = TunnelPhase.CONNECTED,
@@ -107,29 +127,90 @@ class TunnelService : VpnService() {
             )
         }
         notifyExternal(this)
+        startWatchdog()
+    }
+
+    /** Detects a silently-dropped Go tunnel and routes it through [fail] to reconnect. */
+    private fun startWatchdog() {
+        watchdog?.cancel()
+        watchdog = serviceScope.launch {
+            while (true) {
+                delay(WATCHDOG_INTERVAL_MS)
+                if (userStopped) return@launch
+                val t = goTunnel
+                val alive = t != null && runCatching { t.isConnected() }.getOrDefault(false)
+                if (TunnelState.status.phase == TunnelPhase.CONNECTED && !alive) {
+                    fail("Tunnel dropped — reconnecting…")
+                    return@launch
+                }
+            }
+        }
     }
 
     private fun stopTunnel() {
+        userStopped = true
+        watchdog?.cancel()
+        watchdog = null
         TunnelState.update { it.copy(phase = TunnelPhase.STOPPING) }
-        runCatching { goTunnel?.disconnect() }
-        goTunnel = null
-        tunPfd?.let { fd -> runCatching { fd.close() } }
-        tunPfd = null
+        cleanupTunnel()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
         TunnelState.update { it.copy(phase = TunnelPhase.DISCONNECTED, connectedAt = 0L) }
         notifyExternal(this)
     }
 
-    private fun fail(message: String) {
-        TunnelState.update {
-            it.copy(phase = TunnelPhase.DISCONNECTED, lastError = message, connectedAt = 0L)
-        }
-        runCatching { tunPfd?.close() }
-        tunPfd = null
+    /** Closes the Go tunnel and the TUN file descriptor. */
+    private fun cleanupTunnel() {
+        runCatching { goTunnel?.disconnect() }
         goTunnel = null
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        tunPfd?.let { fd -> runCatching { fd.close() } }
+        tunPfd = null
+    }
+
+    /**
+     * A failed/dropped tunnel. When "keep connection alive" is on and the stop was
+     * not user-initiated, the tunnel is re-established with exponential back-off.
+     */
+    private fun fail(message: String) {
+        watchdog?.cancel()
+        watchdog = null
+        cleanupTunnel()
+        val cfg = activeConfig
+        if (userStopped || cfg == null || failedAttempts >= KEEP_ALIVE_ATTEMPTS) {
+            TunnelState.update {
+                it.copy(phase = TunnelPhase.DISCONNECTED, lastError = message, connectedAt = 0L)
+            }
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            notifyExternal(this)
+            return
+        }
+        failedAttempts += 1
+        val attempt = failedAttempts
+        val wait = BACKOFF_MS[attempt - 1]
+        serviceScope.launch {
+            val keepAlive = runCatching {
+                dev.gaurish.outlinelite.data.KeyRepository.autoReconnect(this@TunnelService)
+            }.getOrDefault(true)
+            if (!keepAlive) {
+                TunnelState.update {
+                    it.copy(phase = TunnelPhase.DISCONNECTED, lastError = message, connectedAt = 0L)
+                }
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                notifyExternal(this@TunnelService)
+                return@launch
+            }
+            delay(wait)
+            if (userStopped) return@launch
+            TunnelState.update {
+                it.copy(phase = TunnelPhase.CONNECTING, activeName = cfg.second)
+            }
+            executor.submit {
+                runCatching { connectTunnel(cfg.first) }
+                    .onFailure { t -> fail(t.logMessage()) }
+            }
+        }
         notifyExternal(this)
     }
 
@@ -147,8 +228,9 @@ class TunnelService : VpnService() {
     }
 
     override fun onDestroy() {
-        runCatching { goTunnel?.disconnect() }
-        runCatching { tunPfd?.close() }
+        watchdog?.cancel()
+        serviceScope.cancel()
+        cleanupTunnel()
         executor.shutdown()
         super.onDestroy()
     }
@@ -226,6 +308,9 @@ class TunnelService : VpnService() {
         const val ACTION_STOP = "dev.gaurish.outlinelite.action.STOP"
         private const val EXTRA_CONFIG_JSON = "config_json"
         private const val EXTRA_NAME = "name"
+        private val WATCHDOG_INTERVAL_MS = 10_000L
+        private const val KEEP_ALIVE_ATTEMPTS = 5
+        private val BACKOFF_MS = longArrayOf(2_000L, 5_000L, 10_000L, 20_000L, 30_000L)
 
         private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 

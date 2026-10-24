@@ -19,6 +19,7 @@ object KeyRepository {
     private val KEYS = stringPreferencesKey("keys_v1")
     private val ACTIVE = stringPreferencesKey("active_id")
     private val AUTOSTART = booleanPreferencesKey("autostart")
+    private val AUTO_RECONNECT = booleanPreferencesKey("auto_reconnect")
 
     fun observeKeys(context: Context): Flow<List<AccessKey>> =
         context.dataStore.data.map { decodeKeys(it[KEYS]) }
@@ -28,6 +29,12 @@ object KeyRepository {
 
     fun observeAutostart(context: Context): Flow<Boolean> =
         context.dataStore.data.map { it[AUTOSTART] ?: false }
+
+    fun observeAutoReconnect(context: Context): Flow<Boolean> =
+        context.dataStore.data.map { it[AUTO_RECONNECT] ?: true }
+
+    suspend fun autoReconnect(context: Context): Boolean =
+        context.dataStore.data.first()[AUTO_RECONNECT] ?: true
 
     suspend fun activeKey(context: Context): AccessKey? {
         val keys = decodeKeys(context.dataStore.data.first()[KEYS])
@@ -78,6 +85,10 @@ object KeyRepository {
 
     suspend fun setAutostart(context: Context, enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[AUTOSTART] = enabled }
+    }
+
+    suspend fun setAutoReconnect(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[AUTO_RECONNECT] = enabled }
     }
 
     /*

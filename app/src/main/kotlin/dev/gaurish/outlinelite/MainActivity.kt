@@ -10,6 +10,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.BackHandler
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
@@ -33,6 +34,7 @@ import dev.gaurish.outlinelite.tunnel.TunnelService
 import dev.gaurish.outlinelite.tunnel.TunnelState
 import dev.gaurish.outlinelite.ui.HomeScreen
 import dev.gaurish.outlinelite.ui.OutlineTheme
+import dev.gaurish.outlinelite.ui.SettingsScreen
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -72,6 +74,7 @@ class MainActivity : ComponentActivity() {
                     var activeId by remember { mutableStateOf<String?>(null) }
                     val scope = rememberCoroutineScope()
                     val widthClass = calculateWindowSizeClass(this).widthSizeClass
+                    var screen by remember { mutableStateOf(0) } // 0 = home, 1 = settings
                     LaunchedEffect(Unit) {
                         launch {
                             KeyRepository.observeKeys(applicationContext).collect { keys = it }
@@ -81,35 +84,42 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    HomeScreen(
-                        compact = widthClass == WindowWidthSizeClass.Compact,
-                        status = status,
-                        keys = keys,
-                        activeId = activeId,
-                        onConnectToggle = {
-                            when (status.phase) {
-                                TunnelPhase.DISCONNECTED -> {
-                                    val key = keys.firstOrNull { it.id == activeId } ?: keys.firstOrNull()
-                                    if (key == null) {
-                                        Toast.makeText(
-                                            applicationContext,
-                                            getString(R.string.no_active_key),
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    } else {
-                                        prepareAndStart(key)
+                    if (screen == 1) {
+                        BackHandler { screen = 0 }
+                        SettingsScreen(onBack = { screen = 0 })
+                    } else {
+                        HomeScreen(
+                            compact = widthClass == WindowWidthSizeClass.Compact,
+                            status = status,
+                            keys = keys,
+                            activeId = activeId,
+                            onConnectToggle = {
+                                when (status.phase) {
+                                    TunnelPhase.DISCONNECTED -> {
+                                        val key =
+                                            keys.firstOrNull { it.id == activeId } ?: keys.firstOrNull()
+                                        if (key == null) {
+                                            Toast.makeText(
+                                                applicationContext,
+                                                getString(R.string.no_active_key),
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        } else {
+                                            prepareAndStart(key)
+                                        }
                                     }
+                                    else -> TunnelService.stop(this)
                                 }
-                                else -> TunnelService.stop(this)
-                            }
-                        },
-                        onSelect = { key ->
-                            scope.launch { KeyRepository.setActive(applicationContext, key.id) }
-                        },
-                        onDelete = { key ->
-                            scope.launch { KeyRepository.removeKey(applicationContext, key.id) }
-                        },
-                    )
+                            },
+                            onSelect = { key ->
+                                scope.launch { KeyRepository.setActive(applicationContext, key.id) }
+                            },
+                            onDelete = { key ->
+                                scope.launch { KeyRepository.removeKey(applicationContext, key.id) }
+                            },
+                            onOpenSettings = { screen = 1 },
+                        )
+                    }
                 }
             }
         }

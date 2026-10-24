@@ -98,6 +98,7 @@ fun HomeScreen(
     onConnectToggle: () -> Unit,
     onSelect: (AccessKey) -> Unit,
     onDelete: (AccessKey) -> Unit,
+    onOpenSettings: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -118,7 +119,7 @@ fun HomeScreen(
                 .fillMaxSize()
                 .padding(horizontal = 20.dp, vertical = 16.dp)
         ) {
-            HomeHeader(onAdd = { showAdd = true })
+            HomeHeader(onAdd = { showAdd = true }, onSettings = onOpenSettings)
             status.lastError?.let { err ->
                 Spacer(Modifier.height(8.dp))
                 Text(
@@ -192,7 +193,7 @@ fun HomeScreen(
 }
 
 @Composable
-private fun HomeHeader(onAdd: () -> Unit) {
+private fun HomeHeader(onAdd: () -> Unit, onSettings: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         androidx.compose.foundation.Image(
             painter = painterResource(R.drawable.ic_launcher),
@@ -211,6 +212,14 @@ private fun HomeHeader(onAdd: () -> Unit) {
             Icon(
                 painter = painterResource(R.drawable.ic_add),
                 contentDescription = "Add server",
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(22.dp),
+            )
+        }
+        IconButton(onClick = onSettings) {
+            Icon(
+                painter = painterResource(R.drawable.ic_settings),
+                contentDescription = "Settings",
                 tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(22.dp),
             )
