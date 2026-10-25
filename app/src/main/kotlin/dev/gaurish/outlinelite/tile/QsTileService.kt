@@ -1,8 +1,12 @@
 package dev.gaurish.outlinelite.tile
 
+import android.app.PendingIntent
+import android.content.Intent
+import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
+import dev.gaurish.outlinelite.MainActivity
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelService
@@ -28,6 +32,25 @@ class QsTileService : TileService() {
     override fun onClick() {
         val tile = qsTile ?: return
         val running = TunnelState.status.phase != TunnelPhase.DISCONNECTED
+
+        // Check if VPN consent has ever been granted
+        val consentIntent = VpnService.prepare(this)
+        if (consentIntent != null && !running) {
+            val intent = Intent(this, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                val pendingIntent = PendingIntent.getActivity(
+                    this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+                startActivityAndCollapse(pendingIntent)
+            } else {
+                @Suppress("DEPRECATION")
+                startActivityAndCollapse(intent)
+            }
+            return
+        }
+
         tile.state = if (running) Tile.STATE_INACTIVE else Tile.STATE_ACTIVE
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching {

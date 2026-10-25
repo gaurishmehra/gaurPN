@@ -82,4 +82,17 @@ class SsKeyParserTest {
         assertNull(SsKeyParser.parseHostPort("example.com"))
         assertNull(SsKeyParser.parseHostPort("example.com:x"))
     }
+
+    @Test
+    fun toSsUriRoundTripsSuccessfully() {
+        val original = AccessKey("Tokyo Server", "192.168.1.1", 8388, "chacha20-ietf-poly1305", "secret123")
+        val uri = original.toSsUri()
+        val parsed = SsKeyParser.parse(uri)
+        assertNotNull(parsed)
+        assertEquals("Tokyo Server", parsed!!.name)
+        assertEquals("192.168.1.1", parsed.host)
+        assertEquals(8388, parsed.port)
+        assertEquals("chacha20-ietf-poly1305", parsed.method)
+        assertEquals("secret123", parsed.password)
+    }
 }

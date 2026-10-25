@@ -7,28 +7,39 @@ import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
+import android.content.ClipboardManager
+import android.content.Context
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.DisposableEffectResult
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,26 +47,31 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.KeyRepository
+import dev.gaurish.outlinelite.data.SplitTunnelRepository
+import dev.gaurish.outlinelite.data.ThemeMode
 import kotlinx.coroutines.launch
 
 /**
- * Settings: background keep-alive (battery exemption + auto-reconnect + boot start)
- * and a privacy statement. Values persist in DataStore.
+ * Settings: background keep-alive, split tunneling per-app routing, theme selection, and battery exemption.
  */
 @Composable
-fun SettingsScreen(onBack: () -> Unit) {
+fun SettingsScreen(
+    onBack: () -> Unit,
+    onOpenSplitTunnel: () -> Unit,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val resources = MaterialTheme.colorScheme
@@ -64,6 +80,20 @@ fun SettingsScreen(onBack: () -> Unit) {
         .collectAsStateWithLifecycle(initialValue = true)
     val autostart by KeyRepository.observeAutostart(context)
         .collectAsStateWithLifecycle(initialValue = false)
+    val themeMode by KeyRepository.observeThemeMode(context)
+        .collectAsStateWithLifecycle(initialValue = ThemeMode.SYSTEM)
+    val excludedPackages by SplitTunnelRepository.observeExcludedPackages(context)
+        .collectAsStateWithLifecycle(initialValue = emptySet())
+    val deviceName by KeyRepository.observeDeviceName(context)
+        .collectAsStateWithLifecycle(initialValue = android.os.Build.MODEL)
+    val clusterToken by KeyRepository.observeClusterToken(context)
+        .collectAsStateWithLifecycle(initialValue = "")
+
+    var showThemeDialog by remember { mutableStateOf(false) }
+    var showDeviceNameDialog by remember { mutableStateOf(false) }
+    var draftDeviceName by remember { mutableStateOf("") }
+    var showTokenDialog by remember { mutableStateOf(false) }
+    var draftToken by remember { mutableStateOf("") }
 
     // Battery-optimization state lives in the OS, so re-check after returning
     // from the system dialog (every ON_RESUME).
@@ -113,10 +143,48 @@ fun SettingsScreen(onBack: () -> Unit) {
                 )
             }
 
+            SectionLabel("Appearance")
+            SettingsRow(
+                title = "Theme",
+                summary = when (themeMode) {
+                    ThemeMode.SYSTEM -> "System default"
+                    ThemeMode.LIGHT -> "Light"
+                    ThemeMode.DARK -> "Dark"
+                },
+                onClick = { showThemeDialog = true },
+                trailing = {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_chevron_right),
+                        contentDescription = "Select theme",
+                        tint = resources.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                },
+            )
+
+            SectionLabel("Routing")
+            SettingsRow(
+                title = "Split tunneling",
+                summary = if (excludedPackages.isEmpty()) {
+                    "Route all apps through the VPN"
+                } else {
+                    "${excludedPackages.size} app${if (excludedPackages.size == 1) "" else "s"} bypassing the VPN"
+                },
+                onClick = onOpenSplitTunnel,
+                trailing = {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_chevron_right),
+                        contentDescription = "Open split tunneling",
+                        tint = resources.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                },
+            )
+
             SectionLabel("Background")
             SettingsRow(
                 title = "Keep connection alive",
-                summary = "Reconnect automatically if the tunnel drops (up to 5 attempts)",
+                summary = "Reconnect automatically if the tunnel drops (fast retries first, then every few minutes)",
             ) {
                 Switch(
                     checked = autoReconnect,
@@ -205,6 +273,27 @@ fun SettingsScreen(onBack: () -> Unit) {
             )
 
             Spacer(Modifier.height(20.dp))
+            SectionLabel("Cluster File Sharing")
+
+            SettingsRow(
+                title = "Device Name",
+                summary = deviceName,
+                onClick = {
+                    draftDeviceName = deviceName
+                    showDeviceNameDialog = true
+                },
+            )
+
+            SettingsRow(
+                title = "Cluster Secret Key",
+                summary = if (clusterToken.isNotBlank()) "Configured (512-character secure token)" else "Not set — tap to paste 512-character token",
+                onClick = {
+                    draftToken = clusterToken
+                    showTokenDialog = true
+                },
+            )
+
+            Spacer(Modifier.height(20.dp))
             SectionLabel("Privacy")
             Text(
                 "No analytics, no accounts, no logs. Access keys are stored only on this " +
@@ -214,6 +303,151 @@ fun SettingsScreen(onBack: () -> Unit) {
                 color = resources.onSurfaceVariant,
             )
             Spacer(Modifier.height(30.dp))
+        }
+
+        // Device Name Dialog
+        if (showDeviceNameDialog) {
+            AlertDialog(
+                onDismissRequest = { showDeviceNameDialog = false },
+                title = { Text("Device Name", fontWeight = FontWeight.SemiBold) },
+                text = {
+                    Column {
+                        Text(
+                            "Name shown to other cluster devices on your in-tunnel VPN network.",
+                            fontSize = 12.sp,
+                            color = resources.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = draftDeviceName,
+                            onValueChange = { draftDeviceName = it },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        enabled = draftDeviceName.isNotBlank(),
+                        onClick = {
+                            scope.launch { KeyRepository.setDeviceName(context, draftDeviceName) }
+                            showDeviceNameDialog = false
+                        },
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDeviceNameDialog = false }) {
+                        Text("Cancel")
+                    }
+                },
+            )
+        }
+
+        // Cluster Token Dialog
+        if (showTokenDialog) {
+            AlertDialog(
+                onDismissRequest = { showTokenDialog = false },
+                title = { Text("Cluster Secret Key", fontWeight = FontWeight.SemiBold) },
+                text = {
+                    Column {
+                        Text(
+                            "Enter the 512-character secret key shared with your server relay and other devices. Key is obscured for security.",
+                            fontSize = 12.sp,
+                            color = resources.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = draftToken,
+                            onValueChange = { draftToken = it },
+                            visualTransformation = PasswordVisualTransformation(),
+                            singleLine = false,
+                            maxLines = 4,
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("Paste 512-char token...", fontSize = 12.sp) },
+                        )
+                        Spacer(Modifier.height(8.dp))
+                        TextButton(
+                            onClick = {
+                                val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                val clip = cm?.primaryClip?.getItemAt(0)?.text?.toString()
+                                if (!clip.isNullOrBlank()) {
+                                    draftToken = clip.trim()
+                                }
+                            },
+                        ) {
+                            Text("Paste from Clipboard", fontSize = 12.sp)
+                        }
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            scope.launch { KeyRepository.setClusterToken(context, draftToken) }
+                            showTokenDialog = false
+                        },
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showTokenDialog = false }) {
+                        Text("Cancel")
+                    }
+                },
+            )
+        }
+
+        // Theme Selection Dialog
+        if (showThemeDialog) {
+            AlertDialog(
+                onDismissRequest = { showThemeDialog = false },
+                title = { Text("Choose theme", fontWeight = FontWeight.SemiBold) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(
+                            ThemeMode.SYSTEM to "System default",
+                            ThemeMode.LIGHT to "Light",
+                            ThemeMode.DARK to "Dark",
+                        ).forEach { (mode, label) ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable {
+                                        scope.launch { KeyRepository.setThemeMode(context, mode) }
+                                        showThemeDialog = false
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 8.dp),
+                            ) {
+                                RadioButton(
+                                    selected = themeMode == mode,
+                                    onClick = {
+                                        scope.launch { KeyRepository.setThemeMode(context, mode) }
+                                        showThemeDialog = false
+                                    },
+                                    colors = RadioButtonDefaults.colors(
+                                        selectedColor = resources.primary
+                                    ),
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Text(
+                                    label,
+                                    fontSize = 15.sp,
+                                    color = resources.onSurface,
+                                )
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { showThemeDialog = false }) {
+                        Text("Cancel")
+                    }
+                },
+            )
         }
     }
 }
@@ -239,7 +473,7 @@ private fun SettingsRow(
 ) {
     Box(
         Modifier
-            .fillMaxSize()
+            .fillMaxWidth()
             .padding(bottom = 10.dp)
     ) {
         val clickableMod =
@@ -247,7 +481,7 @@ private fun SettingsRow(
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
                 .background(
                     MaterialTheme.colorScheme.surface,
                     MaterialTheme.shapes.large,

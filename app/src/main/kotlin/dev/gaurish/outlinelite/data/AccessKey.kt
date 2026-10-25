@@ -1,6 +1,8 @@
 package dev.gaurish.outlinelite.data
 
+import org.json.JSONObject
 import java.net.URLDecoder
+import java.net.URLEncoder
 
 data class AccessKey(
     val name: String,
@@ -13,23 +15,23 @@ data class AccessKey(
     val id: String get() = "$host:$port|$method|${password.hashCode()}"
 
     /** Backing config for outlinev.ConnectTunnel / CheckConnectivity. */
-    fun configJson(): String =
-        """{"host":"${host.jsonEsc()}","port":$port,"method":"${method.jsonEsc()}","password":"${password.jsonEsc()}"}"""
+    fun configJson(): String = JSONObject().apply {
+        put("host", host)
+        put("port", port)
+        put("method", method)
+        put("password", password)
+    }.toString()
 
     fun displayAddress(): String = "$host:$port"
-}
 
-internal fun String.jsonEsc(): String {
-    val sb = StringBuilder(length + 4)
-    for (c in this) when (c) {
-        '\\' -> sb.append("\\\\")
-        '"' -> sb.append("\\\"")
-        '\n' -> sb.append("\\n")
-        '\r' -> sb.append("\\r")
-        '\t' -> sb.append("\\t")
-        else -> sb.append(c)
+    /** Exports the key as an ss:// URI (standard Outline format). */
+    fun toSsUri(): String {
+        val rawUserinfo = "$method:$password"
+        val b64 = SsKeyParser.base64UrlEncode(rawUserinfo.toByteArray(Charsets.UTF_8))
+        val hostPart = if (host.contains(':') && !host.startsWith('[')) "[$host]" else host
+        val encodedName = runCatching { URLEncoder.encode(name, "UTF-8").replace("+", "%20") }.getOrDefault(name)
+        return "ss://$b64@$hostPart:$port#$encodedName"
     }
-    return sb.toString()
 }
 
 /**
@@ -46,6 +48,13 @@ object SsKeyParser {
 
     private const val URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     private const val STD_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+    private val URL_MAP = IntArray(128) { -1 }.apply {
+        for (i in URL_ALPHABET.indices) this[URL_ALPHABET[i].code] = i
+    }
+    private val STD_MAP = IntArray(128) { -1 }.apply {
+        for (i in STD_ALPHABET.indices) this[STD_ALPHABET[i].code] = i
+    }
 
     fun parse(rawInput: String): AccessKey? = runCatching {
         val raw = rawInput.trim()
@@ -133,19 +142,34 @@ object SsKeyParser {
         return href.substring(0, idx) to port
     }
 
-    private fun base64Decode(input: String, urlSafe: Boolean): ByteArray? {
-        val alphabet = if (urlSafe) URL_ALPHABET else STD_ALPHABET
-        if (input.isEmpty()) {
-            return null
+    fun base64UrlEncode(bytes: ByteArray): String {
+        val sb = StringBuilder()
+        var bitBuf = 0
+        var bitCount = 0
+        for (b in bytes) {
+            bitBuf = (bitBuf shl 8) or (b.toInt() and 0xFF)
+            bitCount += 8
+            while (bitCount >= 6) {
+                bitCount -= 6
+                sb.append(URL_ALPHABET[(bitBuf shr bitCount) and 0x3F])
+            }
         }
+        if (bitCount > 0) {
+            sb.append(URL_ALPHABET[(bitBuf shl (6 - bitCount)) and 0x3F])
+        }
+        return sb.toString()
+    }
+
+    private fun base64Decode(input: String, urlSafe: Boolean): ByteArray? {
+        val map = if (urlSafe) URL_MAP else STD_MAP
+        if (input.isEmpty()) return null
         val clean = input.trim().replace("=", "")
-        val lookup = HashMap<String, Int>(alphabet.length)
-        for (i in alphabet.indices) lookup[alphabet[i].toString()] = i
         var bitBuf = 0L
         var bitCount = 0
         val out = ArrayList<Byte>(clean.length * 6 / 8 + 1)
         for (c in clean) {
-            val v = alphabet.indexOf(c)
+            val code = c.code
+            val v = if (code in 0..127) map[code] else -1
             if (v < 0) return null
             bitBuf = (bitBuf shl 6) or v.toLong()
             bitCount += 6

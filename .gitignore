@@ -13,3 +13,6 @@ captures/
 .idea/
 *.iml
 .DS_Store
+dist/
+\$cache
+*.bin

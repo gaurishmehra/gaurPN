@@ -13,6 +13,7 @@ data class TunnelStatus(
     /** Elapsed realtime (ms) timestamp when the tunnel reached CONNECTED. */
     val connectedAt: Long = 0L,
     val lastError: String? = null,
+    val allowLanAccess: Boolean = false,
 )
 
 /** Single source of truth for connection state, shared across UI, tile and widget. */

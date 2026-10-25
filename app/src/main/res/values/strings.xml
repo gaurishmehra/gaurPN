@@ -21,7 +21,7 @@
     <string name="no_active_key">No server selected yet</string>
     <string name="settings_section_background">Background</string>
     <string name="settings_keepalive_title">Keep connection alive</string>
-    <string name="settings_keepalive_summary">Re-establish the tunnel automatically if it drops (up to 5 attempts)</string>
+    <string name="settings_keepalive_summary">Re-establish the tunnel automatically if it drops (fast retries first, then every few minutes)</string>
     <string name="settings_boot_title">Start on boot</string>
     <string name="settings_boot_summary">Connect automatically after a reboot</string>
     <string name="settings_battery_title">Ignore battery optimizations</string>
