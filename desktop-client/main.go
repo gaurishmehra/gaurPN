@@ -59,20 +59,26 @@ func loadSettingsFromConfig() (string, string) {
 	path := defaultConfigFile()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "Lilac", "198.51.100.1:9876"
+		return "Lilac", "127.0.0.1:9876"
 	}
 	var conf struct {
-		DeviceName string `json:"device_name"`
-		Relay      string `json:"relay"`
+		DeviceName   string `json:"device_name"`
+		Name         string `json:"name"`
+		Relay        string `json:"relay"`
+		RelayAddress string `json:"relay_address"`
 	}
 	name := "Lilac"
-	relay := "198.51.100.1:9876"
+	relay := "127.0.0.1:9876"
 	if err := json.Unmarshal(data, &conf); err == nil {
 		if strings.TrimSpace(conf.DeviceName) != "" {
 			name = strings.TrimSpace(conf.DeviceName)
+		} else if strings.TrimSpace(conf.Name) != "" {
+			name = strings.TrimSpace(conf.Name)
 		}
 		if strings.TrimSpace(conf.Relay) != "" {
 			relay = strings.TrimSpace(conf.Relay)
+		} else if strings.TrimSpace(conf.RelayAddress) != "" {
+			relay = strings.TrimSpace(conf.RelayAddress)
 		}
 	}
 	return name, relay
@@ -150,13 +156,14 @@ func runDaemon(cfg Config) {
 	if err != nil {
 		log.Fatalf("[FATAL] %v", err)
 	}
+	relayToken, peerCryptoKey := DeriveSubKeys(token)
 
 	_ = os.MkdirAll(cfg.InboxDir, 0o755)
 	log.Printf("[DAEMON] Starting gaur-share daemon as '%s' (ID: %s)", cfg.Name, cfg.DeviceID)
 	log.Printf("[DAEMON] Incoming files will be saved to: %s", cfg.InboxDir)
 
 	for {
-		conn, err := connectWS(cfg, token)
+		conn, err := connectWS(cfg, relayToken)
 		if err != nil {
 			log.Printf("[DAEMON] Connecting to in-tunnel relay (%s)... Error: %v. Retrying in 5s...", cfg.RelayAddr, err)
 			time.Sleep(5 * time.Second)
@@ -202,7 +209,7 @@ func runDaemon(cfg Config) {
 			case "peers":
 				// Peer list update
 			case "transfer_offer":
-				go handleIncomingTransfer(cfg, token, conn, envelope)
+				go handleIncomingTransfer(cfg, relayToken, peerCryptoKey, conn, envelope)
 			}
 		}
 
@@ -210,28 +217,52 @@ func runDaemon(cfg Config) {
 	}
 }
 
-func handleIncomingTransfer(cfg Config, token string, wsConn *websocket.Conn, offer map[string]interface{}) {
+func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte, wsConn *websocket.Conn, offer map[string]interface{}) {
 	transferID, _ := offer["transfer_id"].(string)
 	senderID, _ := offer["from_id"].(string)
 	senderName, _ := offer["from_name"].(string)
-	fileName, _ := offer["file_name"].(string)
+	rawFileName, _ := offer["file_name"].(string)
 	fileSizeFloat, _ := offer["file_size"].(float64)
 	senderPubB64, _ := offer["pub_key"].(string)
+	offerTag, _ := offer["auth_tag"].(string)
 	fileSize := int64(fileSizeFloat)
 
-	if transferID == "" || fileName == "" || senderPubB64 == "" {
+	if transferID == "" || rawFileName == "" || senderPubB64 == "" {
 		return
 	}
 
-	cleanFileName := filepath.Base(fileName)
+	// Finding 3: Zero-knowledge peer authentication (Relay MITM Defense)
+	expectedOfferMsg := fmt.Sprintf("offer:%s:%s:%s", transferID, cfg.DeviceID, senderPubB64)
+	if !VerifyAuthTag(peerCryptoKey, expectedOfferMsg, offerTag) {
+		log.Printf("[RECV] Incoming offer auth tag invalid! Rejecting potential MITM or unauthorized peer: %s", transferID)
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type":        "transfer_reject",
+			"target_id":   senderID,
+			"transfer_id": transferID,
+			"reason":      "auth_failed",
+		})
+		return
+	}
+
+	// Finding 1: Path Traversal Protection
+	cleanFileName := SanitizeFileName(rawFileName)
+	destPath := filepath.Join(cfg.InboxDir, cleanFileName)
+	if !IsPathInsideDirectory(destPath, cfg.InboxDir) {
+		log.Printf("[RECV] Path traversal attack detected in filename %q! Rejecting %s", rawFileName, transferID)
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type":        "transfer_reject",
+			"target_id":   senderID,
+			"transfer_id": transferID,
+			"reason":      "invalid_path",
+		})
+		return
+	}
+
 	senderPubBytes, err := base64.StdEncoding.DecodeString(senderPubB64)
 	if err != nil {
 		log.Printf("[RECV] Invalid sender public key: %v", err)
 		return
 	}
-
-	log.Printf("[RECV] Incoming file from %s (%s): %s (%d bytes)", senderName, senderID, cleanFileName, fileSize)
-	notifyUser("Incoming File Transfer", fmt.Sprintf("%s is sending %s (%.1f MB)", senderName, cleanFileName, float64(fileSize)/(1024*1024)))
 
 	// Generate receiver ephemeral keypair
 	keyPair, err := GenerateKeyPair()
@@ -247,17 +278,27 @@ func handleIncomingTransfer(cfg Config, token string, wsConn *websocket.Conn, of
 		return
 	}
 
-	// Send transfer_accept with receiver's public key
+	myPubB64 := base64.StdEncoding.EncodeToString(keyPair.Public)
+	acceptTag := ComputeAuthTag(peerCryptoKey, fmt.Sprintf("accept:%s:%s:%s", transferID, senderID, myPubB64))
+
+	safetyNumber := ComputeSafetyNumber(senderPubBytes, keyPair.Public, transferID)
+	log.Printf("[RECV] Verified transfer %s safety number: %s", transferID, safetyNumber)
+
+	log.Printf("[RECV] Incoming file from %s (%s): %s (%d bytes)", senderName, senderID, cleanFileName, fileSize)
+	notifyUser("Incoming File Transfer", fmt.Sprintf("%s is sending %s (%.1f MB)", senderName, cleanFileName, float64(fileSize)/(1024*1024)))
+
+	// Send transfer_accept with receiver's public key and auth_tag
 	acceptMsg := map[string]interface{}{
 		"type":        "transfer_accept",
 		"target_id":   senderID,
 		"transfer_id": transferID,
-		"pub_key":     base64.StdEncoding.EncodeToString(keyPair.Public),
+		"pub_key":     myPubB64,
+		"auth_tag":    acceptTag,
 	}
 	_ = wsConn.WriteJSON(acceptMsg)
 
 	// Connect to pipe
-	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=receiver&token=%s", cfg.RelayAddr, transferID, url.QueryEscape(token))
+	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=receiver&token=%s", cfg.RelayAddr, transferID, url.QueryEscape(relayToken))
 	req, _ := http.NewRequest("GET", pipeURL, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -266,10 +307,11 @@ func handleIncomingTransfer(cfg Config, token string, wsConn *websocket.Conn, of
 	}
 	defer resp.Body.Close()
 
-	destPath := filepath.Join(cfg.InboxDir, cleanFileName)
-	outFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	// Finding 2: Safe collision handling & .part temporary staging (auto-accept active)
+	partPath := filepath.Join(cfg.InboxDir, fmt.Sprintf(".%s.%s.part", cleanFileName, transferID))
+	outFile, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		log.Printf("[RECV] Failed to create destination file: %v", err)
+		log.Printf("[RECV] Failed to create temporary part file: %v", err)
 		notifyUser("Transfer Failed", fmt.Sprintf("Cannot save '%s'", cleanFileName))
 		return
 	}
@@ -279,7 +321,7 @@ func handleIncomingTransfer(cfg Config, token string, wsConn *websocket.Conn, of
 	defer func() {
 		_ = outFile.Close()
 		if !transferSuccess || (totalRead == 0 && fileSize > 0) {
-			_ = os.Remove(destPath)
+			_ = os.Remove(partPath)
 			notifyUser("Transfer Failed", fmt.Sprintf("Failed receiving '%s' from %s", cleanFileName, senderName))
 		}
 	}()
@@ -287,6 +329,7 @@ func handleIncomingTransfer(cfg Config, token string, wsConn *websocket.Conn, of
 	// Read and decrypt chunks
 	lenBuf := make([]byte, 4)
 	nonceBuf := make([]byte, 12)
+	expectedCounter := uint64(0)
 
 	startTime := time.Now()
 	for {
@@ -313,6 +356,15 @@ func handleIncomingTransfer(cfg Config, token string, wsConn *websocket.Conn, of
 			return
 		}
 
+		// Finding 4: Enforce sequential nonces
+		prefix := binary.BigEndian.Uint32(nonceBuf[:4])
+		counter := binary.BigEndian.Uint64(nonceBuf[4:])
+		if prefix != 0 || counter != expectedCounter {
+			log.Printf("[RECV] Nonce sequence violation: expected %d, got %d (prefix=%d)", expectedCounter, counter, prefix)
+			return
+		}
+		expectedCounter++
+
 		// Read ciphertext
 		cipherBuf := make([]byte, chunkLen)
 		if _, err := io.ReadFull(resp.Body, cipherBuf); err != nil {
@@ -334,14 +386,21 @@ func handleIncomingTransfer(cfg Config, token string, wsConn *websocket.Conn, of
 	}
 
 	if totalRead > 0 || fileSize == 0 {
+		_ = outFile.Close()
+		// Finding 2: Safe collision resolution and atomic rename
+		finalPath := ResolveUniqueFile(cfg.InboxDir, cleanFileName)
+		if err := os.Rename(partPath, finalPath); err != nil {
+			log.Printf("[RECV] Rename failed: %v", err)
+			return
+		}
 		transferSuccess = true
 		duration := time.Since(startTime).Seconds()
 		if duration <= 0 {
 			duration = 0.001
 		}
 		mbps := (float64(totalRead) / (1024 * 1024)) / duration
-		log.Printf("[RECV] SUCCESS: Saved '%s' (%.2f MB at %.1f MB/s)", cleanFileName, float64(totalRead)/(1024*1024), mbps)
-		notifyUser("Transfer Complete", fmt.Sprintf("Saved '%s' (%.1f MB)", cleanFileName, float64(totalRead)/(1024*1024)))
+		log.Printf("[RECV] SUCCESS: Saved '%s' (%.2f MB at %.1f MB/s)", filepath.Base(finalPath), float64(totalRead)/(1024*1024), mbps)
+		notifyUser("Transfer Complete", fmt.Sprintf("Saved '%s' (%.1f MB)", filepath.Base(finalPath), float64(totalRead)/(1024*1024)))
 	}
 }
 
@@ -361,8 +420,9 @@ func runList(cfg Config, asJSON bool) {
 		}
 		log.Fatalf("[FATAL] %v", err)
 	}
+	relayToken, _ := DeriveSubKeys(token)
 
-	conn, err := connectWS(cfg, token)
+	conn, err := connectWS(cfg, relayToken)
 	if err != nil {
 		if asJSON {
 			fmt.Println("[]")
@@ -424,7 +484,8 @@ func runList(cfg Config, asJSON bool) {
 				}
 				fmt.Printf("%-24s %-28s %-12s\n", id, name, status)
 			}
-			fmt.Println("────────────────────────────────────────────────────────────────────────\n")
+			fmt.Println("────────────────────────────────────────────────────────────────────────")
+			fmt.Println()
 			return
 		}
 	}
@@ -442,8 +503,9 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 	if err != nil {
 		log.Fatalf("[FATAL] %v", err)
 	}
+	relayToken, peerCryptoKey := DeriveSubKeys(token)
 
-	conn, err := connectWS(cfg, token)
+	conn, err := connectWS(cfg, relayToken)
 	if err != nil {
 		log.Fatalf("[FATAL] Cannot connect to relay at %s: %v", cfg.RelayAddr, err)
 	}
@@ -488,6 +550,9 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 		log.Fatalf("[FATAL] KeyPair generation failed: %v", err)
 	}
 
+	myPubB64 := base64.StdEncoding.EncodeToString(keyPair.Public)
+	offerTag := ComputeAuthTag(peerCryptoKey, fmt.Sprintf("offer:%s:%s:%s", transferID, targetID, myPubB64))
+
 	// Send offer
 	offerMsg := map[string]interface{}{
 		"type":        "transfer_offer",
@@ -495,7 +560,8 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 		"transfer_id": transferID,
 		"file_name":   fileName,
 		"file_size":   fileSize,
-		"pub_key":     base64.StdEncoding.EncodeToString(keyPair.Public),
+		"pub_key":     myPubB64,
+		"auth_tag":    offerTag,
 	}
 	_ = conn.WriteJSON(offerMsg)
 	fmt.Printf("Sent transfer offer for '%s' (%.2f MB). Waiting for acceptance...\n", fileName, float64(fileSize)/(1024*1024))
@@ -512,20 +578,29 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 		_ = json.Unmarshal(msgBytes, &envelope)
 		if envelope["type"] == "transfer_accept" && envelope["transfer_id"] == transferID {
 			receiverPubB64, _ := envelope["pub_key"].(string)
+			acceptTag, _ := envelope["auth_tag"].(string)
+
+			expectedAcceptMsg := fmt.Sprintf("accept:%s:%s:%s", transferID, cfg.DeviceID, receiverPubB64)
+			if !VerifyAuthTag(peerCryptoKey, expectedAcceptMsg, acceptTag) {
+				log.Fatalf("[FATAL] Transfer accept auth tag verification failed! Rejecting potential MITM.")
+			}
+
 			receiverPubBytes, _ := base64.StdEncoding.DecodeString(receiverPubB64)
 			aesKey, err = DeriveSharedSecret(keyPair.Private, receiverPubBytes)
 			if err != nil {
 				log.Fatalf("[FATAL] Key derivation failed: %v", err)
 			}
-			fmt.Println("Transfer accepted! Ephemeral E2EE session verified.")
+			safetyNumber := ComputeSafetyNumber(keyPair.Public, receiverPubBytes, transferID)
+			fmt.Printf("Transfer accepted! Ephemeral E2EE session verified. Safety number: %s\n", safetyNumber)
 			break
 		} else if envelope["type"] == "transfer_reject" && envelope["transfer_id"] == transferID {
-			log.Fatalf("[FATAL] Peer declined the transfer.")
+			reason, _ := envelope["reason"].(string)
+			log.Fatalf("[FATAL] Peer declined the transfer (reason: %s).", reason)
 		}
 	}
 
 	// Connect to pipe as sender
-	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=sender&token=%s", cfg.RelayAddr, transferID, url.QueryEscape(token))
+	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=sender&token=%s", cfg.RelayAddr, transferID, url.QueryEscape(relayToken))
 	pipeReader, pipeWriter := io.Pipe()
 
 	uploadDone := make(chan error, 1)
@@ -561,6 +636,7 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 		n, readErr := inFile.Read(chunkBuf)
 		if n > 0 {
 			nonce := make([]byte, 12)
+			binary.BigEndian.PutUint32(nonce[:4], 0)
 			binary.BigEndian.PutUint64(nonce[4:], nonceCounter)
 			nonceCounter++
 
@@ -601,7 +677,7 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 		log.Fatalf("\n[FATAL] Pipe upload failed: %v\n", err)
 	}
 
-	notifyUser("Transfer Sent", fmt.Sprintf("Sent '%s' (%.1f MB)", fileName, float64(sentBytes)/(1024*1024)))
+	notifyUser("Transfer Sent", fmt.Sprintf("Sent '%s' (%.1f MB) to %s", fileName, float64(sentBytes)/(1024*1024), targetName))
 	fmt.Printf("\nTransfer successfully completed in %.1fs!\n", time.Since(startTime).Seconds())
 }
 

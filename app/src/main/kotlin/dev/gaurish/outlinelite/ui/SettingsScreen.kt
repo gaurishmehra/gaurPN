@@ -88,12 +88,16 @@ fun SettingsScreen(
         .collectAsStateWithLifecycle(initialValue = android.os.Build.MODEL)
     val clusterToken by KeyRepository.observeClusterToken(context)
         .collectAsStateWithLifecycle(initialValue = "")
+    val relayAddress by KeyRepository.observeRelayAddress(context)
+        .collectAsStateWithLifecycle(initialValue = KeyRepository.DEFAULT_RELAY_ADDR)
 
     var showThemeDialog by remember { mutableStateOf(false) }
     var showDeviceNameDialog by remember { mutableStateOf(false) }
     var draftDeviceName by remember { mutableStateOf("") }
     var showTokenDialog by remember { mutableStateOf(false) }
     var draftToken by remember { mutableStateOf("") }
+    var showRelayDialog by remember { mutableStateOf(false) }
+    var draftRelay by remember { mutableStateOf("") }
 
     // Battery-optimization state lives in the OS, so re-check after returning
     // from the system dialog (every ON_RESUME).
@@ -293,6 +297,15 @@ fun SettingsScreen(
                 },
             )
 
+            SettingsRow(
+                title = "Relay Address",
+                summary = relayAddress,
+                onClick = {
+                    draftRelay = relayAddress
+                    showRelayDialog = true
+                },
+            )
+
             Spacer(Modifier.height(20.dp))
             SectionLabel("Privacy")
             Text(
@@ -393,6 +406,48 @@ fun SettingsScreen(
                 },
                 dismissButton = {
                     TextButton(onClick = { showTokenDialog = false }) {
+                        Text("Cancel")
+                    }
+                },
+            )
+        }
+
+        // Relay Address Dialog
+        if (showRelayDialog) {
+            AlertDialog(
+                onDismissRequest = { showRelayDialog = false },
+                title = { Text("Relay Address", fontWeight = FontWeight.SemiBold) },
+                text = {
+                    Column {
+                        Text(
+                            "In-tunnel file sharing relay endpoint (host:port). Defaults to 127.0.0.1:9876.",
+                            fontSize = 12.sp,
+                            color = resources.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(12.dp))
+                        OutlinedTextField(
+                            value = draftRelay,
+                            onValueChange = { draftRelay = it },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            placeholder = { Text("127.0.0.1:9876", fontSize = 12.sp) },
+                        )
+                    }
+                },
+                confirmButton = {
+                    val isValid = draftRelay.trim().contains(":")
+                    Button(
+                        enabled = isValid,
+                        onClick = {
+                            scope.launch { KeyRepository.setRelayAddress(context, draftRelay) }
+                            showRelayDialog = false
+                        },
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRelayDialog = false }) {
                         Text("Cancel")
                     }
                 },

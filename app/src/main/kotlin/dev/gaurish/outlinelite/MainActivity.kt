@@ -83,8 +83,6 @@ class MainActivity : ComponentActivity() {
         }
         enableEdgeToEdge()
         handleSsIntent(intent)
-        handleTestSendIntent(intent)
-        dev.gaurish.outlinelite.transfer.RelayManager.start(this)
 
         setContent {
             val themeMode by KeyRepository.observeThemeMode(applicationContext)
@@ -168,7 +166,6 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleSsIntent(intent)
-        handleTestSendIntent(intent)
     }
 
     private fun prepareAndStart(key: AccessKey) {
@@ -184,21 +181,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun handleTestSendIntent(intent: Intent?) {
-        if (intent?.action == "dev.gaurish.outlinelite.TEST_SEND") {
-            val peerId = intent.getStringExtra("peer_id")
-            lifecycleScope.launch {
-                val peerList = dev.gaurish.outlinelite.transfer.RelayManager.peers.first { list ->
-                    list.any { !it.isSelf }
-                }
-                val target = peerList.firstOrNull { it.id == peerId } ?: peerList.first { !it.isSelf }
-                android.util.Log.i("MainActivity", "Sending test file to ${target.name} (${target.id})")
-                val testFile = File(cacheDir, "verified_phone_to_laptop.txt")
-                testFile.writeText("Verified: Phone to laptop transfer works flawlessly with full payload bytes and notifications!")
-                dev.gaurish.outlinelite.transfer.RelayManager.sendFile(this@MainActivity, target, Uri.fromFile(testFile))
-            }
-        }
-    }
 
     private fun handleSsIntent(intent: Intent?) {
         val data: String = intent?.data?.toString() ?: return

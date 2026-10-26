@@ -9,8 +9,16 @@
 * **Zero Wi-Fi Leakage:** No local network broadcasts, no mDNS/Bonjour, no ARP probes, and no raw internet UDP hole punching. All traffic flows strictly into the VPN's TUN interface.
 * **Double-Layer Encryption:**
   1. *Outer Layer:* Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`). Hides everything from local Wi-Fi, ISP, and cellular carriers.
-  2. *Inner Layer:* End-to-End Ephemeral Key Exchange (**X25519**) + Authenticated Streaming (**ChaCha20-Poly1305**).
-* **Zero-Knowledge VPS:** The relay daemon on the VPS binds exclusively to `127.0.0.1:9876` (localhost loopback). It never touches disk and cannot inspect file names or payloads.
+  2. *Inner Layer:* End-to-End Ephemeral Key Exchange (**NIST P-256 / secp256r1 ECDH**) + Key Derivation (**HKDF-SHA256**) + Authenticated Streaming (**AES-256-GCM**).
+* **Zero-Knowledge Dual-Key Architecture:**
+  - The shared cluster token $T$ is never sent in raw form to the relay.
+  - Clients derive $K_{relay} = \text{hex}(\text{HMAC-SHA256}(T, \text{"gaur-relay-auth-v1"}))$ for relay authentication and presence.
+  - Clients derive $K_{peer} = \text{HMAC-SHA256}(T, \text{"gaur-peer-auth-v1"})$ kept strictly on end-devices.
+  - Peer offers and accepts are signed with $K_{peer}$ via HMAC-SHA256 tags binding the transfer ID, recipient ID, and ephemeral public keys, preventing malicious or compromised relays from performing active Man-In-The-Middle (MITM) key swaps.
+* **Sequential Nonce Integrity:** Every 64 KB chunk uses a 96-bit nonce containing a strict sequential counter (`[00 00 00 00][counter]`). Receivers reject any out-of-order, dropped, or duplicated chunks.
+* **Safety Numbers:** Ephemeral public keys and transfer IDs generate a deterministic 30-digit numeric fingerprint (6 blocks of 5 decimal digits) for out-of-band identity verification.
+* **Path Traversal & Collision Protection:** Filenames are sanitized against directory traversal attacks, received streams are staged into hidden `.part` files until GCM tag verification succeeds, and duplicate names resolve automatically to numbered files (`file (1).ext`) without interrupting automatic file acceptance.
+* **In-Memory Zero-Knowledge VPS:** The relay daemon on the VPS binds exclusively to `127.0.0.1:9876` (localhost loopback). It pipes streams in memory via `io.Pipe`, never writes payloads to disk, and cannot decrypt file contents.
 
 ---
 
@@ -108,11 +116,11 @@ gaur-share send "Pixel 8" ~/Documents/report.pdf
 ```
 *Output:*
 ```text
-Connecting to in-tunnel relay (127.0.0.1:9876)... Connected.
-Exchanging ephemeral X25519 keys with Pixel 8... Key agreement verified.
-Streaming encrypted chunks (AES-256-GCM / ChaCha20-Poly1305)...
-[████████████████████████████████████████] 100% (14.2 MB / 14.2 MB) - 48.2 MB/s
-Transfer complete!
+Target located: Pixel 8 (phone-a81f3b)
+Sent transfer offer for 'report.pdf' (14.20 MB). Waiting for acceptance...
+Transfer accepted! Ephemeral E2EE session verified. Safety number: 63877 21084 56392 35848 28620 54908
+Streaming: [██████████████████████████████] 100.0% (14.2/14.2 MB) - 48.2 MB/s
+Transfer successfully completed in 0.3s!
 ```
 
 ---

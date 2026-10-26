@@ -193,6 +193,7 @@ class TunnelService : VpnService() {
         pushNotification()
         startNetworkMonitoring()
         startWatchdog()
+        dev.gaurish.outlinelite.transfer.RelayManager.start(this@TunnelService)
     }
 
     /** Detects a dropped tunnel and probes server reachability; routes both through [fail] to re-establish. */
@@ -427,6 +428,7 @@ class TunnelService : VpnService() {
         goTunnel = null
         tunPfd?.let { fd -> runCatching { fd.close() } }
         tunPfd = null
+        dev.gaurish.outlinelite.transfer.RelayManager.stop()
     }
 
     private fun Throwable.logMessage(): String {

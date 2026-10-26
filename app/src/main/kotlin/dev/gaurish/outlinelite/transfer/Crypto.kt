@@ -1,9 +1,12 @@
 package dev.gaurish.outlinelite.transfer
 
+import java.io.File
 import java.math.BigInteger
+import java.nio.ByteBuffer
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
+import java.security.MessageDigest
 import java.security.PublicKey
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
@@ -87,6 +90,107 @@ object Crypto {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
         return cipher.doFinal(ciphertext)
+    }
+
+    fun deriveSubKeys(clusterToken: String): Pair<String, ByteArray> {
+        val tokenBytes = clusterToken.toByteArray(Charsets.UTF_8)
+
+        val macRelay = Mac.getInstance("HmacSHA256")
+        macRelay.init(SecretKeySpec(tokenBytes, "HmacSHA256"))
+        val relayBytes = macRelay.doFinal("gaur-relay-auth-v1".toByteArray(Charsets.UTF_8))
+        val relayToken = relayBytes.joinToString("") { "%02x".format(it) }
+
+        val macPeer = Mac.getInstance("HmacSHA256")
+        macPeer.init(SecretKeySpec(tokenBytes, "HmacSHA256"))
+        val peerCryptoKey = macPeer.doFinal("gaur-peer-auth-v1".toByteArray(Charsets.UTF_8))
+
+        return Pair(relayToken, peerCryptoKey)
+    }
+
+    fun computeAuthTag(peerCryptoKey: ByteArray, message: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        val tagBytes = mac.doFinal(message.toByteArray(Charsets.UTF_8))
+        return tagBytes.joinToString("") { "%02x".format(it) }
+    }
+
+    fun verifyAuthTag(peerCryptoKey: ByteArray, message: String, tagHex: String): Boolean {
+        if (tagHex.isBlank()) return false
+        val expectedTag = computeAuthTag(peerCryptoKey, message)
+        return MessageDigest.isEqual(
+            expectedTag.toByteArray(Charsets.UTF_8),
+            tagHex.lowercase().toByteArray(Charsets.UTF_8)
+        )
+    }
+
+    fun computeSafetyNumber(alicePub: ByteArray, bobPub: ByteArray, transferId: String): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val compare = compareByteArrays(alicePub, bobPub)
+        if (compare <= 0) {
+            md.update(alicePub)
+            md.update(bobPub)
+        } else {
+            md.update(bobPub)
+            md.update(alicePub)
+        }
+        md.update(transferId.toByteArray(Charsets.UTF_8))
+        val digest = md.digest()
+
+        val sb = StringBuilder()
+        for (i in 0 until 6) {
+            val offset = i * 4
+            val value = ByteBuffer.wrap(digest, offset, 4).int.toLong() and 0xFFFFFFFFL
+            val positive = value % 100000L
+            if (i > 0) sb.append(" ")
+            sb.append(String.format(java.util.Locale.US, "%05d", positive))
+        }
+        return sb.toString()
+    }
+
+    private fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
+        val minLen = minOf(a.size, b.size)
+        for (i in 0 until minLen) {
+            val byteA = a[i].toInt() and 0xFF
+            val byteB = b[i].toInt() and 0xFF
+            if (byteA != byteB) return byteA - byteB
+        }
+        return a.size - b.size
+    }
+
+    fun sanitizeFileName(rawName: String): String {
+        val normalized = rawName.trim().trimEnd('/', '\\').replace('\\', '/')
+        val base = normalized.substringAfterLast('/')
+        val clean = base.replace(Regex("[\\x00-\\x1F\\x7F/\\\\:*?\"<>|]"), "_").trim()
+        val sanitized = clean.replace(Regex("^\\.+"), "")
+        return if (sanitized.isBlank()) "download_${System.currentTimeMillis()}" else sanitized
+    }
+
+    fun isPathInsideDirectory(destFile: File, baseDir: File): Boolean {
+        val canonicalBase = baseDir.canonicalFile
+        var parent: File? = destFile.canonicalFile.parentFile
+        while (parent != null) {
+            if (parent == canonicalBase) return true
+            parent = parent.parentFile
+        }
+        return false
+    }
+
+    fun resolveUniqueFile(targetDir: File, fileName: String): File {
+        val initialFile = File(targetDir, fileName)
+        if (!initialFile.exists()) {
+            return initialFile
+        }
+        val dotIndex = fileName.lastIndexOf('.')
+        val stem = if (dotIndex > 0) fileName.substring(0, dotIndex) else fileName
+        val ext = if (dotIndex > 0) fileName.substring(dotIndex) else ""
+
+        for (i in 1..1000) {
+            val candidate = File(targetDir, "$stem ($i)$ext")
+            if (!candidate.exists()) {
+                return candidate
+            }
+        }
+        return File(targetDir, "$stem (${System.currentTimeMillis()})$ext")
     }
 
     private fun toFixedLengthByteArray(bi: BigInteger, length: Int): ByteArray {

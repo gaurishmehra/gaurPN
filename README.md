@@ -21,6 +21,8 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 ### In-Tunnel File Sharing (`gaur-share`)
 - **Zero Local Wi-Fi Leakage**: All traffic stays inside the Shadowsocks tunnel. No mDNS, no Bonjour, no ARP broadcasts, and no UDP hole punching on your local network.
 - **Double Encryption**: Outer Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`) wraps an inner layer of ephemeral ECDH (NIST P-256) key exchange, HKDF-SHA256 session key derivation, and authenticated AES-256-GCM chunked streaming (64 KB chunks with sequential nonces).
+- **Zero-Knowledge Dual-Key Architecture**: Derives separate relay presence keys ($K_{relay}$) and local peer authentication keys ($K_{peer}$), with HMAC-SHA256 authentication tags preventing relay Man-In-The-Middle attacks and safety number verification.
+- **Path Traversal & Collision Protection**: Automatic filename sanitization, staging to `.part` files, and automatic non-destructive collision resolution preserving seamless file auto-acceptance.
 - **Zero-Knowledge VPS Relay**: The relay daemon binds only to `127.0.0.1:9876` on your VPS. It pipes streams in memory via `io.Pipe`, never writes payloads to disk, and requires pre-shared cluster token authentication.
 - **Android Integration**: Live peer cards on the home screen, native file picker, progress notifications, and automatic saving to the public `Downloads` directory.
 - **Desktop Companion Client**: Single standalone Go binary for Linux, macOS, and Windows with `daemon`, `list`, and `send` commands.

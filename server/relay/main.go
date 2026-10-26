@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -26,7 +30,20 @@ type Peer struct {
 	ID       string          `json:"id"`
 	Name     string          `json:"name"`
 	conn     *websocket.Conn `json:"-"`
+	writeMu  sync.Mutex      `json:"-"`
 	joinedAt time.Time       `json:"joined_at"`
+}
+
+func (p *Peer) WriteMessage(messageType int, data []byte) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	return p.conn.WriteMessage(messageType, data)
+}
+
+func (p *Peer) WriteJSON(v interface{}) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	return p.conn.WriteJSON(v)
 }
 
 type Hub struct {
@@ -39,16 +56,17 @@ type Hub struct {
 }
 
 type PipeSession struct {
-	transferID      string
-	pr              *io.PipeReader
-	pw              *io.PipeWriter
-	receiverReady   chan struct{}
-	senderReady     chan struct{}
-	done            chan struct{}
-	closeRecvOnce   sync.Once
-	closeSenderOnce sync.Once
-	closeDoneOnce   sync.Once
-	created         time.Time
+	transferID        string
+	pr                *io.PipeReader
+	pw                *io.PipeWriter
+	receiverReady     chan struct{}
+	senderReady       chan struct{}
+	done              chan struct{}
+	closeRecvOnce     sync.Once
+	closeSenderOnce   sync.Once
+	closeDoneOnce     sync.Once
+	created           time.Time
+	activeConnections int32
 }
 
 func newPipeSession(transferID string) *PipeSession {
@@ -96,7 +114,7 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 }
 
 func NewHub(token []byte) *Hub {
-	return &Hub{
+	h := &Hub{
 		peers: make(map[string]*Peer),
 		token: token,
 		pipes: make(map[string]*PipeSession),
@@ -106,13 +124,37 @@ func NewHub(token []byte) *Hub {
 			},
 		},
 	}
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		for range ticker.C {
+			h.pipeMu.Lock()
+			now := time.Now()
+			for id, session := range h.pipes {
+				if now.Sub(session.created) > 3*time.Minute {
+					_ = session.pr.Close()
+					_ = session.pw.Close()
+					delete(h.pipes, id)
+					log.Printf("[PIPE] Evicted expired pipe session %s", id)
+				}
+			}
+			h.pipeMu.Unlock()
+		}
+	}()
+	return h
 }
 
 func (h *Hub) authenticate(token string) bool {
 	if len(h.token) == 0 {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(token), h.token) == 1
+	if subtle.ConstantTimeCompare([]byte(token), h.token) == 1 {
+		return true
+	}
+	// Check derived relay auth token if h.token is the master cluster token
+	mac := hmac.New(sha256.New, h.token)
+	mac.Write([]byte("gaur-relay-auth-v1"))
+	derived := hex.EncodeToString(mac.Sum(nil))
+	return subtle.ConstantTimeCompare([]byte(token), []byte(derived)) == 1
 }
 
 func (h *Hub) broadcastPeerList() {
@@ -138,7 +180,7 @@ func (h *Hub) broadcastPeerList() {
 	}
 
 	for _, p := range h.peers {
-		_ = p.conn.WriteMessage(websocket.TextMessage, payload)
+		_ = p.WriteMessage(websocket.TextMessage, payload)
 	}
 }
 
@@ -206,7 +248,7 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		msgType, _ := envelope["type"].(string)
 		if msgType == "ping" {
-			_ = conn.WriteJSON(map[string]string{"type": "pong"})
+			_ = peer.WriteJSON(map[string]string{"type": "pong"})
 			continue
 		}
 
@@ -225,7 +267,7 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		if exists && targetPeer != nil {
 			forwardBytes, _ := json.Marshal(envelope)
-			_ = targetPeer.conn.WriteMessage(websocket.TextMessage, forwardBytes)
+			_ = targetPeer.WriteMessage(websocket.TextMessage, forwardBytes)
 		}
 	}
 }
@@ -249,18 +291,19 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 		session = newPipeSession(transferID)
 		h.pipes[transferID] = session
 	}
+	atomic.AddInt32(&session.activeConnections, 1)
 	h.pipeMu.Unlock()
 
 	defer func() {
-		h.pipeMu.Lock()
-		if cur, ok := h.pipes[transferID]; ok && cur == session {
-			select {
-			case <-session.done:
+		if atomic.AddInt32(&session.activeConnections, -1) <= 0 {
+			h.pipeMu.Lock()
+			if cur, ok := h.pipes[transferID]; ok && cur == session {
 				delete(h.pipes, transferID)
-			default:
 			}
+			h.pipeMu.Unlock()
+			_ = session.pr.Close()
+			_ = session.pw.Close()
 		}
-		h.pipeMu.Unlock()
 	}()
 
 	if role == "receiver" {

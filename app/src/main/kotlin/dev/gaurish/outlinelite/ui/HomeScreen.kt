@@ -881,9 +881,10 @@ private fun ServerRow(
 private suspend fun measurePing(host: String, port: Int): Long? = withContext(Dispatchers.IO) {
     runCatching {
         val start = SystemClock.elapsedRealtime()
-        val socket = Socket()
-        socket.connect(InetSocketAddress(host, port), 2500)
-        socket.close()
+        Socket().use { socket ->
+            socket.soTimeout = 2500
+            socket.connect(InetSocketAddress(host, port), 2500)
+        }
         SystemClock.elapsedRealtime() - start
     }.getOrNull()
 }

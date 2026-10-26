@@ -25,6 +25,21 @@ object KeyRepository {
     private val THEME = stringPreferencesKey("theme_mode")
     private val DEVICE_NAME = stringPreferencesKey("cluster_device_name")
     private val CLUSTER_TOKEN = stringPreferencesKey("cluster_token")
+    private val RELAY_ADDR = stringPreferencesKey("cluster_relay_addr_v1")
+    const val DEFAULT_RELAY_ADDR = "198.51.100.1:9876"
+
+    fun observeRelayAddress(context: Context): Flow<String> =
+        context.dataStore.data.map { it[RELAY_ADDR] ?: DEFAULT_RELAY_ADDR }
+
+    suspend fun getRelayAddress(context: Context): String =
+        context.dataStore.data.first()[RELAY_ADDR] ?: DEFAULT_RELAY_ADDR
+
+    suspend fun setRelayAddress(context: Context, address: String) {
+        val clean = address.trim()
+        if (clean.isNotBlank()) {
+            context.dataStore.edit { it[RELAY_ADDR] = clean }
+        }
+    }
 
     fun observeDeviceName(context: Context): Flow<String> =
         context.dataStore.data.map { it[DEVICE_NAME] ?: android.os.Build.MODEL }

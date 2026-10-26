@@ -1,13 +1,23 @@
 package main
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
 
 	"golang.org/x/crypto/hkdf"
 )
@@ -70,3 +80,105 @@ func DecryptChunk(key []byte, nonce []byte, ciphertext []byte) ([]byte, error) {
 	}
 	return gcm.Open(nil, nonce, ciphertext, nil)
 }
+
+func DeriveSubKeys(clusterToken string) (relayToken string, peerCryptoKey []byte) {
+	tokenBytes := []byte(clusterToken)
+
+	macRelay := hmac.New(sha256.New, tokenBytes)
+	macRelay.Write([]byte("gaur-relay-auth-v1"))
+	relayToken = hex.EncodeToString(macRelay.Sum(nil))
+
+	macPeer := hmac.New(sha256.New, tokenBytes)
+	macPeer.Write([]byte("gaur-peer-auth-v1"))
+	peerCryptoKey = macPeer.Sum(nil)
+
+	return relayToken, peerCryptoKey
+}
+
+func ComputeAuthTag(peerCryptoKey []byte, message string) string {
+	mac := hmac.New(sha256.New, peerCryptoKey)
+	mac.Write([]byte(message))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func VerifyAuthTag(peerCryptoKey []byte, message string, tagHex string) bool {
+	if strings.TrimSpace(tagHex) == "" {
+		return false
+	}
+	expected := ComputeAuthTag(peerCryptoKey, message)
+	return subtle.ConstantTimeCompare([]byte(strings.ToLower(tagHex)), []byte(expected)) == 1
+}
+
+func ComputeSafetyNumber(alicePub, bobPub []byte, transferID string) string {
+	h := sha256.New()
+	if bytes.Compare(alicePub, bobPub) <= 0 {
+		h.Write(alicePub)
+		h.Write(bobPub)
+	} else {
+		h.Write(bobPub)
+		h.Write(alicePub)
+	}
+	h.Write([]byte(transferID))
+	digest := h.Sum(nil)
+
+	blocks := make([]string, 6)
+	for i := 0; i < 6; i++ {
+		offset := i * 4
+		val := binary.BigEndian.Uint32(digest[offset : offset+4])
+		positive := uint64(val) % 100000
+		blocks[i] = fmt.Sprintf("%05d", positive)
+	}
+	return strings.Join(blocks, " ")
+}
+
+func SanitizeFileName(rawName string) string {
+	normalized := strings.ReplaceAll(rawName, "\\", "/")
+	normalized = strings.TrimRight(strings.TrimSpace(normalized), "/")
+	idx := strings.LastIndex(normalized, "/")
+	base := normalized
+	if idx >= 0 {
+		base = normalized[idx+1:]
+	}
+	reg := regexp.MustCompile(`[\x00-\x1F\x7F/\\:*?"<>|]`)
+	clean := strings.TrimSpace(reg.ReplaceAllString(base, "_"))
+	clean = strings.TrimLeft(clean, ".")
+	if clean == "" {
+		return fmt.Sprintf("download_%d", time.Now().Unix())
+	}
+	return clean
+}
+
+func IsPathInsideDirectory(destPath, baseDir string) bool {
+	absBase, err := filepath.Abs(baseDir)
+	if err != nil {
+		return false
+	}
+	absDest, err := filepath.Abs(destPath)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absBase, absDest)
+	if err != nil {
+		return false
+	}
+	return !strings.HasPrefix(rel, "..") && rel != ".."
+}
+
+func ResolveUniqueFile(targetDir string, fileName string) string {
+	initialPath := filepath.Join(targetDir, fileName)
+	if _, err := os.Stat(initialPath); os.IsNotExist(err) {
+		return initialPath
+	}
+
+	ext := filepath.Ext(fileName)
+	stem := strings.TrimSuffix(fileName, ext)
+
+	for i := 1; i <= 1000; i++ {
+		candidate := filepath.Join(targetDir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+		if _, err := os.Stat(candidate); os.IsNotExist(err) {
+			return candidate
+		}
+	}
+	return filepath.Join(targetDir, fmt.Sprintf("%s (%d)%s", stem, time.Now().UnixNano(), ext))
+}
+
