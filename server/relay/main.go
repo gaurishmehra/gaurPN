@@ -34,6 +34,11 @@ type Peer struct {
 	joinedAt time.Time       `json:"joined_at"`
 }
 
+type PeerInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 func (p *Peer) WriteMessage(messageType int, data []byte) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
@@ -158,30 +163,37 @@ func (h *Hub) authenticate(token string) bool {
 }
 
 func (h *Hub) broadcastPeerList() {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-
-	type PeerInfo struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-
-	list := make([]PeerInfo, 0, len(h.peers))
-	for _, p := range h.peers {
-		list = append(list, PeerInfo{ID: p.ID, Name: p.Name})
-	}
-
-	payload, err := json.Marshal(map[string]interface{}{
-		"type":  "peers",
-		"peers": list,
-	})
+	list, peers := h.peersSnapshot()
+	payload, err := json.Marshal(map[string]interface{}{"type": "peers", "peers": list})
 	if err != nil {
 		return
 	}
 
-	for _, p := range h.peers {
+	for _, p := range peers {
 		_ = p.WriteMessage(websocket.TextMessage, payload)
 	}
+}
+
+func (h *Hub) sendPeerList(peer *Peer) {
+	list, _ := h.peersSnapshot()
+	payload, err := json.Marshal(map[string]interface{}{"type": "peers", "peers": list})
+	if err != nil {
+		return
+	}
+	_ = peer.WriteMessage(websocket.TextMessage, payload)
+}
+
+func (h *Hub) peersSnapshot() ([]PeerInfo, []*Peer) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	list := make([]PeerInfo, 0, len(h.peers))
+	peers := make([]*Peer, 0, len(h.peers))
+	for _, peer := range h.peers {
+		list = append(list, PeerInfo{ID: peer.ID, Name: peer.Name})
+		peers = append(peers, peer)
+	}
+	return list, peers
 }
 
 func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -249,6 +261,10 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		msgType, _ := envelope["type"].(string)
 		if msgType == "ping" {
 			_ = peer.WriteJSON(map[string]string{"type": "pong"})
+			continue
+		}
+		if msgType == "list_peers" {
+			h.sendPeerList(peer)
 			continue
 		}
 

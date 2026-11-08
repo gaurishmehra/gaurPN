@@ -18,10 +18,13 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
@@ -56,8 +59,11 @@ import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.transfer.ClusterPeer
 import dev.gaurish.outlinelite.transfer.RelayManager
 import dev.gaurish.outlinelite.transfer.TransferState
+import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelService
 import dev.gaurish.outlinelite.tunnel.TunnelStatus
+import dev.gaurish.outlinelite.tunnel.TunnelState
+import androidx.compose.ui.res.stringResource
 
 @Composable
 fun LanAccessRow(
@@ -259,6 +265,94 @@ fun ClusterSharingSection(
             }
         }
     }
+}
+
+@Composable
+fun ShareTargetDialog(
+    uri: Uri,
+    onConnectToVpn: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val peers by RelayManager.peers.collectAsStateWithLifecycle()
+    val token by KeyRepository.observeClusterToken(context).collectAsStateWithLifecycle(initialValue = "")
+    val tunnelStatus by TunnelState.flow.collectAsStateWithLifecycle()
+    val otherPeers = remember(peers) { peers.filter { !it.isSelf } }
+    val isVpnConnected = tunnelStatus.phase == TunnelPhase.CONNECTED
+    val hasAvailablePeers = isVpnConnected && otherPeers.isNotEmpty()
+    val emptyStateMessage = when {
+        !isVpnConnected && tunnelStatus.phase == TunnelPhase.CONNECTING -> R.string.share_waiting_for_vpn
+        !isVpnConnected && tunnelStatus.phase == TunnelPhase.STOPPING -> R.string.share_vpn_stopping
+        !isVpnConnected -> R.string.share_connect_vpn
+        token.isBlank() -> R.string.share_configure_cluster
+        else -> R.string.share_no_devices
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.share_choose_device)) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                if (!hasAvailablePeers) {
+                    Text(
+                        stringResource(emptyStateMessage),
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    Text(
+                        stringResource(R.string.share_select_destination),
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    otherPeers.forEach { peer ->
+                        PeerRow(
+                            peer = peer,
+                            onSendClick = {
+                                RelayManager.sendFile(context, peer, uri)
+                                onDismiss()
+                            },
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            when {
+                tunnelStatus.phase == TunnelPhase.DISCONNECTED -> {
+                    Button(onClick = onConnectToVpn) {
+                        Text(stringResource(R.string.share_connect_vpn_action))
+                    }
+                }
+                tunnelStatus.phase == TunnelPhase.CONNECTING -> {
+                    Button(onClick = {}, enabled = false) {
+                        Text(stringResource(R.string.share_connecting))
+                    }
+                }
+                tunnelStatus.phase == TunnelPhase.STOPPING -> {
+                    Button(onClick = {}, enabled = false) {
+                        Text(stringResource(R.string.share_disconnecting))
+                    }
+                }
+                isVpnConnected && token.isNotBlank() && otherPeers.isEmpty() -> {
+                    Button(onClick = { RelayManager.refreshDevices(context) }) {
+                        Text(stringResource(R.string.share_refresh_devices))
+                    }
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.share_cancel))
+            }
+        },
+    )
 }
 
 @Composable
@@ -475,4 +569,3 @@ private fun TransferDialog(
         },
     )
 }
-

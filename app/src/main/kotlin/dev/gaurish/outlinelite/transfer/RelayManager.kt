@@ -113,6 +113,7 @@ object RelayManager {
             ws = client.newWebSocket(request, object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
                     Log.i(TAG, "Connected to in-tunnel file relay")
+                    requestPeerList(webSocket)
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {
@@ -148,6 +149,32 @@ object RelayManager {
             }
         }
     }
+
+    fun refreshDevices(context: Context) {
+        val appCtx = context.applicationContext
+        scope.launch {
+            if (TunnelState.flow.value.phase != TunnelPhase.CONNECTED) return@launch
+
+            val token = KeyRepository.getClusterToken(appCtx)
+            if (token.isBlank()) return@launch
+
+            val currentSocket = ws
+            if (currentSocket != null && currentSocket.send(peerListRequest())) return@launch
+
+            Log.i(TAG, "Relay unavailable during device refresh; reconnecting")
+            currentSocket?.close(1012, "Refresh device list")
+            if (ws === currentSocket) ws = null
+            scheduleReconnect(appCtx, token)
+        }
+    }
+
+    private fun requestPeerList(webSocket: WebSocket) {
+        if (!webSocket.send(peerListRequest())) {
+            Log.w(TAG, "Could not request cluster device list")
+        }
+    }
+
+    private fun peerListRequest(): String = JSONObject().put("type", "list_peers").toString()
 
     fun stop() {
         monitorJob?.cancel()

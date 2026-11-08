@@ -21,6 +21,7 @@ import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -37,6 +38,7 @@ import dev.gaurish.outlinelite.tunnel.TunnelService
 import dev.gaurish.outlinelite.tunnel.TunnelState
 import dev.gaurish.outlinelite.ui.HomeScreen
 import dev.gaurish.outlinelite.ui.OutlineTheme
+import dev.gaurish.outlinelite.ui.ShareTargetDialog
 import dev.gaurish.outlinelite.ui.SettingsScreen
 import dev.gaurish.outlinelite.ui.SplitTunnelScreen
 import kotlinx.coroutines.flow.first
@@ -46,6 +48,7 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private var pendingKeyId: String? = null
+    private var pendingSharedUri by mutableStateOf<Uri?>(null)
 
     private val consentLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -72,6 +75,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pendingKeyId = savedInstanceState?.getString(KEY_PENDING_KEY_ID)
+        pendingSharedUri = savedSharedUriFrom(savedInstanceState)
+            ?: sharedUriFrom(intent)
 
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -153,6 +158,25 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     }
+
+                    pendingSharedUri?.let { uri ->
+                        ShareTargetDialog(
+                            uri = uri,
+                            onConnectToVpn = {
+                                val key = keys.firstOrNull { it.id == activeId } ?: keys.firstOrNull()
+                                if (key == null) {
+                                    Toast.makeText(
+                                        applicationContext,
+                                        getString(R.string.no_active_key),
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                } else {
+                                    prepareAndStart(key)
+                                }
+                            },
+                            onDismiss = { pendingSharedUri = null },
+                        )
+                    }
                 }
             }
         }
@@ -161,11 +185,14 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putString(KEY_PENDING_KEY_ID, pendingKeyId)
+        outState.putParcelable(KEY_PENDING_SHARED_URI, pendingSharedUri)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleSsIntent(intent)
+        pendingSharedUri = sharedUriFrom(intent)
     }
 
     private fun prepareAndStart(key: AccessKey) {
@@ -201,8 +228,31 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun sharedUriFrom(intent: Intent?): Uri? {
+        if (intent?.action != Intent.ACTION_SEND) return null
+
+        @Suppress("DEPRECATION")
+        val streamUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+        }
+        return streamUri ?: intent.clipData?.getItemAt(0)?.uri ?: intent.data
+    }
+
+    private fun savedSharedUriFrom(state: Bundle?): Uri? {
+        if (state == null) return null
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            state.getParcelable(KEY_PENDING_SHARED_URI, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            state.getParcelable<Uri>(KEY_PENDING_SHARED_URI)
+        }
+    }
+
     private companion object {
         const val NOTIFICATION_REQUEST_CODE = 99
         const val KEY_PENDING_KEY_ID = "pending_key_id"
+        const val KEY_PENDING_SHARED_URI = "pending_shared_uri"
     }
 }

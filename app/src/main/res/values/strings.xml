@@ -32,4 +32,16 @@
     <string name="settings_battery_failed">Could not open battery settings</string>
     <string name="settings_section_privacy">Privacy</string>
     <string name="settings_privacy_body">No analytics, no accounts, no logs. Access keys are stored only on this device. Traffic is protected by the server\'s own cipher (Shadowsocks AEAD).</string>
+    <string name="share_choose_device">Choose a device</string>
+    <string name="share_select_destination">Send this file to a connected cluster device:</string>
+    <string name="share_configure_cluster">Add the same cluster token in Settings on both devices, then connect the VPN.</string>
+    <string name="share_connect_vpn">Connect the VPN to find devices in your cluster.</string>
+    <string name="share_connect_vpn_action">Connect to VPN</string>
+    <string name="share_connecting">Connecting…</string>
+    <string name="share_disconnecting">Disconnecting…</string>
+    <string name="share_vpn_stopping">Wait for the VPN to disconnect, then connect again to find cluster devices.</string>
+    <string name="share_waiting_for_vpn">Connecting to VPN. Devices will appear as soon as the relay connects.</string>
+    <string name="share_no_devices">No other cluster devices are online yet.</string>
+    <string name="share_refresh_devices">Refresh devices</string>
+    <string name="share_cancel">Cancel</string>
 </resources>
