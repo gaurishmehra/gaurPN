@@ -80,17 +80,38 @@ object Crypto {
         return okm.copyOf(32)
     }
 
-    fun encryptChunk(key: ByteArray, nonce: ByteArray, plaintext: ByteArray, offset: Int, length: Int): ByteArray {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+    /** Creates one AES-GCM cipher for a whole transfer; re-init per chunk. */
+    fun createAesGcmCipher(): Cipher = Cipher.getInstance("AES/GCM/NoPadding")
+
+    fun encryptChunk(
+        cipher: Cipher,
+        key: ByteArray,
+        nonce: ByteArray,
+        plaintext: ByteArray,
+        offset: Int,
+        length: Int,
+    ): ByteArray {
         cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
         return cipher.doFinal(plaintext, offset, length)
     }
 
-    fun decryptChunk(key: ByteArray, nonce: ByteArray, ciphertext: ByteArray): ByteArray {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+    fun decryptChunk(
+        cipher: Cipher,
+        key: ByteArray,
+        nonce: ByteArray,
+        ciphertext: ByteArray,
+        offset: Int,
+        length: Int,
+    ): ByteArray {
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
-        return cipher.doFinal(ciphertext)
+        return cipher.doFinal(ciphertext, offset, length)
     }
+
+    fun encryptChunk(key: ByteArray, nonce: ByteArray, plaintext: ByteArray, offset: Int, length: Int): ByteArray =
+        encryptChunk(createAesGcmCipher(), key, nonce, plaintext, offset, length)
+
+    fun decryptChunk(key: ByteArray, nonce: ByteArray, ciphertext: ByteArray): ByteArray =
+        decryptChunk(createAesGcmCipher(), key, nonce, ciphertext, 0, ciphertext.size)
 
     fun deriveSubKeys(clusterToken: String): Pair<String, ByteArray> {
         val tokenBytes = clusterToken.toByteArray(Charsets.UTF_8)

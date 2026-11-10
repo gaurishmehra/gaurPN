@@ -18,6 +18,7 @@ import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelState
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -26,8 +27,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -40,6 +41,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.BufferedSink
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -54,13 +56,21 @@ object RelayManager {
 
     private const val TAG = "RelayManager"
     private const val RELAY_HOST = "198.51.100.1:9876"
-    private const val NOTIF_RECV_ID = 8801
-    private const val NOTIF_SEND_ID = 8802
     private const val CHANNEL_ID = "file_transfers"
+    private const val NOTIF_GROUP = "gaur_transfers"
+
+    /** 256 KiB chunks cut framing, syscall, and cipher-init overhead by 4x. */
+    private const val CHUNK_SIZE = 256 * 1024
+    private const val MAX_CHUNK_SIZE = 1024 * 1024
+    private const val FLUSH_INTERVAL_MS = 100L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var monitorJob: Job? = null
+
+    @Volatile
     private var ws: WebSocket? = null
+
+    @Volatile
     private var deviceId: String = ""
 
     private val client = OkHttpClient.Builder()
@@ -76,7 +86,7 @@ object RelayManager {
     private val _transferState = MutableStateFlow<TransferState>(TransferState.Idle)
     val transferState: StateFlow<TransferState> = _transferState.asStateFlow()
 
-    private val pendingAccepts = ConcurrentHashMap<String, (JSONObject) -> Unit>()
+    private val pendingAccepts = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
 
     fun start(context: Context) {
         if (monitorJob != null) return
@@ -207,13 +217,9 @@ object RelayManager {
             "transfer_offer" -> {
                 scope.launch { handleIncomingOffer(context, relayToken, peerCryptoKey, json) }
             }
-            "transfer_accept" -> {
+            "transfer_accept", "transfer_reject" -> {
                 val txId = json.optString("transfer_id")
-                pendingAccepts[txId]?.invoke(json)
-            }
-            "transfer_reject" -> {
-                val txId = json.optString("transfer_id")
-                pendingAccepts[txId]?.invoke(json)
+                pendingAccepts.remove(txId)?.complete(json)
             }
         }
     }
@@ -231,8 +237,10 @@ object RelayManager {
         val fileSize = offer.optLong("file_size", 0L)
         val senderPubB64 = offer.getString("pub_key")
         val offerTag = offer.optString("auth_tag")
+        val batchTotal = offer.optInt("batch_total", 1).coerceAtLeast(1)
+        val batchIndex = offer.optInt("batch_index", 0).coerceIn(0, batchTotal - 1)
 
-        // Finding 3: Zero-knowledge peer-to-peer authentication (MITM defense)
+        // Zero-knowledge peer-to-peer authentication (MITM defense)
         val expectedOfferMsg = "offer:$transferId:$deviceId:$senderPubB64"
         if (!Crypto.verifyAuthTag(peerCryptoKey, expectedOfferMsg, offerTag)) {
             Log.e(TAG, "Incoming offer auth tag invalid! Rejecting potential MITM or unauthorized peer.")
@@ -246,7 +254,7 @@ object RelayManager {
             return
         }
 
-        // Finding 1: Path Traversal Protection
+        // Path traversal protection
         val cleanName = Crypto.sanitizeFileName(rawFileName)
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         downloadsDir.mkdirs()
@@ -281,14 +289,18 @@ object RelayManager {
         }
         ws?.send(acceptMsg.toString())
 
-        // Auto-accept remains active (no blocking modal prompt required)
-        _transferState.value = TransferState.Receiving(senderName, cleanName, 0f, 0f)
-        val appCtx = context.applicationContext
-        showNotification(appCtx, NOTIF_RECV_ID, "Receiving $cleanName", "From $senderName...", ongoing = true, progress = -2)
+        val label = if (batchTotal > 1) {
+            "$batchTotal files (${batchIndex + 1}/$batchTotal): $cleanName"
+        } else {
+            cleanName
+        }
+        val notifId = notifIdFor(transferId, sending = false)
 
-        // Finding 2: Safe collision handling & .part temporary file staging
+        _transferState.value = TransferState.Receiving(senderName, label, 0f, 0f)
+        showNotification(context, notifId, "Receiving $label", "From $senderName...", ongoing = true, progress = -2)
+
         val partFile = File(downloadsDir, ".${cleanName}.${transferId}.part")
-        val relayHost = KeyRepository.getRelayAddress(appCtx).ifBlank { RELAY_HOST }
+        val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
         val pipeUrl = "http://$relayHost/pipe?transfer_id=$transferId&role=receiver&token=${Uri.encode(relayToken)}"
         val request = Request.Builder().url(pipeUrl).build()
 
@@ -297,14 +309,14 @@ object RelayManager {
                 Log.e(TAG, "Pipe error: ${e.message}")
                 if (partFile.exists()) partFile.delete()
                 _transferState.value = TransferState.Error("Transfer failed: ${e.message}")
-                showNotification(appCtx, NOTIF_RECV_ID, "Transfer Failed", "Connection error: ${e.message}")
+                showNotification(context, notifId, "Transfer Failed", "Connection error: ${e.message}")
             }
 
             override fun onResponse(call: Call, response: Response) {
                 if (!response.isSuccessful) {
                     if (partFile.exists()) partFile.delete()
                     _transferState.value = TransferState.Error("Pipe rejected with code ${response.code}")
-                    showNotification(appCtx, NOTIF_RECV_ID, "Transfer Failed", "Relay returned code ${response.code}")
+                    showNotification(context, notifId, "Transfer Failed", "Relay returned code ${response.code}")
                     return
                 }
 
@@ -319,25 +331,25 @@ object RelayManager {
 
                 try {
                     val inStream = body.byteStream()
-                    val outStream = FileOutputStream(partFile)
+                    val cipher = Crypto.createAesGcmCipher()
+                    val cipherBuf = ByteArray(MAX_CHUNK_SIZE + 16)
+                    val lenBytes = ByteArray(4)
+                    val nonceBytes = ByteArray(12)
                     val startTime = System.currentTimeMillis()
                     var lastUpdate = 0L
 
-                    val lenBytes = ByteArray(4)
-                    val nonceBytes = ByteArray(12)
-
-                    outStream.use { out ->
+                    BufferedOutputStream(FileOutputStream(partFile), 1 shl 20).use { out ->
                         while (true) {
                             if (!readFully(inStream, lenBytes, 4)) break
                             val chunkLen = ByteBuffer.wrap(lenBytes).order(ByteOrder.BIG_ENDIAN).int
                             if (chunkLen == 0) break // EOF sentinel
-                            if (chunkLen < 0 || chunkLen > 10 * 1024 * 1024) {
+                            if (chunkLen < 0 || chunkLen > MAX_CHUNK_SIZE) {
                                 throw IOException("Invalid chunk length: $chunkLen bytes")
                             }
 
                             if (!readFully(inStream, nonceBytes, 12)) break
 
-                            // Finding 4: Enforce sequential nonces
+                            // Enforce sequential nonces
                             val nonceBuf = ByteBuffer.wrap(nonceBytes)
                             val noncePrefix = nonceBuf.getInt(0)
                             val nonceCounter = nonceBuf.getLong(4)
@@ -346,10 +358,9 @@ object RelayManager {
                             }
                             expectedNonceCounter++
 
-                            val cipherBuf = ByteArray(chunkLen)
                             if (!readFully(inStream, cipherBuf, chunkLen)) break
 
-                            val plain = Crypto.decryptChunk(aesKey, nonceBytes, cipherBuf)
+                            val plain = Crypto.decryptChunk(cipher, aesKey, nonceBytes, cipherBuf, 0, chunkLen)
                             out.write(plain)
                             totalRead += plain.size
 
@@ -358,10 +369,19 @@ object RelayManager {
                                 lastUpdate = now
                                 val elapsed = (now - startTime) / 1000f
                                 val speedMb = if (elapsed > 0) (totalRead / (1024f * 1024f)) / elapsed else 0f
-                                val progress = if (fileSize > 0) (totalRead.toFloat() / fileSize.toFloat()) else 0.5f
+                                val fileProgress = if (fileSize > 0) (totalRead.toFloat() / fileSize.toFloat()) else 0.5f
+                                val overall = if (batchTotal > 1) {
+                                    (batchIndex + fileProgress) / batchTotal
+                                } else {
+                                    fileProgress
+                                }
 
-                                _transferState.value = TransferState.Receiving(senderName, cleanName, progress, speedMb)
-                                showNotification(appCtx, NOTIF_RECV_ID, "Receiving $cleanName", "%.1f MB/s - %.0f%%".format(speedMb, progress * 100f), ongoing = true, progress = (progress * 100).toInt())
+                                _transferState.value = TransferState.Receiving(senderName, label, overall, speedMb)
+                                showNotification(
+                                    context, notifId, "Receiving $label",
+                                    "%.1f MB/s - %.0f%%".format(speedMb, overall * 100f),
+                                    ongoing = true, progress = (overall * 100).toInt()
+                                )
                             }
                         }
                         out.flush()
@@ -372,7 +392,6 @@ object RelayManager {
                     }
 
                     if (totalRead > 0 || fileSize == 0L) {
-                        // Finding 2: Safe collision resolution and atomic rename
                         val finalFile = Crypto.resolveUniqueFile(downloadsDir, cleanName)
                         val renamed = partFile.renameTo(finalFile)
                         if (!renamed) {
@@ -380,7 +399,7 @@ object RelayManager {
                             partFile.delete()
                         }
                         _transferState.value = TransferState.Completed("Received ${finalFile.name} successfully")
-                        showNotification(appCtx, NOTIF_RECV_ID, "Transfer Complete", "Saved ${finalFile.name} to Downloads")
+                        showNotification(context, notifId, "Transfer Complete", "Saved ${finalFile.name} to Downloads")
                     } else {
                         throw IOException("Received 0 bytes")
                     }
@@ -388,13 +407,16 @@ object RelayManager {
                     Log.e(TAG, "Error decrypting stream: ${t.message}", t)
                     if (partFile.exists()) partFile.delete()
                     _transferState.value = TransferState.Error("Transfer error: ${t.message}")
-                    showNotification(appCtx, NOTIF_RECV_ID, "Transfer Failed", "Failed to receive $cleanName")
+                    showNotification(context, notifId, "Transfer Failed", "Failed to receive $cleanName")
                 }
             }
         })
     }
 
-    fun sendFile(context: Context, target: ClusterPeer, uri: Uri) {
+    private data class OutgoingFile(val uri: Uri, val name: String, val size: Long)
+
+    fun sendFiles(context: Context, target: ClusterPeer, uris: List<Uri>) {
+        if (uris.isEmpty()) return
         val appCtx = context.applicationContext
         if (ws == null) {
             _transferState.value = TransferState.Error("File sharing not connected")
@@ -408,144 +430,208 @@ object RelayManager {
                 return@launch
             }
             val (relayToken, peerCryptoKey) = Crypto.deriveSubKeys(masterToken)
-            val (fileName, fileSize) = queryFileInfo(appCtx.contentResolver, uri)
-            _transferState.value = TransferState.Connecting(target.name)
-
-            val transferId = "tx-${System.currentTimeMillis()}"
-            val keyPair = Crypto.generateKeyPair()
-            val myPubB64 = Base64.encodeToString(Crypto.exportPublicKey(keyPair.public), Base64.NO_WRAP)
-            val offerTag = Crypto.computeAuthTag(peerCryptoKey, "offer:$transferId:${target.id}:$myPubB64")
-
-            val offer = JSONObject().apply {
-                put("type", "transfer_offer")
-                put("target_id", target.id)
-                put("transfer_id", transferId)
-                put("file_name", fileName)
-                put("file_size", fileSize)
-                put("pub_key", myPubB64)
-                put("auth_tag", offerTag)
+            val files = uris.map { uri ->
+                val (name, size) = queryFileInfo(appCtx.contentResolver, uri)
+                OutgoingFile(uri, name, size)
             }
+            val batchId = "batch-${UUID.randomUUID()}"
+            val batchName = if (files.size == 1) files[0].name else "${files.size} files"
+            val totalSize = files.sumOf { it.size }
+            val batchNotifId = notifIdFor(batchId, sending = true)
 
-            var accepted = false
-            var peerPubBytes: ByteArray? = null
-
-            pendingAccepts[transferId] = { response ->
-                if (response.optString("type") == "transfer_accept") {
-                    val pubB64 = response.optString("pub_key")
-                    val acceptTag = response.optString("auth_tag")
-                    val expectedAcceptMsg = "accept:$transferId:$deviceId:$pubB64"
-                    if (!Crypto.verifyAuthTag(peerCryptoKey, expectedAcceptMsg, acceptTag)) {
-                        Log.e(TAG, "Transfer accept auth tag verification failed! Rejecting potential MITM.")
-                        _transferState.value = TransferState.Error("Security verification failed: peer key untrusted")
-                    } else {
-                        peerPubBytes = Base64.decode(pubB64, Base64.NO_WRAP)
-                        accepted = true
-                    }
-                } else {
-                    _transferState.value = TransferState.Error("${target.name} declined the transfer")
-                }
-            }
-
-            ws?.send(offer.toString())
-
-            // Wait for acceptance
-            val startWait = System.currentTimeMillis()
-            while (!accepted && _transferState.value !is TransferState.Error) {
-                if (System.currentTimeMillis() - startWait > 45_000L) {
-                    pendingAccepts.remove(transferId)
-                    _transferState.value = TransferState.Error("Transfer request timed out")
-                    return@launch
-                }
-                delay(200)
-            }
-            pendingAccepts.remove(transferId)
-
-            if (_transferState.value is TransferState.Error) {
-                return@launch
-            }
-
-            val pubBytes = peerPubBytes ?: return@launch
-            val aesKey = Crypto.deriveSharedSecret(keyPair, pubBytes)
-
-            val safetyNumber = Crypto.computeSafetyNumber(Crypto.exportPublicKey(keyPair.public), pubBytes, transferId)
-            Log.i(TAG, "Transfer $transferId safety number verified: $safetyNumber")
-
-            // Connect to pipe as sender
-            val relayHost = KeyRepository.getRelayAddress(appCtx).ifBlank { RELAY_HOST }
-            val pipeUrl = "http://$relayHost/pipe?transfer_id=$transferId&role=sender&token=${Uri.encode(relayToken)}"
-            showNotification(appCtx, NOTIF_SEND_ID, "Sending $fileName", "Connecting...", ongoing = true, progress = -2)
-
-            val requestBody = object : RequestBody() {
-                override fun contentType() = "application/octet-stream".toMediaType()
-
-                override fun writeTo(sink: BufferedSink) {
-                    val inStream = (if (uri.scheme == "file") {
-                        try { File(uri.path ?: "").inputStream() } catch (_: Exception) { null }
-                    } else {
-                        appCtx.contentResolver.openInputStream(uri)
-                    }) ?: return
-                    val buffer = ByteArray(64 * 1024)
-                    var sentBytes = 0L
-                    var nonceCounter = 0L
-                    val startTime = System.currentTimeMillis()
-                    var lastUpdate = 0L
-
-                    inStream.use { stream ->
-                        while (true) {
-                            val n = stream.read(buffer)
-                            if (n <= 0) break
-
-                            val nonce = ByteArray(12)
-                            val nonceBuf = ByteBuffer.wrap(nonce)
-                            nonceBuf.putInt(0, 0)
-                            nonceBuf.putLong(4, nonceCounter++)
-
-                            val cipherChunk = Crypto.encryptChunk(aesKey, nonce, buffer, 0, n)
-
-                            // 4-byte len
-                            sink.writeInt(cipherChunk.size)
-                            // 12-byte nonce
-                            sink.write(nonce)
-                            // Ciphertext + tag
-                            sink.write(cipherChunk)
-                            sink.flush()
-
-                            sentBytes += n
-                            val now = System.currentTimeMillis()
-                            if (now - lastUpdate > 150) {
-                                lastUpdate = now
-                                val elapsed = (now - startTime) / 1000f
-                                val speedMb = if (elapsed > 0) (sentBytes / (1024f * 1024f)) / elapsed else 0f
-                                val progress = if (fileSize > 0) (sentBytes.toFloat() / fileSize.toFloat()) else 0.5f
-
-                                _transferState.value = TransferState.Sending(target.name, fileName, progress, speedMb)
-                                showNotification(appCtx, NOTIF_SEND_ID, "Sending $fileName", "%.1f MB/s - %.0f%%".format(speedMb, progress * 100f), ongoing = true, progress = (progress * 100).toInt())
-                            }
-                        }
-                    }
-
-                    // Send 4-byte zero length sentinel for EOF
-                    sink.writeInt(0)
-                    sink.flush()
-                }
-            }
-
-            val pipeReq = Request.Builder().url(pipeUrl).post(requestBody).build()
             try {
-                client.newCall(pipeReq).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        _transferState.value = TransferState.Completed("Sent $fileName to ${target.name}")
-                        showNotification(appCtx, NOTIF_SEND_ID, "Transfer Complete", "Sent $fileName to ${target.name}")
+                var sentBefore = 0L
+                files.forEachIndexed { index, file ->
+                    val label = if (files.size > 1) {
+                        "$batchName (${index + 1}/${files.size}): ${file.name}"
                     } else {
-                        _transferState.value = TransferState.Error("Upload failed: code ${resp.code}")
-                        showNotification(appCtx, NOTIF_SEND_ID, "Transfer Failed", "Upload failed: HTTP ${resp.code}")
+                        file.name
                     }
+                    sendOne(
+                        context = appCtx,
+                        target = target,
+                        relayToken = relayToken,
+                        peerCryptoKey = peerCryptoKey,
+                        file = file,
+                        batchId = batchId,
+                        batchIndex = index,
+                        batchTotal = files.size,
+                        label = label,
+                        sentBefore = sentBefore,
+                        totalSize = totalSize,
+                    )
+                    sentBefore += file.size
                 }
-            } catch (e: Exception) {
-                _transferState.value = TransferState.Error("Upload error: ${e.message}")
-                showNotification(appCtx, NOTIF_SEND_ID, "Transfer Failed", "Upload error: ${e.message}")
+                val message = if (files.size == 1) {
+                    "Sent ${files[0].name} to ${target.name}"
+                } else {
+                    "Sent ${files.size} files to ${target.name}"
+                }
+                _transferState.value = TransferState.Completed(message)
+                showNotification(appCtx, batchNotifId, "Transfer Complete", message)
+            } catch (t: Throwable) {
+                Log.e(TAG, "Send failed: ${t.message}", t)
+                _transferState.value = TransferState.Error("Transfer error: ${t.message}")
+                showNotification(appCtx, batchNotifId, "Transfer Failed", "Failed sending to ${target.name}")
             }
         }
+    }
+
+    fun sendFile(context: Context, target: ClusterPeer, uri: Uri) =
+        sendFiles(context, target, listOf(uri))
+
+    private suspend fun sendOne(
+        context: Context,
+        target: ClusterPeer,
+        relayToken: String,
+        peerCryptoKey: ByteArray,
+        file: OutgoingFile,
+        batchId: String,
+        batchIndex: Int,
+        batchTotal: Int,
+        label: String,
+        sentBefore: Long,
+        totalSize: Long,
+    ) {
+        val transferId = "tx-${UUID.randomUUID()}"
+        val keyPair = Crypto.generateKeyPair()
+        val myPubB64 = Base64.encodeToString(Crypto.exportPublicKey(keyPair.public), Base64.NO_WRAP)
+        val offerTag = Crypto.computeAuthTag(peerCryptoKey, "offer:$transferId:${target.id}:$myPubB64")
+
+        val offer = JSONObject().apply {
+            put("type", "transfer_offer")
+            put("target_id", target.id)
+            put("transfer_id", transferId)
+            put("file_name", file.name)
+            put("file_size", file.size)
+            put("pub_key", myPubB64)
+            put("auth_tag", offerTag)
+            put("batch_id", batchId)
+            put("batch_index", batchIndex)
+            put("batch_total", batchTotal)
+        }
+
+        val deferred = CompletableDeferred<JSONObject>()
+        pendingAccepts[transferId] = deferred
+        val socket = ws ?: throw IOException("File sharing not connected")
+        if (!socket.send(offer.toString())) {
+            pendingAccepts.remove(transferId)
+            throw IOException("Failed to send transfer offer")
+        }
+
+        val response = withTimeoutOrNull(45_000L) { deferred.await() }
+            ?: run {
+                pendingAccepts.remove(transferId)
+                throw IOException("Transfer request timed out")
+            }
+
+        if (response.optString("type") == "transfer_reject") {
+            throw IOException("${target.name} declined the transfer")
+        }
+
+        val pubB64 = response.optString("pub_key")
+        val acceptTag = response.optString("auth_tag")
+        val expectedAcceptMsg = "accept:$transferId:$deviceId:$pubB64"
+        if (!Crypto.verifyAuthTag(peerCryptoKey, expectedAcceptMsg, acceptTag)) {
+            throw SecurityException("Security verification failed: peer key untrusted")
+        }
+
+        val peerPubBytes = Base64.decode(pubB64, Base64.NO_WRAP)
+        val aesKey = Crypto.deriveSharedSecret(keyPair, peerPubBytes)
+        val safetyNumber = Crypto.computeSafetyNumber(Crypto.exportPublicKey(keyPair.public), peerPubBytes, transferId)
+        Log.i(TAG, "Transfer $transferId safety number verified: $safetyNumber")
+
+        val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
+        val pipeUrl = "http://$relayHost/pipe?transfer_id=$transferId&role=sender&token=${Uri.encode(relayToken)}"
+        val notifId = notifIdFor(transferId, sending = true)
+        showNotification(context, notifId, "Sending $label", "Connecting...", ongoing = true, progress = -2)
+
+        val requestBody = object : RequestBody() {
+            override fun contentType() = "application/octet-stream".toMediaType()
+
+            override fun writeTo(sink: BufferedSink) {
+                val inStream = openInputStream(context, file.uri)
+                    ?: throw IOException("Cannot open ${file.name}")
+                val cipher = Crypto.createAesGcmCipher()
+                val buffer = ByteArray(CHUNK_SIZE)
+                val nonce = ByteArray(12)
+                val nonceBuf = ByteBuffer.wrap(nonce)
+                var sentBytes = 0L
+                var nonceCounter = 0L
+                val startTime = System.currentTimeMillis()
+                var lastUpdate = 0L
+                var lastFlush = 0L
+
+                inStream.use { stream ->
+                    while (true) {
+                        val n = stream.read(buffer)
+                        if (n <= 0) break
+
+                        nonceBuf.putInt(0, 0)
+                        nonceBuf.putLong(4, nonceCounter++)
+                        val cipherChunk = Crypto.encryptChunk(cipher, aesKey, nonce, buffer, 0, n)
+
+                        sink.writeInt(cipherChunk.size)
+                        sink.write(nonce)
+                        sink.write(cipherChunk)
+                        sentBytes += n
+
+                        val now = System.currentTimeMillis()
+                        if (now - lastFlush >= FLUSH_INTERVAL_MS) {
+                            sink.flush()
+                            lastFlush = now
+                        }
+                        if (now - lastUpdate > 150) {
+                            lastUpdate = now
+                            val elapsed = (now - startTime) / 1000f
+                            val speedMb = if (elapsed > 0) (sentBytes / (1024f * 1024f)) / elapsed else 0f
+                            val fileProgress = if (file.size > 0) sentBytes.toFloat() / file.size else 0.5f
+                            val overall = if (totalSize > 0) {
+                                (sentBefore + sentBytes).toFloat() / totalSize
+                            } else {
+                                fileProgress
+                            }
+
+                            _transferState.value = TransferState.Sending(target.name, label, overall, speedMb)
+                            showNotification(
+                                context, notifId, "Sending $label",
+                                "%.1f MB/s - %.0f%%".format(speedMb, overall * 100f),
+                                ongoing = true, progress = (overall * 100).toInt()
+                            )
+                        }
+                    }
+                }
+
+                sink.flush()
+                sink.writeInt(0)
+                sink.flush()
+            }
+        }
+
+        val pipeReq = Request.Builder().url(pipeUrl).post(requestBody).build()
+        try {
+            client.newCall(pipeReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    throw IOException("Upload failed: HTTP ${resp.code}")
+                }
+            }
+            showNotification(context, notifId, "Sent $label", "Transfer complete", ongoing = false)
+        } catch (t: Throwable) {
+            showNotification(context, notifId, "Transfer Failed", "Failed to send $label", ongoing = false)
+            throw t
+        }
+    }
+
+    private fun openInputStream(context: Context, uri: Uri): InputStream? =
+        if (uri.scheme == "file") {
+            runCatching { File(uri.path ?: "").inputStream() }.getOrNull()
+        } else {
+            context.contentResolver.openInputStream(uri)
+        }
+
+    private fun notifIdFor(key: String, sending: Boolean): Int {
+        val base = if (sending) 10_000 else 20_000
+        return base + (key.hashCode() and 0x0FFF)
     }
 
     private fun showNotification(
@@ -583,6 +669,7 @@ object RelayManager {
                 .setAutoCancel(!ongoing)
                 .setOngoing(ongoing)
                 .setOnlyAlertOnce(ongoing)
+                .setGroup(NOTIF_GROUP)
 
             if (progress in 0..100) {
                 builder.setProgress(100, progress, false)

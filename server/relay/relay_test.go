@@ -20,6 +20,7 @@ import (
 func TestPeerConcurrentWrites(t *testing.T) {
 	token := []byte("test-cluster-token-secret")
 	hub := NewHub(token)
+	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
 	defer server.Close()
@@ -67,6 +68,7 @@ func TestPeerConcurrentWrites(t *testing.T) {
 func TestPipeSessionCleanup(t *testing.T) {
 	token := []byte("test-secret-token")
 	hub := NewHub(token)
+	defer hub.Close()
 
 	transferID := "tx-test-cleanup-1"
 
@@ -93,6 +95,7 @@ func TestPipeSessionCleanup(t *testing.T) {
 func TestPipeSessionSuccessfulStream(t *testing.T) {
 	token := []byte("test-secret-token")
 	hub := NewHub(token)
+	defer hub.Close()
 
 	transferID := fmt.Sprintf("tx-test-success-%d", time.Now().UnixNano())
 	payloadData := "hello from in-tunnel stream verification"
@@ -144,6 +147,7 @@ func TestPipeSessionSuccessfulStream(t *testing.T) {
 func TestHubAuthenticateWithDerivedToken(t *testing.T) {
 	masterToken := []byte("super-secret-cluster-token")
 	hub := NewHub(masterToken)
+	defer hub.Close()
 
 	// Direct master token should authenticate
 	if !hub.authenticate("super-secret-cluster-token") {

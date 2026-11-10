@@ -31,7 +31,7 @@ type Peer struct {
 	Name     string          `json:"name"`
 	conn     *websocket.Conn `json:"-"`
 	writeMu  sync.Mutex      `json:"-"`
-	joinedAt time.Time       `json:"joined_at"`
+	joinedAt time.Time
 }
 
 type PeerInfo struct {
@@ -52,38 +52,35 @@ func (p *Peer) WriteJSON(v interface{}) error {
 }
 
 type Hub struct {
-	mu       sync.RWMutex
-	peers    map[string]*Peer
-	token    []byte
-	upgrader websocket.Upgrader
-	pipeMu   sync.Mutex
-	pipes    map[string]*PipeSession
+	mu        sync.RWMutex
+	peers     map[string]*Peer
+	token     []byte
+	upgrader  websocket.Upgrader
+	pipeMu    sync.Mutex
+	pipes     map[string]*PipeSession
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 type PipeSession struct {
 	transferID        string
-	pr                *io.PipeReader
-	pw                *io.PipeWriter
+	pipe              *bufferedPipe
 	receiverReady     chan struct{}
 	senderReady       chan struct{}
 	done              chan struct{}
 	closeRecvOnce     sync.Once
 	closeSenderOnce   sync.Once
 	closeDoneOnce     sync.Once
-	created           time.Time
 	activeConnections int32
 }
 
 func newPipeSession(transferID string) *PipeSession {
-	pr, pw := io.Pipe()
 	return &PipeSession{
 		transferID:    transferID,
-		pr:            pr,
-		pw:            pw,
+		pipe:          newBufferedPipe(2 << 20), // 2 MiB of decoupling per transfer
 		receiverReady: make(chan struct{}),
 		senderReady:   make(chan struct{}),
 		done:          make(chan struct{}),
-		created:       time.Now(),
 	}
 }
 
@@ -106,14 +103,23 @@ func (s *PipeSession) markDone() {
 }
 
 type flushWriter struct {
-	w       io.Writer
-	flusher http.Flusher
+	w         io.Writer
+	flusher   http.Flusher
+	lastFlush time.Time
+	interval  time.Duration
 }
 
+// Write forwards the chunk and flushes at most once per interval. Flushing on
+// every 64 KiB chunk forced a syscall and a chunk boundary per write; a short
+// interval keeps progress responsive without that per-chunk cost.
 func (fw *flushWriter) Write(p []byte) (n int, err error) {
 	n, err = fw.w.Write(p)
 	if fw.flusher != nil && n > 0 {
-		fw.flusher.Flush()
+		now := time.Now()
+		if fw.interval <= 0 || now.Sub(fw.lastFlush) >= fw.interval {
+			fw.flusher.Flush()
+			fw.lastFlush = now
+		}
 	}
 	return
 }
@@ -123,6 +129,7 @@ func NewHub(token []byte) *Hub {
 		peers: make(map[string]*Peer),
 		token: token,
 		pipes: make(map[string]*PipeSession),
+		done:  make(chan struct{}),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // loopback / tunnel only
@@ -130,22 +137,36 @@ func NewHub(token []byte) *Hub {
 		},
 	}
 	go func() {
-		ticker := time.NewTicker(60 * time.Second)
-		for range ticker.C {
-			h.pipeMu.Lock()
-			now := time.Now()
-			for id, session := range h.pipes {
-				if now.Sub(session.created) > 3*time.Minute {
-					_ = session.pr.Close()
-					_ = session.pw.Close()
-					delete(h.pipes, id)
-					log.Printf("[PIPE] Evicted expired pipe session %s", id)
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				h.pipeMu.Lock()
+				now := time.Now()
+				for id, session := range h.pipes {
+					// Evict on idleness, never on age. A large file on a slow
+					// link must not be killed just because it takes a while.
+					if now.Sub(session.pipe.LastActivity()) > 5*time.Minute {
+						_ = session.pipe.CloseWithError(fmt.Errorf("pipe session idle timeout"))
+						delete(h.pipes, id)
+						log.Printf("[PIPE] Evicted idle pipe session %s", id)
+					}
 				}
+				h.pipeMu.Unlock()
+			case <-h.done:
+				return
 			}
-			h.pipeMu.Unlock()
 		}
 	}()
 	return h
+}
+
+// Close stops the eviction goroutine. Safe to call more than once.
+func (h *Hub) Close() {
+	h.closeOnce.Do(func() {
+		close(h.done)
+	})
 }
 
 func (h *Hub) authenticate(token string) bool {
@@ -317,8 +338,7 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 				delete(h.pipes, transferID)
 			}
 			h.pipeMu.Unlock()
-			_ = session.pr.Close()
-			_ = session.pw.Close()
+			_ = session.pipe.Close()
 		}
 	}()
 
@@ -329,11 +349,11 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-session.senderReady:
 		case <-r.Context().Done():
-			_ = session.pw.CloseWithError(r.Context().Err())
+			_ = session.pipe.CloseWithError(r.Context().Err())
 			return
 		case <-time.After(60 * time.Second):
 			http.Error(w, "Sender connection timeout", http.StatusGatewayTimeout)
-			_ = session.pw.CloseWithError(fmt.Errorf("sender timed out"))
+			_ = session.pipe.CloseWithError(fmt.Errorf("sender timed out"))
 			return
 		}
 
@@ -346,9 +366,9 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		fw := &flushWriter{w: w, flusher: flusher}
-		buf := make([]byte, 64*1024)
-		_, err := io.CopyBuffer(fw, session.pr, buf)
+		fw := &flushWriter{w: w, flusher: flusher, interval: 100 * time.Millisecond}
+		buf := make([]byte, 256*1024)
+		_, err := io.CopyBuffer(fw, session.pipe, buf)
 		if isFlusher {
 			flusher.Flush()
 		}
@@ -369,17 +389,17 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-session.receiverReady:
 		case <-r.Context().Done():
-			_ = session.pr.CloseWithError(r.Context().Err())
+			_ = session.pipe.CloseWithError(r.Context().Err())
 			return
 		case <-time.After(60 * time.Second):
 			http.Error(w, "Receiver connection timeout", http.StatusGatewayTimeout)
-			_ = session.pr.CloseWithError(fmt.Errorf("receiver timed out"))
+			_ = session.pipe.CloseWithError(fmt.Errorf("receiver timed out"))
 			return
 		}
 
-		buf := make([]byte, 64*1024)
-		_, err := io.CopyBuffer(session.pw, r.Body, buf)
-		_ = session.pw.Close()
+		buf := make([]byte, 256*1024)
+		_, err := io.CopyBuffer(session.pipe, r.Body, buf)
+		_ = session.pipe.Close()
 
 		if err != nil && err != io.EOF {
 			log.Printf("[PIPE] Error reading sender body for %s: %v", transferID, err)

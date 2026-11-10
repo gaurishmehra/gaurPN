@@ -57,12 +57,18 @@ func DeriveSharedSecret(priv *ecdh.PrivateKey, peerPubBytes []byte) ([]byte, err
 	return aesKey, nil
 }
 
-func EncryptChunk(key []byte, nonce []byte, plaintext []byte) ([]byte, error) {
+// NewAEAD builds the AES-256-GCM AEAD once per transfer. Callers reuse it for
+// every chunk instead of rebuilding the cipher for each 64 KiB block.
+func NewAEAD(key []byte) (cipher.AEAD, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
+	return cipher.NewGCM(block)
+}
+
+func EncryptChunk(key []byte, nonce []byte, plaintext []byte) ([]byte, error) {
+	gcm, err := NewAEAD(key)
 	if err != nil {
 		return nil, err
 	}
@@ -70,11 +76,7 @@ func EncryptChunk(key []byte, nonce []byte, plaintext []byte) ([]byte, error) {
 }
 
 func DecryptChunk(key []byte, nonce []byte, ciphertext []byte) ([]byte, error) {
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	gcm, err := cipher.NewGCM(block)
+	gcm, err := NewAEAD(key)
 	if err != nil {
 		return nil, err
 	}
@@ -181,4 +183,3 @@ func ResolveUniqueFile(targetDir string, fileName string) string {
 	}
 	return filepath.Join(targetDir, fmt.Sprintf("%s (%d)%s", stem, time.Now().UnixNano(), ext))
 }
-

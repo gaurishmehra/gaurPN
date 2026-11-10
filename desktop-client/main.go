@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -29,6 +30,7 @@ type Config struct {
 	DeviceID  string
 	Name      string
 	InboxDir  string
+	PeersFile string
 }
 
 func defaultInboxDir() string {
@@ -53,6 +55,50 @@ func defaultConfigFile() string {
 		return "./config.json"
 	}
 	return filepath.Join(home, ".config", "gaur-share", "config.json")
+}
+
+func defaultPeersFile() string {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return "./gaur-peers.json"
+	}
+	return filepath.Join(cache, "gaur-share", "peers.json")
+}
+
+type peerFileEntry struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	IsSelf bool   `json:"is_self"`
+}
+
+// writePeersFile publishes the current peer list for desktop shells to watch.
+// It writes in place rather than via rename so QFileSystemWatcher keeps its
+// inode watch and reacts to a single modify event.
+func writePeersFile(cfg Config, peers []peerFileEntry) {
+	if cfg.PeersFile == "" {
+		return
+	}
+	if peers == nil {
+		peers = []peerFileEntry{}
+	}
+	payload := struct {
+		Updated int64           `json:"updated"`
+		Peers   []peerFileEntry `json:"peers"`
+	}{Updated: time.Now().Unix(), Peers: peers}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(cfg.PeersFile), 0o755); err != nil {
+		return
+	}
+	f, err := os.OpenFile(cfg.PeersFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return
+	}
+	_, _ = f.Write(data)
+	_ = f.Close()
 }
 
 func loadSettingsFromConfig() (string, string) {
@@ -161,10 +207,12 @@ func runDaemon(cfg Config) {
 	_ = os.MkdirAll(cfg.InboxDir, 0o755)
 	log.Printf("[DAEMON] Starting gaur-share daemon as '%s' (ID: %s)", cfg.Name, cfg.DeviceID)
 	log.Printf("[DAEMON] Incoming files will be saved to: %s", cfg.InboxDir)
+	writePeersFile(cfg, nil)
 
 	for {
 		conn, err := connectWS(cfg, relayToken)
 		if err != nil {
+			writePeersFile(cfg, nil)
 			log.Printf("[DAEMON] Connecting to in-tunnel relay (%s)... Error: %v. Retrying in 5s...", cfg.RelayAddr, err)
 			time.Sleep(5 * time.Second)
 			continue
@@ -194,6 +242,7 @@ func runDaemon(cfg Config) {
 			_, msgBytes, err := conn.ReadMessage()
 			if err != nil {
 				close(stopPing)
+				writePeersFile(cfg, nil)
 				log.Printf("[DAEMON] Relay connection interrupted: %v. Reconnecting...", err)
 				_ = conn.Close()
 				break
@@ -207,7 +256,20 @@ func runDaemon(cfg Config) {
 			msgType, _ := envelope["type"].(string)
 			switch msgType {
 			case "peers":
-				// Peer list update
+				peersRaw, _ := envelope["peers"].([]interface{})
+				entries := make([]peerFileEntry, 0, len(peersRaw))
+				for _, p := range peersRaw {
+					pMap, _ := p.(map[string]interface{})
+					id, _ := pMap["id"].(string)
+					name, _ := pMap["name"].(string)
+					entries = append(entries, peerFileEntry{
+						ID:     id,
+						Name:   name,
+						Status: "online",
+						IsSelf: id == cfg.DeviceID || strings.EqualFold(name, cfg.Name),
+					})
+				}
+				writePeersFile(cfg, entries)
 			case "transfer_offer":
 				go handleIncomingTransfer(cfg, relayToken, peerCryptoKey, conn, envelope)
 			}
@@ -226,6 +288,14 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 	senderPubB64, _ := offer["pub_key"].(string)
 	offerTag, _ := offer["auth_tag"].(string)
 	fileSize := int64(fileSizeFloat)
+	batchID, _ := offer["batch_id"].(string)
+	batchIndexFloat, _ := offer["batch_index"].(float64)
+	batchTotalFloat, _ := offer["batch_total"].(float64)
+	batchIndex := int(batchIndexFloat)
+	batchTotal := int(batchTotalFloat)
+	if batchTotal < 1 {
+		batchTotal = 1
+	}
 
 	if transferID == "" || rawFileName == "" || senderPubB64 == "" {
 		return
@@ -284,7 +354,12 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 	safetyNumber := ComputeSafetyNumber(senderPubBytes, keyPair.Public, transferID)
 	log.Printf("[RECV] Verified transfer %s safety number: %s", transferID, safetyNumber)
 
-	log.Printf("[RECV] Incoming file from %s (%s): %s (%d bytes)", senderName, senderID, cleanFileName, fileSize)
+	if batchTotal > 1 {
+		log.Printf("[RECV] Incoming batch %s file %d/%d from %s (%s): %s (%d bytes)",
+			batchID, batchIndex+1, batchTotal, senderName, senderID, cleanFileName, fileSize)
+	} else {
+		log.Printf("[RECV] Incoming file from %s (%s): %s (%d bytes)", senderName, senderID, cleanFileName, fileSize)
+	}
 	notifyUser("Incoming File Transfer", fmt.Sprintf("%s is sending %s (%.1f MB)", senderName, cleanFileName, float64(fileSize)/(1024*1024)))
 
 	// Send transfer_accept with receiver's public key and auth_tag
@@ -327,8 +402,16 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 	}()
 
 	// Read and decrypt chunks
+	aead, err := NewAEAD(aesKey)
+	if err != nil {
+		log.Printf("[RECV] Failed to init AEAD: %v", err)
+		return
+	}
+	bw := bufio.NewWriterSize(outFile, 1<<20)
 	lenBuf := make([]byte, 4)
 	nonceBuf := make([]byte, 12)
+	cipherBuf := make([]byte, 0, 256*1024+aead.Overhead())
+	plainBuf := make([]byte, 0, 256*1024)
 	expectedCounter := uint64(0)
 
 	startTime := time.Now()
@@ -345,7 +428,7 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 		if chunkLen == 0 {
 			break // Clean stream EOF sentinel
 		}
-		if chunkLen > 10*1024*1024 {
+		if chunkLen > 1024*1024 {
 			log.Printf("[RECV] Invalid chunk length (%d bytes), aborting", chunkLen)
 			return
 		}
@@ -365,20 +448,24 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 		}
 		expectedCounter++
 
-		// Read ciphertext
-		cipherBuf := make([]byte, chunkLen)
+		// Read ciphertext into a reused buffer
+		if cap(cipherBuf) < int(chunkLen) {
+			cipherBuf = make([]byte, chunkLen)
+		} else {
+			cipherBuf = cipherBuf[:chunkLen]
+		}
 		if _, err := io.ReadFull(resp.Body, cipherBuf); err != nil {
 			log.Printf("[RECV] Ciphertext read error: %v", err)
 			return
 		}
 
-		plaintext, err := DecryptChunk(aesKey, nonceBuf, cipherBuf)
+		plaintext, err := aead.Open(plainBuf[:0], nonceBuf, cipherBuf, nil)
 		if err != nil {
 			log.Printf("[RECV] Decryption authentication failed! File may be tampered: %v", err)
 			return
 		}
 
-		if _, err := outFile.Write(plaintext); err != nil {
+		if _, err := bw.Write(plaintext); err != nil {
 			log.Printf("[RECV] File write error: %v", err)
 			return
 		}
@@ -386,6 +473,10 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 	}
 
 	if totalRead > 0 || fileSize == 0 {
+		if err := bw.Flush(); err != nil {
+			log.Printf("[RECV] Flush failed: %v", err)
+			return
+		}
 		_ = outFile.Close()
 		// Finding 2: Safe collision resolution and atomic rename
 		finalPath := ResolveUniqueFile(cfg.InboxDir, cleanFileName)
@@ -422,7 +513,12 @@ func runList(cfg Config, asJSON bool) {
 	}
 	relayToken, _ := DeriveSubKeys(token)
 
-	conn, err := connectWS(cfg, relayToken)
+	// Discovery must not reuse the daemon's device ID: the relay replaces an
+	// existing peer with the same ID, so a poll would evict the daemon.
+	listCfg := cfg
+	listCfg.DeviceID = fmt.Sprintf("list-%d", os.Getpid())
+
+	conn, err := connectWS(listCfg, relayToken)
 	if err != nil {
 		if asJSON {
 			fmt.Println("[]")
@@ -456,7 +552,10 @@ func runList(cfg Config, asJSON bool) {
 					pMap, _ := p.(map[string]interface{})
 					id, _ := pMap["id"].(string)
 					name, _ := pMap["name"].(string)
-					isSelf := (id == cfg.DeviceID) || strings.EqualFold(name, cfg.Name)
+					if id == listCfg.DeviceID {
+						continue
+					}
+					isSelf := strings.EqualFold(name, cfg.Name)
 					out = append(out, JSONPeer{
 						ID:     id,
 						Name:   name,
@@ -477,7 +576,10 @@ func runList(cfg Config, asJSON bool) {
 				pMap, _ := p.(map[string]interface{})
 				id, _ := pMap["id"].(string)
 				name, _ := pMap["name"].(string)
-				isSelf := (id == cfg.DeviceID) || strings.EqualFold(name, cfg.Name)
+				if id == listCfg.DeviceID {
+					continue
+				}
+				isSelf := strings.EqualFold(name, cfg.Name)
 				status := "online"
 				if isSelf {
 					status = "online (this device)"
@@ -491,13 +593,28 @@ func runList(cfg Config, asJSON bool) {
 	}
 }
 
-func runSend(cfg Config, targetQuery string, filePath string) {
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		log.Fatalf("[FATAL] Cannot open file: %v", err)
+type sendFileMeta struct {
+	Path string
+	Name string
+	Size int64
+}
+
+func runSend(cfg Config, targetQuery string, filePaths []string) {
+	if len(filePaths) == 0 {
+		log.Fatalf("[FATAL] No files specified")
 	}
-	fileSize := fileInfo.Size()
-	fileName := filepath.Base(filePath)
+
+	metas := make([]sendFileMeta, 0, len(filePaths))
+	for _, path := range filePaths {
+		info, err := os.Stat(path)
+		if err != nil {
+			log.Fatalf("[FATAL] Cannot open file %s: %v", path, err)
+		}
+		if info.IsDir() {
+			log.Fatalf("[FATAL] %s is a directory; only files are supported", path)
+		}
+		metas = append(metas, sendFileMeta{Path: path, Name: filepath.Base(path), Size: info.Size()})
+	}
 
 	token, err := loadToken(cfg.TokenFile)
 	if err != nil {
@@ -511,95 +628,136 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 	}
 	defer conn.Close()
 
-	// Wait for peers list to locate target
-	var targetID, targetName string
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	for {
-		_, msgBytes, err := conn.ReadMessage()
-		if err != nil {
-			log.Fatalf("[FATAL] Failed to discover target device: %v", err)
-		}
-		var envelope map[string]interface{}
-		_ = json.Unmarshal(msgBytes, &envelope)
-		if envelope["type"] == "peers" {
-			peersRaw, _ := envelope["peers"].([]interface{})
-			for _, p := range peersRaw {
-				pMap, _ := p.(map[string]interface{})
-				id, _ := pMap["id"].(string)
-				name, _ := pMap["name"].(string)
-				if id == targetQuery || strings.EqualFold(name, targetQuery) || strings.Contains(strings.ToLower(name), strings.ToLower(targetQuery)) {
-					targetID = id
-					targetName = name
-					break
-				}
-			}
-			break
-		}
-	}
-
+	targetID, targetName := discoverTarget(conn, targetQuery)
 	if targetID == "" {
 		log.Fatalf("[FATAL] Target device '%s' is not currently online in the tunnel", targetQuery)
 	}
-
 	fmt.Printf("Target located: %s (%s)\n", targetName, targetID)
-	transferID := fmt.Sprintf("tx-%d", time.Now().UnixNano())
 
-	// Generate sender ephemeral keypair
-	keyPair, err := GenerateKeyPair()
-	if err != nil {
-		log.Fatalf("[FATAL] KeyPair generation failed: %v", err)
+	batchID := fmt.Sprintf("batch-%d", time.Now().UnixNano())
+	startTime := time.Now()
+	var sentTotal int64
+	for i, meta := range metas {
+		label := meta.Name
+		if len(metas) > 1 {
+			label = fmt.Sprintf("%d files (%d/%d): %s", len(metas), i+1, len(metas), meta.Name)
+		}
+		fmt.Printf("Sending %s (%.2f MB)...\n", label, float64(meta.Size)/(1024*1024))
+		if err := sendOne(cfg, conn, relayToken, peerCryptoKey, targetID, targetName, meta, batchID, i, len(metas)); err != nil {
+			notifyUser("Transfer Failed", fmt.Sprintf("Failed sending '%s': %v", meta.Name, err))
+			log.Fatalf("[FATAL] %v", err)
+		}
+		sentTotal += meta.Size
 	}
 
+	duration := time.Since(startTime).Seconds()
+	if duration <= 0 {
+		duration = 0.001
+	}
+	mbps := (float64(sentTotal) / (1024 * 1024)) / duration
+	notifyUser("Transfer Sent", fmt.Sprintf("Sent %d file(s) (%.1f MB) to %s", len(metas), float64(sentTotal)/(1024*1024), targetName))
+	fmt.Printf("Transfer completed: %d file(s), %.1f MB in %.1fs (%.1f MB/s)\n",
+		len(metas), float64(sentTotal)/(1024*1024), duration, mbps)
+}
+
+// discoverTarget waits for the relay peer list and resolves a device by id,
+// exact name, or case-insensitive name substring.
+func discoverTarget(conn *websocket.Conn, targetQuery string) (string, string) {
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	for {
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			return "", ""
+		}
+		var envelope map[string]interface{}
+		if json.Unmarshal(msgBytes, &envelope) != nil {
+			continue
+		}
+		if envelope["type"] != "peers" {
+			continue
+		}
+		peersRaw, _ := envelope["peers"].([]interface{})
+		for _, p := range peersRaw {
+			pMap, _ := p.(map[string]interface{})
+			id, _ := pMap["id"].(string)
+			name, _ := pMap["name"].(string)
+			if id == targetQuery || strings.EqualFold(name, targetQuery) ||
+				strings.Contains(strings.ToLower(name), strings.ToLower(targetQuery)) {
+				return id, name
+			}
+		}
+		return "", ""
+	}
+}
+
+// waitForAccept reads the signaling socket until the matching accept or reject
+// arrives, ignoring unrelated peer-list traffic.
+func waitForAccept(conn *websocket.Conn, transferID string, peerCryptoKey []byte, deviceID string) ([]byte, error) {
+	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+	for {
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			return nil, fmt.Errorf("peer did not accept transfer within timeout: %w", err)
+		}
+		var envelope map[string]interface{}
+		if json.Unmarshal(msgBytes, &envelope) != nil {
+			continue
+		}
+		if envelope["type"] == "transfer_accept" && envelope["transfer_id"] == transferID {
+			receiverPubB64, _ := envelope["pub_key"].(string)
+			acceptTag, _ := envelope["auth_tag"].(string)
+			expected := fmt.Sprintf("accept:%s:%s:%s", transferID, deviceID, receiverPubB64)
+			if !VerifyAuthTag(peerCryptoKey, expected, acceptTag) {
+				return nil, fmt.Errorf("accept auth tag verification failed")
+			}
+			return base64.StdEncoding.DecodeString(receiverPubB64)
+		}
+		if envelope["type"] == "transfer_reject" && envelope["transfer_id"] == transferID {
+			reason, _ := envelope["reason"].(string)
+			return nil, fmt.Errorf("peer declined the transfer (reason: %s)", reason)
+		}
+	}
+}
+
+func sendOne(cfg Config, conn *websocket.Conn, relayToken string, peerCryptoKey []byte, targetID, targetName string, meta sendFileMeta, batchID string, batchIndex, batchTotal int) error {
+	transferID := fmt.Sprintf("tx-%d", time.Now().UnixNano())
+
+	keyPair, err := GenerateKeyPair()
+	if err != nil {
+		return fmt.Errorf("keypair generation failed: %w", err)
+	}
 	myPubB64 := base64.StdEncoding.EncodeToString(keyPair.Public)
 	offerTag := ComputeAuthTag(peerCryptoKey, fmt.Sprintf("offer:%s:%s:%s", transferID, targetID, myPubB64))
 
-	// Send offer
 	offerMsg := map[string]interface{}{
 		"type":        "transfer_offer",
 		"target_id":   targetID,
 		"transfer_id": transferID,
-		"file_name":   fileName,
-		"file_size":   fileSize,
+		"file_name":   meta.Name,
+		"file_size":   meta.Size,
 		"pub_key":     myPubB64,
 		"auth_tag":    offerTag,
+		"batch_id":    batchID,
+		"batch_index": batchIndex,
+		"batch_total": batchTotal,
 	}
-	_ = conn.WriteJSON(offerMsg)
-	fmt.Printf("Sent transfer offer for '%s' (%.2f MB). Waiting for acceptance...\n", fileName, float64(fileSize)/(1024*1024))
-
-	// Wait for acceptance
-	var aesKey []byte
-	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-	for {
-		_, msgBytes, err := conn.ReadMessage()
-		if err != nil {
-			log.Fatalf("[FATAL] Peer did not accept transfer within timeout: %v", err)
-		}
-		var envelope map[string]interface{}
-		_ = json.Unmarshal(msgBytes, &envelope)
-		if envelope["type"] == "transfer_accept" && envelope["transfer_id"] == transferID {
-			receiverPubB64, _ := envelope["pub_key"].(string)
-			acceptTag, _ := envelope["auth_tag"].(string)
-
-			expectedAcceptMsg := fmt.Sprintf("accept:%s:%s:%s", transferID, cfg.DeviceID, receiverPubB64)
-			if !VerifyAuthTag(peerCryptoKey, expectedAcceptMsg, acceptTag) {
-				log.Fatalf("[FATAL] Transfer accept auth tag verification failed! Rejecting potential MITM.")
-			}
-
-			receiverPubBytes, _ := base64.StdEncoding.DecodeString(receiverPubB64)
-			aesKey, err = DeriveSharedSecret(keyPair.Private, receiverPubBytes)
-			if err != nil {
-				log.Fatalf("[FATAL] Key derivation failed: %v", err)
-			}
-			safetyNumber := ComputeSafetyNumber(keyPair.Public, receiverPubBytes, transferID)
-			fmt.Printf("Transfer accepted! Ephemeral E2EE session verified. Safety number: %s\n", safetyNumber)
-			break
-		} else if envelope["type"] == "transfer_reject" && envelope["transfer_id"] == transferID {
-			reason, _ := envelope["reason"].(string)
-			log.Fatalf("[FATAL] Peer declined the transfer (reason: %s).", reason)
-		}
+	if err := conn.WriteJSON(offerMsg); err != nil {
+		return fmt.Errorf("send offer failed: %w", err)
 	}
 
-	// Connect to pipe as sender
+	receiverPubBytes, err := waitForAccept(conn, transferID, peerCryptoKey, cfg.DeviceID)
+	if err != nil {
+		return err
+	}
+	aesKey, err := DeriveSharedSecret(keyPair.Private, receiverPubBytes)
+	if err != nil {
+		return fmt.Errorf("key derivation failed: %w", err)
+	}
+	safetyNumber := ComputeSafetyNumber(keyPair.Public, receiverPubBytes, transferID)
+	fmt.Printf("Accepted by %s. Safety number: %s\n", targetName, safetyNumber)
+
 	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=sender&token=%s", cfg.RelayAddr, transferID, url.QueryEscape(relayToken))
 	pipeReader, pipeWriter := io.Pipe()
 
@@ -621,64 +779,72 @@ func runSend(cfg Config, targetQuery string, filePath string) {
 		uploadDone <- nil
 	}()
 
-	inFile, err := os.Open(filePath)
+	inFile, err := os.Open(meta.Path)
 	if err != nil {
-		log.Fatalf("[FATAL] Cannot read input file: %v", err)
+		return fmt.Errorf("cannot read input file: %w", err)
 	}
 	defer inFile.Close()
 
-	chunkBuf := make([]byte, 64*1024) // 64 KB chunks
-	nonceCounter := uint64(0)
+	aead, err := NewAEAD(aesKey)
+	if err != nil {
+		return fmt.Errorf("aead init failed: %w", err)
+	}
+	bw := bufio.NewWriterSize(pipeWriter, 1<<20)
+	chunkBuf := make([]byte, 256*1024)
+	cipherBuf := make([]byte, 0, len(chunkBuf)+aead.Overhead())
+	nonce := make([]byte, 12)
+	var nonceCounter uint64
 	var sentBytes int64
 	startTime := time.Now()
 
 	for {
 		n, readErr := inFile.Read(chunkBuf)
 		if n > 0 {
-			nonce := make([]byte, 12)
 			binary.BigEndian.PutUint32(nonce[:4], 0)
 			binary.BigEndian.PutUint64(nonce[4:], nonceCounter)
 			nonceCounter++
 
-			cipherChunk, encErr := EncryptChunk(aesKey, nonce, chunkBuf[:n])
-			if encErr != nil {
-				log.Fatalf("[FATAL] Encryption failed: %v", encErr)
+			cipherChunk := aead.Seal(cipherBuf[:0], nonce, chunkBuf[:n], nil)
+			var lenHeader [4]byte
+			binary.BigEndian.PutUint32(lenHeader[:], uint32(len(cipherChunk)))
+			if _, err := bw.Write(lenHeader[:]); err != nil {
+				return fmt.Errorf("stream write failed: %w", err)
+			}
+			if _, err := bw.Write(nonce); err != nil {
+				return fmt.Errorf("stream write failed: %w", err)
+			}
+			if _, err := bw.Write(cipherChunk); err != nil {
+				return fmt.Errorf("stream write failed: %w", err)
 			}
 
-			// Write 4-byte chunk len + 12-byte nonce + ciphertext
-			lenHeader := make([]byte, 4)
-			binary.BigEndian.PutUint32(lenHeader, uint32(len(cipherChunk)))
-			_, _ = pipeWriter.Write(lenHeader)
-			_, _ = pipeWriter.Write(nonce)
-			_, _ = pipeWriter.Write(cipherChunk)
-
 			sentBytes += int64(n)
-			pct := float64(sentBytes) / float64(fileSize) * 100.0
+			pct := float64(sentBytes) / float64(meta.Size) * 100.0
 			speed := (float64(sentBytes) / (1024 * 1024)) / time.Since(startTime).Seconds()
-			fmt.Printf("\rStreaming: [%-30s] %.1f%% (%.1f/%.1f MB) - %.1f MB/s",
-				strings.Repeat("█", int(pct*0.3)), pct,
-				float64(sentBytes)/(1024*1024), float64(fileSize)/(1024*1024), speed)
+			fmt.Printf("\rStreaming %s: %.1f%% (%.1f/%.1f MB) %.1f MB/s",
+				meta.Name, pct, float64(sentBytes)/(1024*1024), float64(meta.Size)/(1024*1024), speed)
 		}
-
 		if readErr == io.EOF {
-			// Write zero-length EOF marker
-			zeroHeader := make([]byte, 4)
-			_, _ = pipeWriter.Write(zeroHeader)
 			break
 		}
 		if readErr != nil {
-			log.Fatalf("\n[FATAL] Error reading file: %v", readErr)
+			return fmt.Errorf("read error: %w", readErr)
 		}
 	}
 
-	_ = pipeWriter.Close()
-	if err := <-uploadDone; err != nil {
-		notifyUser("Transfer Failed", fmt.Sprintf("Failed sending '%s': %v", fileName, err))
-		log.Fatalf("\n[FATAL] Pipe upload failed: %v\n", err)
+	var zeroHeader [4]byte
+	if _, err := bw.Write(zeroHeader[:]); err != nil {
+		return fmt.Errorf("stream write failed: %w", err)
 	}
+	if err := bw.Flush(); err != nil {
+		return fmt.Errorf("stream flush failed: %w", err)
+	}
+	_ = pipeWriter.Close()
+	fmt.Println()
 
-	notifyUser("Transfer Sent", fmt.Sprintf("Sent '%s' (%.1f MB) to %s", fileName, float64(sentBytes)/(1024*1024), targetName))
-	fmt.Printf("\nTransfer successfully completed in %.1fs!\n", time.Since(startTime).Seconds())
+	if err := <-uploadDone; err != nil {
+		return fmt.Errorf("pipe upload failed: %w", err)
+	}
+	return nil
 }
 
 func main() {
@@ -690,6 +856,7 @@ func main() {
 	flag.StringVar(&cfg.DeviceID, "device-id", generateDeviceID(), "Unique device identifier")
 	flag.StringVar(&cfg.Name, "name", defaultName, "Human readable device name")
 	flag.StringVar(&cfg.InboxDir, "inbox", defaultInboxDir(), "Directory where incoming files are saved")
+	flag.StringVar(&cfg.PeersFile, "peers-file", defaultPeersFile(), "Path to the peer state file watched by desktop shells")
 	flag.BoolVar(&jsonOutput, "json", false, "Output results as JSON")
 	flag.Parse()
 
@@ -699,7 +866,7 @@ func main() {
 		fmt.Println("\nUsage:")
 		fmt.Println("  gaur-share daemon                   Run background receiver daemon")
 		fmt.Println("  gaur-share list [-json]             List all active cluster devices")
-		fmt.Println("  gaur-share send <device> <file>     Send file to a specific device")
+		fmt.Println("  gaur-share send <device> <file>...  Send one or more files to a device")
 		fmt.Println("\nFlags:")
 		flag.PrintDefaults()
 		return
@@ -710,6 +877,9 @@ func main() {
 	go func() {
 		<-sigChan
 		fmt.Println("\nShutting down gaur-share...")
+		if args[0] == "daemon" {
+			writePeersFile(cfg, nil)
+		}
 		os.Exit(0)
 	}()
 
@@ -725,9 +895,9 @@ func main() {
 		runList(cfg, jsonOutput)
 	case "send":
 		if len(args) < 3 {
-			log.Fatalf("Usage: gaur-share send <target-device> <file-path>")
+			log.Fatalf("Usage: gaur-share send <target-device> <file-path> [file-path...]")
 		}
-		runSend(cfg, args[1], args[2])
+		runSend(cfg, args[1], args[2:])
 	default:
 		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send", args[0])
 	}

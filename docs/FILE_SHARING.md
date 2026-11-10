@@ -15,7 +15,7 @@
   - Clients derive $K_{relay} = \text{hex}(\text{HMAC-SHA256}(T, \text{"gaur-relay-auth-v1"}))$ for relay authentication and presence.
   - Clients derive $K_{peer} = \text{HMAC-SHA256}(T, \text{"gaur-peer-auth-v1"})$ kept strictly on end-devices.
   - Peer offers and accepts are signed with $K_{peer}$ via HMAC-SHA256 tags binding the transfer ID, recipient ID, and ephemeral public keys, preventing malicious or compromised relays from performing active Man-In-The-Middle (MITM) key swaps.
-* **Sequential Nonce Integrity:** Every 64 KB chunk uses a 96-bit nonce containing a strict sequential counter (`[00 00 00 00][counter]`). Receivers reject any out-of-order, dropped, or duplicated chunks.
+* **Sequential Nonce Integrity:** Every 256 KB chunk uses a 96-bit nonce containing a strict sequential counter (`[00 00 00 00][counter]`). Receivers reject any out-of-order, dropped, or duplicated chunks.
 * **Safety Numbers:** Ephemeral public keys and transfer IDs generate a deterministic 30-digit numeric fingerprint (6 blocks of 5 decimal digits) for out-of-band identity verification.
 * **Path Traversal & Collision Protection:** Filenames are sanitized against directory traversal attacks, received streams are staged into hidden `.part` files until GCM tag verification succeeds, and duplicate names resolve automatically to numbered files (`file (1).ext`) without interrupting automatic file acceptance.
 * **In-Memory Zero-Knowledge VPS:** The relay daemon on the VPS binds exclusively to `127.0.0.1:9876` (localhost loopback). It pipes streams in memory via `io.Pipe`, never writes payloads to disk, and cannot decrypt file contents.
@@ -112,7 +112,7 @@ laptop-92c10e         Gaurish-Laptop    online (you)just now
 
 #### 3. Send a File to Phone
 ```bash
-gaur-share send "Pixel 8" ~/Documents/report.pdf
+gaur-share send "Pixel 8" ~/Documents/report.pdf ~/Documents/notes.pdf
 ```
 *Output:*
 ```text

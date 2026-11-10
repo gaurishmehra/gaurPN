@@ -35,6 +35,26 @@ class CryptoTest {
     }
 
     @Test
+    fun testReusedCipherAcrossChunks() {
+        val alice = Crypto.generateKeyPair()
+        val bob = Crypto.generateKeyPair()
+        val key = Crypto.deriveSharedSecret(alice, Crypto.exportPublicKey(bob.public))
+
+        val encryptor = Crypto.createAesGcmCipher()
+        val decryptor = Crypto.createAesGcmCipher()
+
+        for (i in 0 until 5) {
+            val nonce = ByteArray(12).also {
+                java.nio.ByteBuffer.wrap(it).putLong(4, i.toLong())
+            }
+            val plaintext = ByteArray(1024) { (i + it).toByte() }
+            val ciphertext = Crypto.encryptChunk(encryptor, key, nonce, plaintext, 0, plaintext.size)
+            val decrypted = Crypto.decryptChunk(decryptor, key, nonce, ciphertext, 0, ciphertext.size)
+            assertArrayEquals(plaintext, decrypted)
+        }
+    }
+
+    @Test
     fun testSubKeyDerivationAndAuthTag() {
         val masterToken = "test-cluster-token-xyz-12345"
         val (relayToken, peerKey) = Crypto.deriveSubKeys(masterToken)

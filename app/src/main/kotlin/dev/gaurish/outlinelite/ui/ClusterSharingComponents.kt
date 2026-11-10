@@ -155,11 +155,11 @@ fun ClusterSharingSection(
 
     var targetPeerForPicker by remember { mutableStateOf<ClusterPeer?>(null) }
     val filePickerLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.GetContent()
-    ) { uri: Uri? ->
+        ActivityResultContracts.GetMultipleContents()
+    ) { uris: List<Uri> ->
         val peer = targetPeerForPicker
-        if (uri != null && peer != null) {
-            RelayManager.sendFile(context, peer, uri)
+        if (uris.isNotEmpty() && peer != null) {
+            RelayManager.sendFiles(context, peer, uris)
         }
         targetPeerForPicker = null
     }
@@ -269,7 +269,7 @@ fun ClusterSharingSection(
 
 @Composable
 fun ShareTargetDialog(
-    uri: Uri,
+    uris: List<Uri>,
     onConnectToVpn: () -> Unit,
     onDismiss: () -> Unit,
 ) {
@@ -315,7 +315,7 @@ fun ShareTargetDialog(
                         PeerRow(
                             peer = peer,
                             onSendClick = {
-                                RelayManager.sendFile(context, peer, uri)
+                                RelayManager.sendFiles(context, peer, uris)
                                 onDismiss()
                             },
                         )
@@ -393,7 +393,7 @@ private fun PeerRow(
                 contentColor = Color(0xFF04231A),
             ),
         ) {
-            Text("Send File", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            Text("Send Files", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }

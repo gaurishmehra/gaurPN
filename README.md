@@ -20,7 +20,7 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 
 ### In-Tunnel File Sharing (`gaur-share`)
 - **Zero Local Wi-Fi Leakage**: All traffic stays inside the Shadowsocks tunnel. No mDNS, no Bonjour, no ARP broadcasts, and no UDP hole punching on your local network.
-- **Double Encryption**: Outer Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`) wraps an inner layer of ephemeral ECDH (NIST P-256) key exchange, HKDF-SHA256 session key derivation, and authenticated AES-256-GCM chunked streaming (64 KB chunks with sequential nonces).
+- **Double Encryption**: Outer Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`) wraps an inner layer of ephemeral ECDH (NIST P-256) key exchange, HKDF-SHA256 session key derivation, and authenticated AES-256-GCM chunked streaming (256 KB chunks with sequential nonces).
 - **Zero-Knowledge Dual-Key Architecture**: Derives separate relay presence keys ($K_{relay}$) and local peer authentication keys ($K_{peer}$), with HMAC-SHA256 authentication tags preventing relay Man-In-The-Middle attacks and safety number verification.
 - **Path Traversal & Collision Protection**: Automatic filename sanitization, staging to `.part` files, and automatic non-destructive collision resolution preserving seamless file auto-acceptance.
 - **Zero-Knowledge VPS Relay**: The relay daemon binds only to `127.0.0.1:9876` on your VPS. It pipes streams in memory via `io.Pipe`, never writes payloads to disk, and requires pre-shared cluster token authentication.
@@ -73,7 +73,7 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 │  Desktop Client (gaur-share on Linux / macOS / Windows)                                               │
 │    ├── gaur-share daemon: Runs background receiver, notifies via desktop alerts                      │
 │    ├── gaur-share list: Discovers active tunnel cluster peers                                         │
-│    └── gaur-share send <target> <file>: Ephemeral key exchange + AES-256-GCM chunked stream           │
+│    └── gaur-share send <target> <file>...: Ephemeral key exchange + AES-256-GCM chunked stream        │
 └───────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -253,7 +253,7 @@ To list online devices and send a file:
 gaur-share list
 
 # Send a file to an Android device
-gaur-share send "Pixel 8" ~/Documents/notes.pdf
+gaur-share send "Pixel 8" ~/Documents/notes.pdf ~/Documents/report.pdf
 ```
 
 #### On Android (`gaurPN`)
