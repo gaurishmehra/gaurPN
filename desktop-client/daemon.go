@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 	"net/url"
@@ -63,8 +64,19 @@ func connectWS(cfg Config, token string) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("X-Gaur-Token", token)
 	conn, _, err := websocket.DefaultDialer.Dial(u.String(), header)
-	return conn, err
+	if err != nil {
+		return nil, err
+	}
+	// Gorilla defaults to no read limit, so a malicious relay could send an
+	// unbounded frame and OOM the client. 2 MiB is far above any protocol
+	// message (sealed payloads cap at 512 KiB); an oversized frame closes the
+	// connection instead.
+	conn.SetReadLimit(wsReadLimit)
+	return conn, nil
 }
+
+// wsReadLimit is the largest WebSocket frame any client accepts.
+const wsReadLimit = 2 << 20
 
 type transferRun struct {
 	cancel context.CancelFunc
@@ -94,6 +106,9 @@ type daemonSession struct {
 	activeTransfers *sync.Map
 	mpris           *MprisManager
 	localMedia      *LocalMediaWatcher
+	status          *StatusPublisher
+	statusWarned    map[string]bool
+	statusWarnOrder []string
 }
 
 func runDaemon(cfg Config) {
@@ -117,6 +132,13 @@ func runDaemon(cfg Config) {
 		log.Printf("[MPRIS] Local watcher disabled: %v", localErr)
 	}
 
+	statusPublisher, statusErr := NewStatusPublisher(cfg, peerCryptoKey)
+	if statusErr != nil {
+		log.Printf("[STATUS] Disabled: %v", statusErr)
+	}
+	setDaemonStatus(statusPublisher)
+	defer stopDaemonStatus()
+
 	if err := ensureInboxDir(cfg.InboxDir); err != nil {
 		log.Printf("[DAEMON] Inbox directory unavailable: %v", err)
 	}
@@ -134,6 +156,8 @@ func runDaemon(cfg Config) {
 		activeTransfers: &sync.Map{},
 		mpris:           mpris,
 		localMedia:      localMedia,
+		status:          statusPublisher,
+		statusWarned:    make(map[string]bool),
 	}
 	for {
 		connected := session.runOnce()
@@ -161,6 +185,8 @@ func (s *daemonSession) runOnce() bool {
 	client := &wsClient{conn: conn}
 	s.sender.Set(client, s.peerCryptoKey)
 	s.broadcaster.Set(client, s.peerCryptoKey)
+	// A new relay connection gets one status resend immediately.
+	s.status.SetWriter(client)
 
 	log.Printf("[DAEMON] Connected to in-tunnel relay at %s. Standing by for incoming transfers...", cfg.RelayAddr)
 
@@ -194,6 +220,7 @@ func (s *daemonSession) runOnce() bool {
 			clipCancel()
 			s.sender.Set(nil, nil)
 			s.broadcaster.Set(nil, nil)
+			s.status.SetWriter(nil)
 			s.store.set(nil)
 			writePeersFile(cfg, nil)
 			log.Printf("[DAEMON] Relay connection interrupted: %v. Reconnecting...", err)
@@ -209,17 +236,10 @@ func (s *daemonSession) runOnce() bool {
 		switch envelopeString(envelope, "type") {
 		case "peers":
 			peersRaw, _ := envelope["peers"].([]interface{})
-			entries := make([]peerFileEntry, 0, len(peersRaw))
-			for _, p := range peersRaw {
-				pMap, _ := p.(map[string]interface{})
-				id, _ := pMap["id"].(string)
-				name, _ := pMap["name"].(string)
-				entries = append(entries, peerFileEntry{
-					ID:     id,
-					Name:   name,
-					Status: "online",
-					IsSelf: id == cfg.DeviceID || strings.EqualFold(name, cfg.Name),
-				})
+			entries := buildPeerEntries(cfg, s.peerCryptoKey, peersRaw, s.warnStatusOnce)
+			if s.status != nil {
+				reading, ok := s.status.Current()
+				applyOwnStatus(entries, cfg.DeviceID, reading, ok)
 			}
 			s.store.set(entries)
 			writePeersFile(cfg, entries)
@@ -259,6 +279,109 @@ func (s *daemonSession) runOnce() bool {
 	}
 
 	return true
+}
+
+// buildPeerEntries converts the relay's peers broadcast into peers-file
+// entries, decrypting each peer's status blob when the relay carries one.
+// Malformed blobs are skipped and reported through warn once per device; the
+// relay never sees plaintext telemetry.
+func buildPeerEntries(cfg Config, peerCryptoKey []byte, peersRaw []interface{}, warn func(string, error)) []peerFileEntry {
+	statusKey := DeriveStatusKey(peerCryptoKey)
+	entries := make([]peerFileEntry, 0, len(peersRaw))
+	for _, p := range peersRaw {
+		pMap, _ := p.(map[string]interface{})
+		id, _ := pMap["id"].(string)
+		name, _ := pMap["name"].(string)
+		entry := peerFileEntry{
+			ID:     id,
+			Name:   name,
+			Status: "online",
+			IsSelf: id == cfg.DeviceID || strings.EqualFold(name, cfg.Name),
+		}
+		if blob, _ := pMap["status"].(string); blob != "" && id != cfg.DeviceID {
+			battery, charging, ts, err := DecodeStatusBlob(statusKey, id, blob)
+			switch {
+			case err != nil:
+				if warn != nil {
+					warn(id, err)
+				}
+			case !statusBlobFresh(ts, time.Now().UnixMilli()):
+				// The blob authenticated but is older than the freshness
+				// window: the relay replayed a stored status.
+				if warn != nil {
+					warn(id, errStatusStale)
+				}
+			default:
+				entry.Battery = intPtr(battery)
+				entry.Charging = boolPtr(charging)
+			}
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+// applyOwnStatus fills the daemon's own peers entry from its local UPower
+// reading. The relay may echo our own status blob, but the local reading is
+// authoritative and avoids a round trip through the relay. The match is by
+// device id, never by display name: two machines can share a name (the
+// default is "Lilac"), and a same-name peer must keep its own telemetry.
+func applyOwnStatus(entries []peerFileEntry, deviceID string, reading batteryReading, ok bool) {
+	if !ok || deviceID == "" {
+		return
+	}
+	for i := range entries {
+		if entries[i].ID == deviceID {
+			entries[i].Battery = intPtr(reading.Battery)
+			entries[i].Charging = boolPtr(reading.Charging)
+		}
+	}
+}
+
+// statusFreshnessMs is how old an authenticated status blob may be before it
+// is ignored. The relay stores blobs opaquely and can replay an old one; the
+// authenticated ts is the only freshness signal. Ten minutes tolerates clock
+// skew between cluster devices.
+const statusFreshnessMs = 10 * 60 * 1000
+
+// errStatusStale marks an authenticated status blob older than the freshness
+// window.
+var errStatusStale = errors.New("status blob is stale")
+
+// statusBlobFresh reports whether an authenticated status timestamp is inside
+// the freshness window. A timestamp slightly in the future (clock skew) is
+// accepted; only old blobs are dropped.
+func statusBlobFresh(ts, nowMs int64) bool {
+	return nowMs-ts <= statusFreshnessMs
+}
+
+// statusWarnCapacity bounds the one-line-per-device warning memory. The relay
+// controls the device ids it advertises, so an unbounded map would grow with
+// its peer churn.
+const statusWarnCapacity = 256
+
+// warnStatusOnce logs a malformed status blob once per device. The peers
+// handler runs in the single read-loop goroutine, so the map needs no lock.
+// When the table is full the oldest device is dropped, mirroring the replay
+// guard's FIFO eviction.
+func (s *daemonSession) warnStatusOnce(deviceID string, err error) {
+	if s.statusWarned == nil {
+		s.statusWarned = make(map[string]bool, statusWarnCapacity)
+	}
+	if s.statusWarned[deviceID] {
+		return
+	}
+	if len(s.statusWarned) >= statusWarnCapacity {
+		if len(s.statusWarnOrder) > 0 {
+			delete(s.statusWarned, s.statusWarnOrder[0])
+			s.statusWarnOrder = s.statusWarnOrder[1:]
+		} else {
+			s.statusWarned = make(map[string]bool, statusWarnCapacity)
+		}
+	}
+	s.statusWarned[deviceID] = true
+	s.statusWarnOrder = append(s.statusWarnOrder, deviceID)
+	log.Printf("[STATUS] Ignoring malformed status from %s: %v", singleLineDisplayName(deviceID), err)
 }
 
 // pingLoop sends the heartbeat ping every daemonPingEvery. On a write failure

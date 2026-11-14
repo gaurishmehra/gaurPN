@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,6 +81,53 @@ func collectSendMetas(filePaths []string, openRequested bool) ([]sendFileMeta, e
 	return metas, nil
 }
 
+// requestMeta is the grant a pull request's target echoes in its sealed
+// offers. It is parsed from the hidden --request-meta flag, which only the
+// send subprocess spawned by handleIncomingRequest sets.
+type requestMeta struct {
+	RequestID string
+	Grant     string
+	ExpiresTs int64
+}
+
+// parseRequestMeta validates "<request_id>:<grant>:<expires_ts>". Grants are
+// 64 lowercase hex characters; anything else is a caller bug and must fail
+// before a single chunk is uploaded.
+func parseRequestMeta(raw string) (*requestMeta, error) {
+	parts := strings.Split(raw, ":")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("request meta must be <request_id>:<grant>:<expires_ts>")
+	}
+	requestID := strings.TrimSpace(parts[0])
+	grant := strings.TrimSpace(parts[1])
+	expiresText := strings.TrimSpace(parts[2])
+	if !isRequestID(requestID) {
+		return nil, fmt.Errorf("request meta: request id must be req- plus 16 lowercase hex characters")
+	}
+	if !isLowerHex(grant, 64) {
+		return nil, fmt.Errorf("request meta: grant must be 64 lowercase hex characters")
+	}
+	expires, err := strconv.ParseInt(expiresText, 10, 64)
+	if err != nil || expires <= 0 {
+		return nil, fmt.Errorf("request meta: expires_ts must be a positive unix-millisecond timestamp")
+	}
+	return &requestMeta{RequestID: requestID, Grant: grant, ExpiresTs: expires}, nil
+}
+
+// isLowerHex reports whether s is exactly length lowercase hex characters.
+func isLowerHex(s string, length int) bool {
+	if len(s) != length {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
 // runSendText sends a one-shot text or link to a peer. The payload is
 // encrypted with a key domain-separated from file transfers and clipboard
 // sync; the relay only sees ciphertext and routing metadata.
@@ -122,6 +170,10 @@ func runSendText(cfg Config, targetQuery, text string) {
 	if err != nil {
 		log.Fatalf("[FATAL] %v", err)
 	}
+	targetName = singleLineDisplayName(targetName)
+	if targetName == "" {
+		targetName = singleLineDisplayName(targetID)
+	}
 
 	kind := "text"
 	if strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") {
@@ -157,7 +209,7 @@ func runSendText(cfg Config, targetQuery, text string) {
 	if err := client.WriteJSON(msg); err != nil {
 		log.Fatalf("[FATAL] Could not send text: %v", err)
 	}
-	fmt.Printf("Sent %s to %s (%s)\n", kind, targetName, targetID)
+	fmt.Printf("Sent %s to %s (%s)\n", kind, targetName, singleLineDisplayName(targetID))
 }
 
 func runSend(cfg Config, targetQuery string, filePaths []string, openRequested bool) {
@@ -207,7 +259,11 @@ func runSend(cfg Config, targetQuery string, filePaths []string, openRequested b
 	if err != nil {
 		log.Fatalf("[FATAL] %v", err)
 	}
-	fmt.Printf("Target located: %s (%s)\n", targetName, targetID)
+	targetName = singleLineDisplayName(targetName)
+	if targetName == "" {
+		targetName = singleLineDisplayName(targetID)
+	}
+	fmt.Printf("Target located: %s (%s)\n", targetName, singleLineDisplayName(targetID))
 
 	batchID := fmt.Sprintf("batch-%d", time.Now().UnixNano())
 	startTime := time.Now()
@@ -230,7 +286,7 @@ func runSend(cfg Config, targetQuery string, filePaths []string, openRequested b
 		duration = 0.001
 	}
 	mbps := (float64(sentTotal) / (1024 * 1024)) / duration
-	notifyUser("Transfer Sent", fmt.Sprintf("Sent %d file(s) (%.1f MB) to %s", len(metas), float64(sentTotal)/(1024*1024), targetName))
+	notifyUser("Transfer Sent", fmt.Sprintf("Sent %d file(s) (%.1f MB) to %s", len(metas), float64(sentTotal)/(1024*1024), singleLineDisplayName(targetName)))
 	fmt.Printf("Transfer completed: %d file(s), %.1f MB in %.1fs (%.1f MB/s)\n",
 		len(metas), float64(sentTotal)/(1024*1024), duration, mbps)
 }
@@ -319,6 +375,13 @@ func ambiguousTargetError(query string, matches []targetPeer) error {
 // exact id, exact name, or name prefix. It returns an error when no device
 // matches, when several match, or when the relay never delivers a peer list.
 func discoverTarget(conn *websocket.Conn, targetQuery string) (string, string, error) {
+	return discoverTargetExcluding(conn, targetQuery)
+}
+
+// discoverTargetExcluding is discoverTarget with self-connection ids removed
+// from the peer list. A one-shot command connects under a short-lived id, and
+// that entry must not make a name query look ambiguous.
+func discoverTargetExcluding(conn *websocket.Conn, targetQuery string, excludeIDs ...string) (string, string, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(discoverTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 	for {
@@ -339,9 +402,20 @@ func discoverTarget(conn *websocket.Conn, targetQuery string) (string, string, e
 			pMap, _ := p.(map[string]interface{})
 			id, _ := pMap["id"].(string)
 			name, _ := pMap["name"].(string)
-			if id != "" {
-				peers = append(peers, targetPeer{ID: id, Name: name})
+			if id == "" {
+				continue
 			}
+			excluded := false
+			for _, exclude := range excludeIDs {
+				if id == exclude {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+			peers = append(peers, targetPeer{ID: id, Name: name})
 		}
 		match, err := resolveTargetQuery(peers, targetQuery)
 		if err != nil {
@@ -413,14 +487,29 @@ func parseHave(raw interface{}) []int {
 	return out
 }
 
+// completionTimeout bounds how long a sender waits for the receiver's signed
+// receipt: 120 seconds plus one second per 512 KiB, clamped to [2 minutes,
+// 2 hours]. A pull request uses the same formula to bound its receive window
+// after the first offer. Package vars so tests can shrink the base and clamp.
+var (
+	completionTimeoutBase = 120 * time.Second
+	completionTimeoutMin  = 2 * time.Minute
+	completionTimeoutMax  = 2 * time.Hour
+)
+
+func completionTimeout(size int64) time.Duration {
+	timeout := completionTimeoutBase + time.Duration(size/(512*1024))*time.Second
+	if timeout < completionTimeoutMin {
+		timeout = completionTimeoutMin
+	}
+	if timeout > completionTimeoutMax {
+		timeout = completionTimeoutMax
+	}
+	return timeout
+}
+
 func waitForComplete(conn *websocket.Conn, transferID string, peerCryptoKey []byte, deviceID string, digest *FileDigest) error {
-	timeout := time.Duration(digest.Size/(512*1024)+120) * time.Second
-	if timeout < 2*time.Minute {
-		timeout = 2 * time.Minute
-	}
-	if timeout > 2*time.Hour {
-		timeout = 2 * time.Hour
-	}
+	timeout := completionTimeout(digest.Size)
 	_ = conn.SetReadDeadline(time.Now().Add(timeout))
 	defer conn.SetReadDeadline(time.Time{})
 	for {

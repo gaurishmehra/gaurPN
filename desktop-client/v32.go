@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"strconv"
 	"strings"
@@ -64,6 +65,18 @@ func NewRequestID() (string, error) {
 	return "req-" + suffix, nil
 }
 
+// isRequestID reports whether value is the pinned "req-" plus 16 lowercase
+// hex characters. It mirrors RequestCodec.isRequestId on Android; the target
+// uses it to reject a request id that would break the send subprocess's
+// "<request_id>:<grant>:<expires_ts>" metadata.
+func isRequestID(value string) bool {
+	const prefix = "req-"
+	if len(value) != len(prefix)+16 || !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	return isLowerHex(value[len(prefix):], 16)
+}
+
 // DeriveStatusKey domain-separates peer status blobs from file transfers,
 // clipboard sync, text shares, and notifications.
 func DeriveStatusKey(peerKey []byte) []byte {
@@ -109,9 +122,18 @@ func EncodeStatusBlob(statusKey []byte, deviceID string, battery int, charging b
 	return base64.StdEncoding.EncodeToString(blob), nil
 }
 
+// statusBlobMaxEncoded is the largest base64 status blob accepted from the
+// relay. The pinned plaintext is ~40 bytes, so anything near this cap is
+// garbage; rejecting it before base64 decoding keeps an untrusted relay from
+// forcing a large allocation.
+const statusBlobMaxEncoded = 4096
+
 // DecodeStatusBlob fails closed: any decode, authentication, or parse error
 // returns err and the caller ignores the update. There is no partial result.
 func DecodeStatusBlob(statusKey []byte, deviceID, blob string) (battery int, charging bool, ts int64, err error) {
+	if len(blob) > statusBlobMaxEncoded {
+		return 0, false, 0, fmt.Errorf("status blob: %d bytes exceeds the %d-byte cap", len(blob), statusBlobMaxEncoded)
+	}
 	raw, err := base64.StdEncoding.DecodeString(blob)
 	if err != nil {
 		return 0, false, 0, fmt.Errorf("status blob: %w", err)
@@ -139,7 +161,9 @@ var errMalformedStatus = errors.New("status blob: malformed plaintext")
 
 // parseStatusPlaintext is the strict counterpart to statusPlaintext. It
 // accepts exactly the pinned shape and rejects everything else, including
-// non-canonical JSON that json.Unmarshal would happily accept.
+// non-canonical numbers (signs, leading zeros) that strconv would happily
+// accept. The rules mirror the Kotlin parser, so both clients agree on which
+// authenticated blobs are usable.
 func parseStatusPlaintext(plaintext []byte) (int, bool, int64, error) {
 	const (
 		batteryPrefix = `{"battery":`
@@ -154,8 +178,8 @@ func parseStatusPlaintext(plaintext []byte) (int, bool, int64, error) {
 	if !ok {
 		return 0, false, 0, errMalformedStatus
 	}
-	battery, err := strconv.Atoi(batteryText)
-	if err != nil {
+	battery, ok := parseCanonicalDigits(batteryText, 100)
+	if !ok {
 		return 0, false, 0, errMalformedStatus
 	}
 	chargingText, rest, ok := strings.Cut(rest, tsSep)
@@ -175,11 +199,30 @@ func parseStatusPlaintext(plaintext []byte) (int, bool, int64, error) {
 	if !ok {
 		return 0, false, 0, errMalformedStatus
 	}
-	ts, err := strconv.ParseInt(tsText, 10, 64)
-	if err != nil {
+	ts, ok := parseCanonicalDigits(tsText, math.MaxInt64)
+	if !ok {
 		return 0, false, 0, errMalformedStatus
 	}
-	return battery, charging, ts, nil
+	return int(battery), charging, ts, nil
+}
+
+// parseCanonicalDigits parses the unsigned decimal form encoding/json emits:
+// digits only, no sign, no leading zeros, and at most max. It is the Go
+// counterpart of the Kotlin parser's digit loop.
+func parseCanonicalDigits(text string, max int64) (int64, bool) {
+	if text == "" || (len(text) > 1 && text[0] == '0') {
+		return 0, false
+	}
+	for i := 0; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return 0, false
+		}
+	}
+	value, err := strconv.ParseInt(text, 10, 64)
+	if err != nil || value > max {
+		return 0, false
+	}
+	return value, true
 }
 
 // shareURLUnsafeRunes is the URL-unsafe set beyond control characters and

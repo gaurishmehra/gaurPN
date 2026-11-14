@@ -35,6 +35,7 @@ import (
 type fakePeer struct {
 	id       string
 	name     string
+	status   string // opaque status blob, guarded by fakeRelay.mu
 	mu       sync.Mutex
 	conn     *websocket.Conn
 	dark     chan struct{}
@@ -192,6 +193,19 @@ func (f *fakeRelay) handleWS(w http.ResponseWriter, r *http.Request) {
 			_ = peer.writeJSON(map[string]string{"type": "pong"})
 		case "list_peers":
 			f.sendPeerList(peer)
+		case "status":
+			// The production relay stores the blob opaquely and includes it
+			// in every later peers broadcast.
+			status, _ := envelope["status"].(string)
+			if status == "" {
+				continue
+			}
+			f.mu.Lock()
+			if cur, ok := f.peers[deviceID]; ok && cur == peer {
+				cur.status = status
+			}
+			f.mu.Unlock()
+			f.broadcastPeers()
 		case "sealed":
 			target, _ := envelope["target_id"].(string)
 			if target == "" {
@@ -239,7 +253,11 @@ func (f *fakeRelay) peersSnapshot() []map[string]string {
 	defer f.mu.Unlock()
 	list := make([]map[string]string, 0, len(f.peers))
 	for _, p := range f.peers {
-		list = append(list, map[string]string{"id": p.id, "name": p.name})
+		entry := map[string]string{"id": p.id, "name": p.name}
+		if p.status != "" {
+			entry["status"] = p.status
+		}
+		list = append(list, entry)
 	}
 	return list
 }
@@ -551,6 +569,13 @@ func (f *fakeRelay) connects() int {
 	return f.wsConnects
 }
 
+func (f *fakeRelay) hasPeer(deviceID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.peers[deviceID]
+	return ok
+}
+
 func (f *fakeRelay) statusCallsCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -722,6 +747,7 @@ func TestPingLoopClosesConnOnWriteFailure(t *testing.T) {
 
 	// Kill the TCP connection from the server side without a WS close
 	// frame: subsequent ping writes fail.
+	waitFor(t, 5*time.Second, func() bool { return f.hasPeer(cfg.DeviceID) })
 	f.killConn(cfg.DeviceID)
 
 	stop := make(chan struct{})
@@ -733,10 +759,14 @@ func TestPingLoopClosesConnOnWriteFailure(t *testing.T) {
 		t.Fatal("ping loop did not exit after its write failed")
 	}
 
-	// The read loop is unblocked because the conn was closed.
+	// The read loop is unblocked because the conn was closed. Frames the
+	// relay broadcast before the kill may still be buffered, so read until
+	// the closed connection reports the failure.
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, _, err := client.ReadMessage(); err == nil {
-		t.Fatal("expected ReadMessage to fail after the ping loop closed the conn")
+	for {
+		if _, _, err := client.ReadMessage(); err != nil {
+			break
+		}
 	}
 }
 

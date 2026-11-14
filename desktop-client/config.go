@@ -25,6 +25,11 @@ type Config struct {
 	AutoOpen        bool
 	OnlyTrusted     bool
 	Notifications   bool
+
+	// RequestMeta is set only by the send subprocess spawned for a pull
+	// request. It carries the grant the requester expects echoed in the
+	// sealed offer. It is never read from config.json.
+	RequestMeta *requestMeta
 }
 
 func defaultInboxDir() string {
@@ -173,13 +178,16 @@ func generateDeviceID() string {
 }
 
 // setupLogFile points the standard logger at cfg.LogFile when one was given.
-// A log file that cannot be opened is ignored: the daemon must stay runnable
-// with logs going to stderr.
+// The log carries device ids, file names, and transfer metadata, so it is
+// owner-only. A log file that cannot be opened is ignored: the daemon must
+// stay runnable with logs going to stderr.
 func setupLogFile(cfg Config) {
 	if cfg.LogFile == "" {
 		return
 	}
-	if f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+	if f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+		// O_CREATE never tightens an existing file.
+		_ = os.Chmod(cfg.LogFile, 0o600)
 		log.SetOutput(f)
 	}
 }

@@ -16,11 +16,19 @@ import (
 const listDeadline = 4 * time.Second
 
 type peerFileEntry struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
-	IsSelf bool   `json:"is_self"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Status   string `json:"status"`
+	IsSelf   bool   `json:"is_self"`
+	Battery  *int   `json:"battery,omitempty"`
+	Charging *bool  `json:"charging,omitempty"`
 }
+
+// intPtr and boolPtr let the peers file distinguish "unknown" (nil, omitted)
+// from a known zero value. A plain int/bool with omitempty would drop a real
+// 0% battery or a "not charging" flag.
+func intPtr(v int) *int    { return &v }
+func boolPtr(v bool) *bool { return &v }
 
 type peerStore struct {
 	mu    sync.RWMutex
@@ -62,15 +70,27 @@ func writePeersFile(cfg Config, peers []peerFileEntry) {
 		log.Printf("[PEERS] Could not serialize peer list for %s: %v", cfg.PeersFile, err)
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(cfg.PeersFile), 0o755); err != nil {
+	dir := filepath.Dir(cfg.PeersFile)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		log.Printf("[PEERS] Could not create directory for %s: %v", cfg.PeersFile, err)
 		return
 	}
-	f, err := os.OpenFile(cfg.PeersFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	// The peer list names the user's other devices, so the directory and file
+	// are owner-only. MkdirAll leaves an existing directory's mode alone, so
+	// tighten it here — but never a world-writable shared directory such as
+	// /tmp, which a user-specified -peers-file may point into.
+	if info, err := os.Stat(dir); err == nil && info.IsDir() &&
+		info.Mode().Perm()&0o002 == 0 && info.Mode().Perm()&0o077 != 0 {
+		_ = os.Chmod(dir, 0o700)
+	}
+	f, err := os.OpenFile(cfg.PeersFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		log.Printf("[PEERS] Could not open %s for writing: %v", cfg.PeersFile, err)
 		return
 	}
+	// O_CREATE never tightens an existing file: a peers.json written 0644 by
+	// an older build must become owner-only too.
+	_ = os.Chmod(cfg.PeersFile, 0o600)
 	if _, err := f.Write(data); err != nil {
 		log.Printf("[PEERS] Could not write %s: %v", cfg.PeersFile, err)
 	}
@@ -160,7 +180,8 @@ func runList(cfg Config, asJSON bool) error {
 				if isSelf {
 					status = "online (this device)"
 				}
-				fmt.Printf("%-24s %-28s %-12s\n", id, name, status)
+				fmt.Printf("%-24s %-28s %-12s\n",
+					singleLineDisplayName(id), singleLineDisplayName(name), status)
 			}
 			fmt.Println("────────────────────────────────────────────────────────────────────────")
 			fmt.Println()

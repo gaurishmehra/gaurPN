@@ -220,13 +220,21 @@ func runSendV3(cfg Config, targets []string, filePaths []string, offline, openRe
 				"open":         meta.Open,
 				"offline":      offline,
 			}
+			// A pull request's target echoes the request id and grant. The
+			// sender_id above is cfg.SenderID (the real device id), even
+			// though this subprocess connects under a "-out" id: the
+			// requester verifies the sender against the target it asked.
+			if cfg.RequestMeta != nil {
+				inner["request_id"] = cfg.RequestMeta.RequestID
+				inner["grant"] = cfg.RequestMeta.Grant
+			}
 			envelope, err := sealEnvelope(peerCryptoKey, target, "offer", inner)
 			if err != nil {
-				log.Printf("[SEND] Could not seal offer for %s: %v", target, err)
+				log.Printf("[SEND] Could not seal offer for %s: %v", singleLineDisplayName(target), err)
 				continue
 			}
 			if err := client.WriteJSON(envelope); err != nil {
-				log.Printf("[SEND] Could not send offer to %s: %v", target, err)
+				log.Printf("[SEND] Could not send offer to %s: %v", singleLineDisplayName(target), err)
 			}
 		}
 		fmt.Printf("Queued %s for %d device(s)\n", meta.Name, len(targets))
@@ -356,7 +364,8 @@ func handleIncomingSealed(
 	// device here, where it would decrypt and be processed all the same.
 	targetID := envelopeString(envelope, "target_id")
 	if targetID != cfg.DeviceID {
-		log.Printf("[SEALED] Dropped envelope addressed to %s, not this device (%s)", targetID, cfg.DeviceID)
+		log.Printf("[SEALED] Dropped envelope addressed to %s, not this device (%s)",
+			singleLineDisplayName(targetID), cfg.DeviceID)
 		return
 	}
 	// Replay protection: a duplicate msg_id is dropped, and command kinds
@@ -372,6 +381,13 @@ func handleIncomingSealed(
 		log.Printf("[SEALED] Could not open %v envelope: %v", envelope["kind"], err)
 		return
 	}
+	// A pull request carries requester_id/requester_name, not sender_id, so it
+	// must be dispatched before the generic sender gate. Its own trust check
+	// lives in handleIncomingRequest and declines rather than dropping.
+	if kind == "request" {
+		go handleIncomingRequest(cfg, peerCryptoKey, client, inner)
+		return
+	}
 	senderID := envelopeString(inner, "sender_id")
 	senderName := envelopeString(inner, "sender_name")
 	if senderID == "" {
@@ -380,8 +396,11 @@ func handleIncomingSealed(
 	if senderName == "" {
 		senderName = senderID
 	}
+	// The name is display-only; the id keeps its wire value for trust,
+	// routing, and diagnostics.
+	senderName = singleLineDisplayName(senderName)
 	if onlyTrustedEnabled(cfg) && senderID != cfg.DeviceID && !isTrustedDevice(senderID) {
-		log.Printf("[SEALED] Dropped %s from untrusted %s", kind, senderID)
+		log.Printf("[SEALED] Dropped %s from untrusted %s", kind, singleLineDisplayName(senderID))
 		return
 	}
 
@@ -406,8 +425,8 @@ func handleIncomingSealed(
 		if fileName == "" {
 			fileName = "file"
 		}
-		notifyUser("Delivered", fmt.Sprintf("%s received %s", senderName, fileName))
-		log.Printf("[SEALED] Delivery receipt from %s for %s", senderID, fileName)
+		notifyUser("Delivered", fmt.Sprintf("%s received %s", senderName, singleLineDisplayName(fileName)))
+		log.Printf("[SEALED] Delivery receipt from %s for %s", singleLineDisplayName(senderID), singleLineDisplayName(fileName))
 	case "notification_ack":
 		status := envelopeString(inner, "status")
 		notifKey := envelopeString(inner, "notif_key")
@@ -443,6 +462,46 @@ func handleSealedOffer(
 	senderID, senderName string,
 	inner map[string]interface{},
 ) {
+	finalPath, err := receiveSealedOfferFile(cfg, relayToken, peerCryptoKey, cfg.DeviceID, senderID, inner)
+	if err != nil {
+		log.Printf("[SEALED] %v", err)
+		return
+	}
+	notifyUser("File Received", fmt.Sprintf("%s from %s", filepath.Base(finalPath), senderName))
+	log.Printf("[SEALED] Received %s from %s", filepath.Base(finalPath), singleLineDisplayName(senderID))
+
+	completion := map[string]interface{}{
+		"sender_id":   cfg.DeviceID,
+		"sender_name": cfg.Name,
+		"transfer_id": envelopeString(inner, "transfer_id"),
+		"file_hash":   envelopeString(inner, "file_hash"),
+		"file_name":   filepath.Base(finalPath),
+	}
+	envelope, err := sealEnvelope(peerCryptoKey, senderID, "complete", completion)
+	if err != nil {
+		log.Printf("[SEALED] Could not seal completion: %v", err)
+		return
+	}
+	if err := client.WriteJSON(envelope); err != nil {
+		log.Printf("[SEALED] Could not send completion: %v", err)
+	}
+}
+
+// receiveSealedOfferFile downloads, verifies, and commits one sealed v3
+// offer. It is shared by the daemon's push path and the request (pull)
+// command; deviceID is the identity used for chunk auth — the daemon's id
+// for a pushed offer, the request's ephemeral id for a requested one.
+//
+// Resume works like the v2 path: the .part file and chunk bitmap are reused
+// when they belong to this exact transfer and file, and a failed download
+// keeps both so the next offer resumes instead of restarting from zero.
+func receiveSealedOfferFile(
+	cfg Config,
+	relayToken string,
+	peerCryptoKey []byte,
+	deviceID, senderID string,
+	inner map[string]interface{},
+) (string, error) {
 	transferID := envelopeString(inner, "transfer_id")
 	sessionID := envelopeString(inner, "session_id")
 	fileName := envelopeString(inner, "file_name")
@@ -452,34 +511,35 @@ func handleSealedOffer(
 	chunkCount := int(envelopeInt64(inner, "chunk_count"))
 	chunkHashes := parseStringArray(inner["chunk_hashes"])
 
-	if transferID == "" || sessionID == "" || fileName == "" || fileHash == "" ||
-		chunkSize <= 0 || chunkCount < 0 || len(chunkHashes) != chunkCount {
-		log.Printf("[SEALED] Rejecting malformed offer from %s", senderID)
-		return
+	if transferID == "" || sessionID == "" || fileName == "" || fileHash == "" {
+		return "", fmt.Errorf("rejecting malformed offer from %s", senderID)
 	}
-	if fileSize > 0 && chunkCount == 0 {
-		return
+	// The transfer id becomes part of the .part and .state file names; only
+	// the pinned "tx-" + 32 lowercase hex shape may reach a path.
+	if !IsValidTransferID(transferID) {
+		return "", fmt.Errorf("rejecting offer with invalid transfer id from %s", senderID)
+	}
+	// The same caps as the v2 path: chunk geometry is peer-supplied, and a
+	// bad combination could address outside the file or make the receiver
+	// hash a chunk count the sender never staged.
+	if !sealedOfferGeometryOK(fileSize, chunkSize, chunkCount, len(chunkHashes)) {
+		return "", fmt.Errorf("rejecting malformed offer from %s", senderID)
 	}
 
 	cleanName := SanitizeFileName(fileName)
 	destPath := filepath.Join(cfg.InboxDir, cleanName)
 	if !IsPathInsideDirectory(destPath, cfg.InboxDir) {
-		log.Printf("[SEALED] Path traversal attempt from %s: %q", senderID, fileName)
-		return
+		return "", fmt.Errorf("path traversal attempt from %s: %q", senderID, fileName)
 	}
 	if err := ensureInboxDir(cfg.InboxDir); err != nil {
-		log.Printf("[SEALED] Inbox unavailable: %v", err)
-		return
+		return "", fmt.Errorf("inbox unavailable: %w", err)
 	}
 
-	partPath := partFilePath(cfg, cleanName, transferID)
-	statePath := partPath + ".state"
+	partPath, statePath, pathOk := partPathsFor(cfg, cleanName, transferID)
+	if !pathOk {
+		return "", fmt.Errorf("rejecting offer with an escaping staging path from %s", senderID)
+	}
 
-	// Resume like the v2 path: reuse the .part file and chunk bitmap when
-	// they belong to this exact transfer and file, and start over cleanly
-	// when they do not. The v3 session id is deterministic, so ciphertext
-	// staged on the relay is still valid and only missing chunks are
-	// downloaded.
 	state, err := LoadReceiveState(statePath, transferID, fileHash)
 	if err != nil {
 		state = NewReceiveState(transferID, fileHash, fileSize, chunkSize, chunkCount)
@@ -506,46 +566,48 @@ func handleSealedOffer(
 	ctx, cancel := context.WithTimeout(context.Background(), sealedOfferTimeout)
 	defer cancel()
 	if err := downloadChunks(
-		ctx, cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey},
+		ctx, cfg, ChunkAuth{RelayToken: relayToken, DeviceID: deviceID, PeerKey: peerCryptoKey},
 		transferID, sessionID, digest, fileKey,
 		missing, partPath, state, statePath, nil,
 	); err != nil {
-		// Keep .part and state: the staged ciphertext is deterministic, so
-		// the next offer for this file resumes instead of restarting from
-		// zero.
-		log.Printf("[SEALED] Download failed for %s: %v", cleanName, err)
-		return
+		return "", fmt.Errorf("download failed for %s: %w", cleanName, err)
+	}
+	if fileSize == 0 {
+		// An empty file has no chunks to download, so nothing created the
+		// .part. Stage it owner-only like the v2 path; the hash check below
+		// still runs.
+		if _, err := os.Stat(partPath); os.IsNotExist(err) {
+			if f, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+				_ = f.Close()
+			}
+		}
 	}
 	ok, err := VerifyFileHash(partPath, fileHash)
 	if err != nil || !ok {
-		log.Printf("[SEALED] Integrity check failed for %s", cleanName)
 		_ = os.Remove(partPath)
-		return
+		return "", fmt.Errorf("integrity check failed for %s", cleanName)
 	}
 	finalPath, err := CommitUniqueFile(partPath, cfg.InboxDir, cleanName)
 	if err != nil {
-		log.Printf("[SEALED] Could not finalize %s: %v", cleanName, err)
-		return
+		return "", fmt.Errorf("could not finalize %s: %w", cleanName, err)
 	}
 	_ = os.Remove(statePath)
-	notifyUser("File Received", fmt.Sprintf("%s from %s", filepath.Base(finalPath), senderName))
-	log.Printf("[SEALED] Received %s from %s", filepath.Base(finalPath), senderID)
+	return finalPath, nil
+}
 
-	completion := map[string]interface{}{
-		"sender_id":   cfg.DeviceID,
-		"sender_name": cfg.Name,
-		"transfer_id": transferID,
-		"file_hash":   fileHash,
-		"file_name":   filepath.Base(finalPath),
-	}
-	envelope, err := sealEnvelope(peerCryptoKey, senderID, "complete", completion)
-	if err != nil {
-		log.Printf("[SEALED] Could not seal completion: %v", err)
-		return
-	}
-	if err := client.WriteJSON(envelope); err != nil {
-		log.Printf("[SEALED] Could not send completion: %v", err)
-	}
+// sealedOfferGeometryOK applies the v2 receive caps to a sealed v3 offer:
+// the chunk size must be exactly the pinned ChunkSize, the chunk count is
+// bounded, the manifest must have one hash per chunk, and the file size must
+// fit the chunks. An empty file is exactly (0 bytes, 0 chunks); a zero-byte
+// file with chunks, or a non-empty file with none, is malformed.
+func sealedOfferGeometryOK(fileSize int64, chunkSize, chunkCount, hashCount int) bool {
+	validEmpty := fileSize == 0 && chunkCount == 0
+	validNonEmpty := fileSize > 0 && chunkCount > 0
+	return chunkSize == ChunkSize &&
+		chunkCount >= 0 && chunkCount <= 65536 &&
+		hashCount == chunkCount &&
+		fileSize >= 0 && fileSize <= int64(chunkCount)*int64(ChunkSize) &&
+		(validEmpty || validNonEmpty)
 }
 
 func splitTargets(raw string) []string {

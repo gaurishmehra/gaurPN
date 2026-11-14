@@ -32,6 +32,13 @@ const (
 	downloadRetries = 30
 )
 
+// chunkHTTPClient is the client for every chunk and transfer-metadata request.
+// http.DefaultClient has no timeout, so a relay that accepts a connection and
+// then black-holes the response would park a worker forever. 60 seconds covers
+// a slow-tunnel 4 MiB PUT while bounding a hang. Package var so tests can
+// substitute a short timeout.
+var chunkHTTPClient = &http.Client{Timeout: 60 * time.Second}
+
 // ReceiveState is the durable resume bitmap for one incoming transfer. It is
 // written next to the .part file so a killed daemon can pick up where it left
 // off without re-downloading verified chunks.
@@ -236,7 +243,7 @@ func putChunk(cfg Config, auth ChunkAuth, transferID, sessionID string, index in
 	}
 	req.Header.Set("X-Gaur-Token", auth.RelayToken)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := chunkHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -254,7 +261,7 @@ func getChunk(cfg Config, auth ChunkAuth, transferID, sessionID string, index in
 		return nil, false, err
 	}
 	req.Header.Set("X-Gaur-Token", auth.RelayToken)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := chunkHTTPClient.Do(req)
 	if err != nil {
 		return nil, false, err
 	}
@@ -309,7 +316,7 @@ func deleteTransfer(cfg Config, auth ChunkAuth, transferID, sessionID string) {
 		return
 	}
 	req.Header.Set("X-Gaur-Token", auth.RelayToken)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := chunkHTTPClient.Do(req)
 	if err == nil {
 		_ = resp.Body.Close()
 	}
@@ -335,7 +342,7 @@ func fetchChunkStatus(cfg Config, auth ChunkAuth, transferID, sessionID string, 
 			return nil
 		}
 		req.Header.Set("X-Gaur-Token", auth.RelayToken)
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := chunkHTTPClient.Do(req)
 		if err != nil {
 			lastErr = err
 			continue

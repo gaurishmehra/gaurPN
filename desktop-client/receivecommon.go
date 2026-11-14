@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"regexp"
 	"time"
 )
 
@@ -75,7 +76,7 @@ func blockUntrustedSender(cfg Config, wsConn *wsClient, offer map[string]interfa
 	}
 	writeTransferReject(wsConn, senderID, transferID, "untrusted")
 	notifyUser("Transfer blocked", "Not from a trusted device")
-	log.Printf("[RECV] Blocked %s from untrusted %s", transferID, senderIdentity)
+	log.Printf("[RECV] Blocked %s from untrusted %s", transferID, singleLineDisplayName(senderIdentity))
 	return true
 }
 
@@ -91,6 +92,15 @@ func sanitizeOfferName(cfg Config, rawFileName string) (string, bool) {
 	return cleanFileName, true
 }
 
+// transferIDPattern is the pinned shape DeriveTransferID produces: "tx-"
+// followed by 32 lowercase hex characters. The id becomes part of the .part
+// and .state file names, so anything else — path separators, "..", a NUL —
+// must be rejected before it reaches filepath.Join.
+var transferIDPattern = regexp.MustCompile(`^tx-[0-9a-f]{32}$`)
+
+// IsValidTransferID reports whether id has the pinned transfer-id shape.
+func IsValidTransferID(id string) bool { return transferIDPattern.MatchString(id) }
+
 // partFilePath is the staging name for an incoming transfer: hidden, and
 // unique per transfer so concurrent offers of the same file name do not
 // fight over one .part.
@@ -98,12 +108,32 @@ func partFilePath(cfg Config, cleanFileName, transferID string) string {
 	return filepath.Join(cfg.InboxDir, fmt.Sprintf(".%s.%s.part", cleanFileName, transferID))
 }
 
+// partPathsFor builds the staging and resume-state paths for one incoming
+// transfer and asserts both stay inside the inbox. The transfer id is
+// validated when the offer is parsed; this check is defense in depth for a
+// crafted id that somehow slips through, because filepath.Join cleans ".."
+// lexically while the joined result can still escape the inbox. A failure is
+// logged once here and reported to the caller, which rejects the offer.
+func partPathsFor(cfg Config, cleanFileName, transferID string) (partPath, statePath string, ok bool) {
+	partPath = partFilePath(cfg, cleanFileName, transferID)
+	statePath = partPath + ".state"
+	if !IsPathInsideDirectory(partPath, cfg.InboxDir) || !IsPathInsideDirectory(statePath, cfg.InboxDir) {
+		log.Printf("[RECV] Rejecting transfer: staging path escapes the inbox (transfer id %q)",
+			singleLineDisplayName(transferID))
+		return "", "", false
+	}
+	return partPath, statePath, true
+}
+
 // announceIncomingOffer logs the incoming transfer and raises the user
 // notification. Shared by the v1 and v2 receive paths.
 func announceIncomingOffer(batchID string, batchIndex, batchTotal int, senderName, senderID, cleanFileName string, fileSize int64) {
+	senderName = singleLineDisplayName(senderName)
+	senderID = singleLineDisplayName(senderID)
+	cleanFileName = singleLineDisplayName(cleanFileName)
 	if batchTotal > 1 {
 		log.Printf("[RECV] Incoming batch %s file %d/%d from %s (%s): %s (%d bytes)",
-			batchID, batchIndex+1, batchTotal, senderName, senderID, cleanFileName, fileSize)
+			singleLineDisplayName(batchID), batchIndex+1, batchTotal, senderName, senderID, cleanFileName, fileSize)
 	} else {
 		log.Printf("[RECV] Incoming file from %s (%s): %s (%d bytes)", senderName, senderID, cleanFileName, fileSize)
 	}
@@ -113,7 +143,8 @@ func announceIncomingOffer(batchID string, batchIndex, batchTotal int, senderNam
 // notifyTransferFailed raises the failure toast shared by the v1 and v2
 // receive paths.
 func notifyTransferFailed(cleanFileName, senderName string) {
-	notifyUser("Transfer Failed", fmt.Sprintf("Failed receiving '%s' from %s", cleanFileName, senderName))
+	notifyUser("Transfer Failed", fmt.Sprintf("Failed receiving '%s' from %s",
+		singleLineDisplayName(cleanFileName), singleLineDisplayName(senderName)))
 }
 
 // transferMbps converts a byte total and start time into the throughput

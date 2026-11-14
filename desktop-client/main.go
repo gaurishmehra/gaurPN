@@ -46,6 +46,7 @@ func main() {
 		fmt.Println("  gaur-share send --all <file|dir>...          Upload once, send to every online device")
 		fmt.Println("  gaur-share send --offline <device> <file>... Queue for a device that may be offline")
 		fmt.Println("  gaur-share send --to <id,id> <file>...       Send to specific device IDs")
+		fmt.Println("  gaur-share request [--screenshot] <device>   Request files (or a screenshot) from a device")
 		fmt.Println("  gaur-share send-text <device> <text|->       Send a text or link (use - for stdin)")
 		fmt.Println("  gaur-share pair <gaur://pair?...>           Pair using the QR URI from gaur-relay -init")
 		fmt.Println("  gaur-share ui [-addr 127.0.0.1:0]           Local browser UI for peers, text, and files")
@@ -67,6 +68,10 @@ func main() {
 		fmt.Println("\nShutting down gaur-share...")
 		if args[0] == "daemon" {
 			writePeersFile(cfg, nil)
+			stopDaemonStatus()
+			// A send subprocess for a pull request outlives the handler that
+			// started it; os.Exit skips its context cancel, so kill it here.
+			killRequestSubprocesses()
 			// Unlink the socket the daemon is listening on so Quickshell's
 			// next dial does not hit a stale file. Only the socket source
 			// ever creates it.
@@ -98,10 +103,21 @@ func main() {
 		sendAll := sendFlags.Bool("all", false, "Send to every online device (v3, one upload)")
 		sendOffline := sendFlags.Bool("offline", false, "Queue for a device that may be offline (v3)")
 		sendTo := sendFlags.String("to", "", "Comma-separated device IDs (v3)")
+		sendRequestMeta := sendFlags.String("request-meta", "", "Internal: <request_id>:<grant>:<expires_ts> for a pull request")
 		if err := sendFlags.Parse(args[1:]); err != nil {
 			log.Fatalf("[FATAL] %v", err)
 		}
 		rest := sendFlags.Args()
+		if *sendRequestMeta != "" {
+			if *sendTo == "" {
+				log.Fatalf("--request-meta requires --to")
+			}
+			meta, err := parseRequestMeta(*sendRequestMeta)
+			if err != nil {
+				log.Fatalf("[FATAL] %v", err)
+			}
+			cfg.RequestMeta = meta
+		}
 		switch {
 		case *sendAll:
 			if len(rest) < 1 {
@@ -129,6 +145,22 @@ func main() {
 				log.Fatalf("Usage: gaur-share send [-open] <target-device> <file-path> [file-path...]")
 			}
 			runSend(cfg, rest[0], rest[1:], *openRequested)
+		}
+	case "request":
+		requestFlags := flag.NewFlagSet("request", flag.ExitOnError)
+		requestScreenshot := requestFlags.Bool("screenshot", false, "Ask the target for a screenshot instead of files")
+		if err := requestFlags.Parse(requestArgsFromFlags(args[1:])); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		requestArgs := requestFlags.Args()
+		if len(requestArgs) != 1 {
+			log.Fatalf("Usage: gaur-share request [--screenshot] <target-device>")
+		}
+		if err := runRequest(cfg, requestArgs[0], *requestScreenshot); err != nil {
+			// runRequest returns the user-facing outcome line (declined,
+			// timed out, connection lost) as its error text.
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
 		}
 	case "send-text":
 		if len(args) < 3 {
@@ -183,7 +215,7 @@ func main() {
 		if err := trustDevice(id, name); err != nil {
 			log.Fatalf("[FATAL] %v", err)
 		}
-		fmt.Printf("Trusted %s (%s)\n", name, id)
+		fmt.Printf("Trusted %s (%s)\n", singleLineDisplayName(name), singleLineDisplayName(id))
 	case "untrust":
 		if len(args) < 2 {
 			log.Fatalf("Usage: gaur-share untrust <device-id-or-name>")
@@ -194,9 +226,9 @@ func main() {
 			log.Fatalf("[FATAL] %v", err)
 		}
 		if removed {
-			fmt.Printf("Revoked %s (%s)\n", name, id)
+			fmt.Printf("Revoked %s (%s)\n", singleLineDisplayName(name), singleLineDisplayName(id))
 		} else {
-			fmt.Printf("%s was not trusted\n", name)
+			fmt.Printf("%s was not trusted\n", singleLineDisplayName(name))
 		}
 	case "trusted":
 		devices, err := loadTrustedDevices()
@@ -224,6 +256,6 @@ func main() {
 		}
 		fmt.Printf("Only trusted devices: %s\n", args[1])
 	default:
-		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, send-text, pair, ui, notify, trust, untrust, trusted, trust-mode", args[0])
+		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, request, send-text, pair, ui, notify, trust, untrust, trusted, trust-mode", args[0])
 	}
 }

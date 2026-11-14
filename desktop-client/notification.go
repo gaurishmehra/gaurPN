@@ -1,14 +1,17 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type mirroredAction struct {
@@ -47,13 +50,16 @@ func handleIncomingNotification(cfg Config, peerCryptoKey []byte, client *wsClie
 	senderIdentity := offerSenderID(envelope)
 	if onlyTrustedEnabled(cfg) && senderIdentity != cfg.DeviceID &&
 		!isTrustedDevice(senderIdentity) {
-		log.Printf("[NOTIF] Dropped notification from untrusted %s", senderIdentity)
+		log.Printf("[NOTIF] Dropped notification from untrusted %s", singleLineDisplayName(senderIdentity))
 		return
 	}
-	fromName := envelopeString(envelope, "from_name")
+	// fromName is display-only; fromID is bound into the AAD, so only its
+	// display copy is sanitized.
+	fromName := singleLineDisplayName(envelopeString(envelope, "from_name"))
 	if fromName == "" {
-		fromName = fromID
+		fromName = singleLineDisplayName(fromID)
 	}
+	logFromID := singleLineDisplayName(fromID)
 	msgID := envelopeString(envelope, "msg_id")
 	ts := envelopeInt64(envelope, "ts")
 	event := envelopeString(envelope, "event")
@@ -64,7 +70,7 @@ func handleIncomingNotification(cfg Config, peerCryptoKey []byte, client *wsClie
 		return
 	}
 	if !replayGuard.Allow("notification", msgID, envelopeRelayTs(envelope)) {
-		log.Printf("[NOTIF] Dropped replayed notification from %s (msg_id=%s)", fromID, msgID)
+		log.Printf("[NOTIF] Dropped replayed notification from %s (msg_id=%s)", logFromID, singleLineDisplayName(msgID))
 		return
 	}
 
@@ -81,7 +87,7 @@ func handleIncomingNotification(cfg Config, peerCryptoKey []byte, client *wsClie
 		DeriveNotificationKey(peerCryptoKey), nonce, ciphertext, aad,
 	)
 	if err != nil {
-		log.Printf("[NOTIF] Authentication failed for notification from %s", fromID)
+		log.Printf("[NOTIF] Authentication failed for notification from %s", logFromID)
 		return
 	}
 	if len(plaintext) > 256*1024 {
@@ -175,7 +181,7 @@ func displayMirroredNotification(
 	if err := sendNotificationAction(
 		cfg, client, peerCryptoKey, fromID, payload.Key, action.Index, reply,
 	); err != nil {
-		log.Printf("[NOTIF] Could not send action to %s: %v", fromID, err)
+		log.Printf("[NOTIF] Could not send action to %s: %v", singleLineDisplayName(fromID), err)
 	}
 }
 
@@ -185,7 +191,14 @@ func displayMirroredNotification(
 // body beginning with "-" is delivered as text instead of being read as an
 // option.
 func notifySendArgs(title, body, iconPath string, actions []string) []string {
-	args := []string{"-a", "gaurPN", "-t", "8000"}
+	return notifySendArgsFor(title, body, iconPath, actions, 8000)
+}
+
+// notifySendArgsFor is notifySendArgs with an explicit expiry in
+// milliseconds. The URL action uses a 30-second expiry so the button stays
+// clickable for the whole action wait.
+func notifySendArgsFor(title, body, iconPath string, actions []string, timeoutMs int) []string {
+	args := []string{"-a", "gaurPN", "-t", strconv.Itoa(timeoutMs)}
 	if iconPath != "" {
 		args = append(args, "-i", iconPath)
 	}
@@ -193,6 +206,70 @@ func notifySendArgs(title, body, iconPath string, actions []string) []string {
 		args = append(args, "-A", action)
 	}
 	return append(args, "--", title, body)
+}
+
+const (
+	urlActionKey   = "open"
+	urlActionLabel = "Open in browser"
+	urlActionWait  = 30 * time.Second
+)
+
+// notifyURLAction renders a received link with an "Open in browser" action.
+// It is a package var so tests can observe the choice without spawning
+// notify-send. It returns false when the action notification could not be
+// displayed, in which case the caller falls back to the plain toast.
+var notifyURLAction = showURLActionNotification
+
+// urlActionNotificationArgs is the exact notify-send argv for a link: one
+// action whose key is "open", the canonical URL as the body, and a timeout
+// that matches the action wait.
+func urlActionNotificationArgs(title, canonicalURL string) []string {
+	return notifySendArgsFor(
+		title, canonicalURL, "",
+		[]string{urlActionKey + "=" + urlActionLabel},
+		int(urlActionWait/time.Millisecond),
+	)
+}
+
+// showURLActionNotification displays the link notification and, if the user
+// picks the action, launches the canonical URL with xdg-open. The URL comes
+// from ValidateShareURL, never from the raw clipboard text, and it is passed
+// as a single argv with no shell. The 30-second context bounds the wait so
+// the receiving goroutine exits cleanly when the user ignores it.
+func showURLActionNotification(title, canonicalURL string) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), urlActionWait)
+	defer cancel()
+	out, err := exec.CommandContext(
+		ctx, "notify-send", urlActionNotificationArgs(title, canonicalURL)...,
+	).Output()
+	if err != nil {
+		// A notification that hit the wait deadline was displayed and
+		// ignored; raising a second plain toast would duplicate it. Only a
+		// daemon that rejects the action falls back.
+		if ctx.Err() != nil {
+			return true
+		}
+		return false
+	}
+	if strings.TrimSpace(string(out)) != urlActionKey {
+		// Displayed, but the user dismissed it without choosing the action.
+		return true
+	}
+	openCtx, openCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	cmd := exec.CommandContext(openCtx, "xdg-open", canonicalURL)
+	if err := cmd.Start(); err != nil {
+		openCancel()
+		log.Printf("[TEXT] Could not open link: %v", err)
+		return true
+	}
+	go func() {
+		defer openCancel()
+		_ = cmd.Wait()
+	}()
+	return true
 }
 
 // escapeAppleScriptString makes text safe to embed inside an AppleScript

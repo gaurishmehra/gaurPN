@@ -140,6 +140,27 @@ func TestV32NewRequestID(t *testing.T) {
 	}
 }
 
+func TestV32IsRequestID(t *testing.T) {
+	cases := []struct {
+		value string
+		want  bool
+	}{
+		{"req-0011223344556677", true},
+		{"req-ffffffffffffffff", true},
+		{"req-001122334455667", false},
+		{"req-00112233445566778", false},
+		{"req-00112233445566G7", false},
+		{"req-0011223344556677:x", false},
+		{"0011223344556677", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isRequestID(tc.value); got != tc.want {
+			t.Errorf("isRequestID(%q) = %v, want %v", tc.value, got, tc.want)
+		}
+	}
+}
+
 func TestV32StatusPlaintextPinned(t *testing.T) {
 	if got := statusPlaintext(73, true, 1730000000000); got != v32StatusJSON {
 		t.Fatalf("statusPlaintext = %q, want %q", got, v32StatusJSON)
@@ -259,6 +280,60 @@ func TestV32StatusBlobFailsClosed(t *testing.T) {
 			}
 			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
 				t.Errorf("error = %v, want %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestV32ParseStatusPlaintext mirrors the Kotlin decoder's rejection table:
+// only the exact pinned shape with canonical decimal numbers is accepted.
+func TestV32ParseStatusPlaintext(t *testing.T) {
+	valid := []struct {
+		name     string
+		payload  string
+		battery  int
+		charging bool
+		ts       int64
+	}{
+		{"pinned", v32StatusJSON, 73, true, 1730000000000},
+		{"zero values", `{"battery":0,"charging":false,"ts":0}`, 0, false, 0},
+		{"full battery", `{"battery":100,"charging":true,"ts":9223372036854775807}`, 100, true, math.MaxInt64},
+	}
+	for _, tc := range valid {
+		t.Run(tc.name, func(t *testing.T) {
+			battery, charging, ts, err := parseStatusPlaintext([]byte(tc.payload))
+			if err != nil {
+				t.Fatalf("parseStatusPlaintext(%q): %v", tc.payload, err)
+			}
+			if battery != tc.battery || charging != tc.charging || ts != tc.ts {
+				t.Fatalf("parsed (%d, %v, %d), want (%d, %v, %d)",
+					battery, charging, ts, tc.battery, tc.charging, tc.ts)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name    string
+		payload string
+	}{
+		{"out of range battery", `{"battery":101,"charging":true,"ts":1730000000000}`},
+		{"negative battery", `{"battery":-1,"charging":true,"ts":1730000000000}`},
+		{"leading zero battery", `{"battery":073,"charging":true,"ts":1730000000000}`},
+		{"signed battery", `{"battery":+7,"charging":true,"ts":1730000000000}`},
+		{"leading zero ts", `{"battery":73,"charging":true,"ts":01730000000000}`},
+		{"negative ts", `{"battery":73,"charging":true,"ts":-1}`},
+		{"reordered fields", `{"charging":true,"battery":73,"ts":1730000000000}`},
+		{"extra field", `{"battery":73,"charging":true,"ts":1730000000000,"x":1}`},
+		{"missing field", `{"battery":73,"charging":true}`},
+		{"trailing bytes", `{"battery":73,"charging":true,"ts":1730000000000}x`},
+		{"non-bool charging", `{"battery":73,"charging":1,"ts":1730000000000}`},
+		{"overflowing ts", `{"battery":73,"charging":true,"ts":9223372036854775808}`},
+		{"empty", ``},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, _, _, err := parseStatusPlaintext([]byte(tc.payload)); !errors.Is(err, errMalformedStatus) {
+				t.Fatalf("parseStatusPlaintext(%q) error = %v, want errMalformedStatus", tc.payload, err)
 			}
 		})
 	}

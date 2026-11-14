@@ -34,6 +34,8 @@ func handleIncomingClipboard(cfg Config, peerCryptoKey []byte, envelope map[stri
 	if fromID == "" || fromID == cfg.DeviceID {
 		return
 	}
+	// fromID is bound into the AAD, so only the display copy is sanitized.
+	logFromID := singleLineDisplayName(fromID)
 	msgID := envelopeString(envelope, "msg_id")
 	ts := envelopeInt64(envelope, "ts")
 	relayTs := ts
@@ -45,14 +47,14 @@ func handleIncomingClipboard(cfg Config, peerCryptoKey []byte, envelope map[stri
 	nonceB64 := envelopeString(envelope, "nonce")
 	dataB64 := envelopeString(envelope, "data")
 	if msgID == "" || ts <= 0 || (kind != "text" && kind != "image") || nonceB64 == "" || dataB64 == "" {
-		log.Printf("[CLIP] Dropped malformed clipboard from %s (kind=%q msg=%q)", fromID, kind, msgID)
+		log.Printf("[CLIP] Dropped malformed clipboard from %s (kind=%q msg=%q)", logFromID, kind, msgID)
 		return
 	}
-	log.Printf("[CLIP] Received %s clipboard from %s (relayTs=%d, b64=%d)", kind, fromID, relayTs, len(dataB64))
+	log.Printf("[CLIP] Received %s clipboard from %s (relayTs=%d, b64=%d)", kind, logFromID, relayTs, len(dataB64))
 
 	clipboardStateMu.Lock()
 	if relayTs <= clipboardLastTs {
-		log.Printf("[CLIP] Dropped stale clipboard from %s (relayTs=%d last=%d)", fromID, relayTs, clipboardLastTs)
+		log.Printf("[CLIP] Dropped stale clipboard from %s (relayTs=%d last=%d)", logFromID, relayTs, clipboardLastTs)
 		clipboardStateMu.Unlock()
 		return
 	}
@@ -69,15 +71,15 @@ func handleIncomingClipboard(cfg Config, peerCryptoKey []byte, envelope map[stri
 	aad := []byte(fmt.Sprintf("clipboard:%s:%s:%d:%s:%s", fromID, msgID, ts, kind, mime))
 	plaintext, err := DecryptClipboard(DeriveClipboardKey(peerCryptoKey), nonce, ciphertext, aad)
 	if err != nil {
-		log.Printf("[CLIP] Authentication failed for clipboard from %s", fromID)
+		log.Printf("[CLIP] Authentication failed for clipboard from %s", logFromID)
 		return
 	}
 	if kind == "text" && len(plaintext) > 1024*1024 {
-		log.Printf("[CLIP] Rejecting oversized text clipboard from %s (%d bytes)", fromID, len(plaintext))
+		log.Printf("[CLIP] Rejecting oversized text clipboard from %s (%d bytes)", logFromID, len(plaintext))
 		return
 	}
 	if kind == "image" && len(plaintext) > maxClipboardImageBytes {
-		log.Printf("[CLIP] Rejecting oversized image clipboard from %s (%d bytes)", fromID, len(plaintext))
+		log.Printf("[CLIP] Rejecting oversized image clipboard from %s (%d bytes)", logFromID, len(plaintext))
 		return
 	}
 
@@ -102,10 +104,10 @@ func handleIncomingClipboard(cfg Config, peerCryptoKey []byte, envelope map[stri
 	clipboardStateMu.Unlock()
 
 	if err := writeClipboard(payload); err != nil {
-		log.Printf("[CLIP] Could not apply clipboard from %s: %v", fromID, err)
+		log.Printf("[CLIP] Could not apply clipboard from %s: %v", logFromID, err)
 		return
 	}
-	log.Printf("[CLIP] Applied %s clipboard from %s (%d bytes)", kind, fromID, len(plaintext))
+	log.Printf("[CLIP] Applied %s clipboard from %s (%d bytes)", kind, logFromID, len(plaintext))
 }
 
 // handleIncomingText decrypts a one-shot text/link share, copies it to the
@@ -118,28 +120,31 @@ func handleIncomingText(cfg Config, peerCryptoKey []byte, envelope map[string]in
 	senderIdentity := offerSenderID(envelope)
 	if onlyTrustedEnabled(cfg) && senderIdentity != cfg.DeviceID &&
 		!isTrustedDevice(senderIdentity) {
-		log.Printf("[TEXT] Dropped text from untrusted %s", senderIdentity)
+		log.Printf("[TEXT] Dropped text from untrusted %s", singleLineDisplayName(senderIdentity))
 		return
 	}
 	fromID := envelopeString(envelope, "from_id")
 	if fromID == "" || fromID == cfg.DeviceID {
 		return
 	}
-	fromName := envelopeString(envelope, "from_name")
+	// fromName is display-only; fromID is bound into the AAD, so only its
+	// display copy is sanitized.
+	fromName := singleLineDisplayName(envelopeString(envelope, "from_name"))
 	if fromName == "" {
-		fromName = fromID
+		fromName = singleLineDisplayName(fromID)
 	}
+	logFromID := singleLineDisplayName(fromID)
 	msgID := envelopeString(envelope, "msg_id")
 	ts := envelopeInt64(envelope, "ts")
 	kind := envelopeString(envelope, "kind")
 	nonceB64 := envelopeString(envelope, "nonce")
 	dataB64 := envelopeString(envelope, "data")
 	if msgID == "" || ts <= 0 || (kind != "text" && kind != "url") || nonceB64 == "" || dataB64 == "" {
-		log.Printf("[TEXT] Dropped malformed text message from %s", fromID)
+		log.Printf("[TEXT] Dropped malformed text message from %s", logFromID)
 		return
 	}
 	if !replayGuard.Allow("text", msgID, envelopeRelayTs(envelope)) {
-		log.Printf("[TEXT] Dropped replayed text message from %s (msg_id=%s)", fromID, msgID)
+		log.Printf("[TEXT] Dropped replayed text message from %s (msg_id=%s)", logFromID, singleLineDisplayName(msgID))
 		return
 	}
 
@@ -154,7 +159,7 @@ func handleIncomingText(cfg Config, peerCryptoKey []byte, envelope map[string]in
 	aad := []byte(fmt.Sprintf("text:%s:%s:%d:%s", fromID, msgID, ts, kind))
 	plaintext, err := DecryptClipboard(DeriveTextKey(peerCryptoKey), nonce, ciphertext, aad)
 	if err != nil {
-		log.Printf("[TEXT] Authentication failed for text message from %s", fromID)
+		log.Printf("[TEXT] Authentication failed for text message from %s", logFromID)
 		return
 	}
 
@@ -166,7 +171,7 @@ func handleIncomingText(cfg Config, peerCryptoKey []byte, envelope map[string]in
 // sealed v3 text path; neither persists the text anywhere.
 func applyIncomingText(fromID, fromName, kind string, plaintext []byte) {
 	if len(plaintext) == 0 || len(plaintext) > 64*1024 {
-		log.Printf("[TEXT] Rejecting invalid text message from %s (%d bytes)", fromID, len(plaintext))
+		log.Printf("[TEXT] Rejecting invalid text message from %s (%d bytes)", singleLineDisplayName(fromID), len(plaintext))
 		return
 	}
 	text := string(plaintext)
@@ -180,14 +185,46 @@ func applyIncomingText(fromID, fromName, kind string, plaintext []byte) {
 	clipboardSuppressKind = "text"
 	clipboardStateMu.Unlock()
 	if err := writeClipboard(ClipboardPayload{Kind: "text", Mime: "text/plain", Data: plaintext}); err != nil {
-		log.Printf("[TEXT] Could not apply text from %s to clipboard: %v", fromID, err)
+		log.Printf("[TEXT] Could not apply text from %s to clipboard: %v", singleLineDisplayName(fromID), err)
 	}
+	notifyIncomingText(kind, fromName, text)
+	log.Printf("[TEXT] Received %s from %s (%d bytes)", kind, singleLineDisplayName(fromID), len(plaintext))
+}
+
+// notifyPlainText is notifyUser behind a var so tests can observe the
+// fallback path without spawning notify-send.
+var notifyPlainText = notifyUser
+
+// urlActionSlots bounds concurrent "notify-send with an action" waits. Each
+// wait parks a process and a goroutine for up to urlActionWait; a member
+// spamming URL texts must not be able to spawn them without bound. When both
+// slots are taken the caller falls back to the plain toast.
+var urlActionSlots = make(chan struct{}, 2)
+
+// notifyIncomingText raises the notification for a received text share. A
+// validated http(s) URL gets an "Open in browser" action; every other text,
+// and any link whose action notification could not be displayed or could not
+// get an action slot, keeps the plain toast. The action wait is bounded so the
+// receive goroutine exits.
+func notifyIncomingText(kind, fromName, text string) {
+	fromName = singleLineDisplayName(fromName)
 	title := "Text from " + fromName
 	if kind == "url" {
 		title = "Link from " + fromName
 	}
-	notifyUser(title, text)
-	log.Printf("[TEXT] Received %s from %s (%d bytes)", kind, fromID, len(plaintext))
+	if canonical, ok := ValidateShareURL(text); ok {
+		select {
+		case urlActionSlots <- struct{}{}:
+			defer func() { <-urlActionSlots }()
+			if notifyURLAction(title, canonical) {
+				return
+			}
+		default:
+			// Both action notifications are already waiting on a user; a
+			// third would only queue another process.
+		}
+	}
+	notifyPlainText(title, text)
 }
 
 func handleIncomingTransfer(ctx context.Context, cfg Config, relayToken string, peerCryptoKey []byte, wsConn *wsClient, offer map[string]interface{}) {
@@ -212,6 +249,15 @@ func handleIncomingTransferV1(cfg Config, relayToken string, peerCryptoKey []byt
 	batchTotal := common.BatchTotal
 
 	if transferID == "" || rawFileName == "" || senderPubB64 == "" {
+		return
+	}
+	// The transfer id becomes part of the .part file name. Only the pinned
+	// "tx-" + 32 lowercase hex shape DeriveTransferID produces may reach a
+	// path; anything else (path separators, "..", a NUL) is rejected here.
+	if !IsValidTransferID(transferID) {
+		log.Printf("[RECV] Rejecting offer with invalid transfer id %q from %s",
+			singleLineDisplayName(transferID), singleLineDisplayName(senderID))
+		writeTransferReject(wsConn, senderID, transferID, "invalid_transfer_id")
 		return
 	}
 
@@ -296,7 +342,11 @@ func handleIncomingTransferV1(cfg Config, relayToken string, peerCryptoKey []byt
 		notifyUser("Transfer Failed", fmt.Sprintf("Cannot save '%s'", cleanFileName))
 		return
 	}
-	partPath := partFilePath(cfg, cleanFileName, transferID)
+	partPath, _, pathOk := partPathsFor(cfg, cleanFileName, transferID)
+	if !pathOk {
+		writeTransferReject(wsConn, senderID, transferID, "invalid_path")
+		return
+	}
 	// 0600: the staged plaintext is for gaur alone. O_CREATE never tightens
 	// an existing file, so re-pin the mode for a part left by an older build.
 	outFile, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
@@ -429,6 +479,15 @@ func handleIncomingTransferV2(ctx context.Context, cfg Config, relayToken string
 	if transferID == "" || sessionID == "" || rawFileName == "" || fileHash == "" || senderPubB64 == "" || senderID == "" {
 		return
 	}
+	// The transfer id becomes part of the .part and .state file names. Only
+	// the pinned "tx-" + 32 lowercase hex shape DeriveTransferID produces may
+	// reach a path.
+	if !IsValidTransferID(transferID) {
+		log.Printf("[RECV] Rejecting offer with invalid transfer id %q from %s",
+			singleLineDisplayName(transferID), singleLineDisplayName(senderID))
+		writeTransferReject(wsConn, senderID, transferID, "invalid_transfer_id")
+		return
+	}
 	validEmpty := fileSize == 0 && chunkCount == 0
 	validNonEmpty := fileSize > 0 && chunkCount > 0
 	if chunkSize <= 0 || chunkSize > MaxChunkSize || chunkCount > 65536 || (!validEmpty && !validNonEmpty) {
@@ -467,8 +526,11 @@ func handleIncomingTransferV2(ctx context.Context, cfg Config, relayToken string
 		return
 	}
 
-	partPath := partFilePath(cfg, cleanFileName, transferID)
-	statePath := partPath + ".state"
+	partPath, statePath, pathOk := partPathsFor(cfg, cleanFileName, transferID)
+	if !pathOk {
+		writeTransferReject(wsConn, senderID, transferID, "invalid_path")
+		return
+	}
 
 	state, err := LoadReceiveState(statePath, transferID, fileHash)
 	if err != nil {

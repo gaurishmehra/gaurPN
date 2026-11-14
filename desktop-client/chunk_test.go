@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHashFileChunks(t *testing.T) {
@@ -218,5 +221,72 @@ func TestChunkWireFormat(t *testing.T) {
 	id := DeriveTransferID([]byte("peer-key"), "deadbeef")
 	if !strings.HasPrefix(id, "tx-") || len(id) != 35 {
 		t.Fatalf("transfer id = %q, want tx- plus 32 hex chars", id)
+	}
+}
+
+// --- D3: chunk HTTP client timeouts ---
+
+// TestChunkHTTPClientTimeout points every chunk endpoint at a server that
+// accepts the request and never answers, and asserts the client's timeout
+// bounds the call instead of parking a worker forever.
+func TestChunkHTTPClientTimeout(t *testing.T) {
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-done
+	}))
+	t.Cleanup(func() { close(done) }) // runs before httptest's srv.Close
+
+	oldClient, oldBackoff := chunkHTTPClient, chunkStatusBackoff
+	chunkHTTPClient = &http.Client{Timeout: 50 * time.Millisecond}
+	chunkStatusBackoff = time.Millisecond
+	t.Cleanup(func() { chunkHTTPClient, chunkStatusBackoff = oldClient, oldBackoff })
+
+	cfg := Config{RelayAddr: strings.TrimPrefix(srv.URL, "http://")}
+	auth := ChunkAuth{RelayToken: "token", DeviceID: "desktop-1", PeerKey: []byte("peer")}
+
+	cases := []struct {
+		name    string
+		wantErr bool
+		call    func() error
+	}{
+		{
+			name: "putChunk", wantErr: true,
+			call: func() error { return putChunk(cfg, auth, "tx-1", "sess-1", 0, []byte("x")) },
+		},
+		{
+			name: "getChunk", wantErr: true,
+			call: func() error {
+				_, _, err := getChunk(cfg, auth, "tx-1", "sess-1", 0)
+				return err
+			},
+		},
+		{
+			// fetchChunkStatus swallows errors by design; returning at all is
+			// the proof that its requests are bounded.
+			name: "fetchChunkStatus", wantErr: false,
+			call: func() error {
+				fetchChunkStatus(cfg, auth, "tx-1", "sess-1", 1)
+				return nil
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			err := tc.call()
+			if tc.wantErr && err == nil {
+				t.Fatal("a hung relay must produce an error")
+			}
+			if elapsed := time.Since(start); elapsed > 2*time.Second {
+				t.Fatalf("%s took %v, want the client timeout to bound it", tc.name, elapsed)
+			}
+		})
+	}
+
+	// deleteTransfer has no error return; it must still return promptly.
+	start := time.Now()
+	deleteTransfer(cfg, auth, "tx-1", "sess-1")
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("deleteTransfer took %v, want the client timeout to bound it", elapsed)
 	}
 }
