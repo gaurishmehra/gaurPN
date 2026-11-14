@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -34,118 +33,6 @@ type mirroredNotification struct {
 	Actions   []mirroredAction `json:"actions"`
 }
 
-// runNotify sends a sealed notification to a device. It is the desktop ->
-// device direction of the same mirroring channel.
-func runNotify(cfg Config, targetQuery, title, body, iconPath string) {
-	cfg.SenderID = cfg.DeviceID
-	cfg.DeviceID = cfg.SenderID + "-out"
-
-	token, err := loadToken(cfg.TokenFile)
-	if err != nil {
-		log.Fatalf("[FATAL] %v", err)
-	}
-	relayToken, peerCryptoKey := DeriveSubKeys(token)
-
-	conn, err := connectWS(cfg, relayToken)
-	if err != nil {
-		log.Fatalf("[FATAL] Cannot connect to relay at %s: %v", cfg.RelayAddr, err)
-	}
-	defer conn.Close()
-	client := &wsClient{conn: conn}
-
-	targetID, targetName, err := discoverTarget(conn, targetQuery)
-	if err != nil {
-		if errors.Is(err, errTargetAmbiguous) {
-			// Guessing among several online devices would misroute the
-			// notification; make the user pick instead.
-			log.Fatalf("[FATAL] %v", err)
-		}
-		// No match, or the relay never delivered a peer list: the relay
-		// mailboxes sealed notifications for offline devices, so address
-		// the raw query as a device id like the substring matcher did.
-		targetID = targetQuery
-		targetName = targetQuery
-	}
-	inner := notificationInner(cfg, title, body, iconPath)
-	envelope, err := sealEnvelope(peerCryptoKey, targetID, "notification", inner)
-	if err != nil {
-		log.Fatalf("[FATAL] %v", err)
-	}
-	if err := client.WriteJSON(envelope); err != nil {
-		log.Fatalf("[FATAL] %v", err)
-	}
-	fmt.Printf("Notification sent to %s (%s)\n", targetName, targetID)
-}
-
-// runNotifyAll fans one sealed notification out to every online device. It is
-// used by the Quickshell notification server to mirror desktop notifications.
-func runNotifyAll(cfg Config, title, body, iconPath string) {
-	cfg.SenderID = cfg.DeviceID
-	cfg.DeviceID = cfg.SenderID + "-out"
-
-	token, err := loadToken(cfg.TokenFile)
-	if err != nil {
-		log.Fatalf("[FATAL] %v", err)
-	}
-	relayToken, peerCryptoKey := DeriveSubKeys(token)
-
-	conn, err := connectWS(cfg, relayToken)
-	if err != nil {
-		log.Fatalf("[FATAL] Cannot connect to relay at %s: %v", cfg.RelayAddr, err)
-	}
-	defer conn.Close()
-	client := &wsClient{conn: conn}
-
-	targets := onlinePeerIDs(conn, cfg.DeviceID, cfg.SenderID)
-	if len(targets) == 0 {
-		log.Fatalf("[FATAL] No other devices are online")
-	}
-	inner := notificationInner(cfg, title, body, iconPath)
-	sent := 0
-	for _, target := range targets {
-		envelope, err := sealEnvelope(peerCryptoKey, target, "notification", inner)
-		if err != nil {
-			log.Printf("[NOTIFY] Could not seal for %s: %v", target, err)
-			continue
-		}
-		if err := client.WriteJSON(envelope); err != nil {
-			log.Printf("[NOTIFY] Could not send to %s: %v", target, err)
-			continue
-		}
-		sent++
-	}
-	fmt.Printf("Notification sent to %d device(s)\n", sent)
-}
-
-func notificationInner(cfg Config, title, body, iconPath string) map[string]interface{} {
-	key, _ := randomHex(8)
-	inner := map[string]interface{}{
-		"sender_id":   cfg.SenderID,
-		"sender_name": cfg.Name,
-		"event":       "posted",
-		"key":         "desktop-" + key,
-		"app":         cfg.Name,
-		"title":       title,
-		"text":        body,
-		"actions":     []interface{}{},
-	}
-	if icon := readIconBase64(iconPath); icon != "" {
-		inner["icon"] = icon
-	}
-	return inner
-}
-
-func readIconBase64(path string) string {
-	if path == "" {
-		return ""
-	}
-	data, err := os.ReadFile(path)
-	if err != nil || len(data) > 64*1024 {
-		return ""
-	}
-	return base64.StdEncoding.EncodeToString(data)
-}
-
 // handleIncomingNotification decrypts a mirrored notification and renders it
 // with the source app's icon and action buttons. Actions are sent back to the
 // source device, which owns the PendingIntent and any RemoteInput.
@@ -153,7 +40,7 @@ func handleIncomingNotification(cfg Config, peerCryptoKey []byte, client *wsClie
 	if !cfg.Notifications {
 		return
 	}
-	fromID, _ := envelope["from_id"].(string)
+	fromID := envelopeString(envelope, "from_id")
 	if fromID == "" || fromID == cfg.DeviceID {
 		return
 	}
@@ -163,16 +50,15 @@ func handleIncomingNotification(cfg Config, peerCryptoKey []byte, client *wsClie
 		log.Printf("[NOTIF] Dropped notification from untrusted %s", senderIdentity)
 		return
 	}
-	fromName, _ := envelope["from_name"].(string)
+	fromName := envelopeString(envelope, "from_name")
 	if fromName == "" {
 		fromName = fromID
 	}
-	msgID, _ := envelope["msg_id"].(string)
-	tsFloat, _ := envelope["ts"].(float64)
-	ts := int64(tsFloat)
-	event, _ := envelope["event"].(string)
-	nonceB64, _ := envelope["nonce"].(string)
-	dataB64, _ := envelope["data"].(string)
+	msgID := envelopeString(envelope, "msg_id")
+	ts := envelopeInt64(envelope, "ts")
+	event := envelopeString(envelope, "event")
+	nonceB64 := envelopeString(envelope, "nonce")
+	dataB64 := envelopeString(envelope, "data")
 	if msgID == "" || ts <= 0 || (event != "posted" && event != "removed") ||
 		nonceB64 == "" || dataB64 == "" {
 		return

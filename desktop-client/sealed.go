@@ -77,24 +77,36 @@ func numberToInt64(value interface{}) int64 {
 		return int64(n)
 	case float64:
 		return int64(n)
-	case json.Number:
-		v, _ := n.Int64()
-		return v
 	default:
 		return 0
 	}
+}
+
+// envelopeString reads a string field from a JSON envelope. A missing or
+// non-string field yields "" so a malformed envelope fails safe instead of
+// misbehaving downstream.
+func envelopeString(m map[string]interface{}, key string) string {
+	s, _ := m[key].(string)
+	return s
+}
+
+// envelopeInt64 reads a numeric field from a JSON envelope. JSON numbers
+// arrive as float64; Go-constructed envelopes may carry int or int64. A
+// missing or non-numeric field yields 0.
+func envelopeInt64(m map[string]interface{}, key string) int64 {
+	return numberToInt64(m[key])
 }
 
 func openSealed(
 	peerCryptoKey []byte,
 	envelope map[string]interface{},
 ) (string, map[string]interface{}, error) {
-	targetID, _ := envelope["target_id"].(string)
-	msgID, _ := envelope["msg_id"].(string)
-	ts := numberToInt64(envelope["ts"])
-	kind, _ := envelope["kind"].(string)
-	nonceB64, _ := envelope["nonce"].(string)
-	dataB64, _ := envelope["data"].(string)
+	targetID := envelopeString(envelope, "target_id")
+	msgID := envelopeString(envelope, "msg_id")
+	ts := envelopeInt64(envelope, "ts")
+	kind := envelopeString(envelope, "kind")
+	nonceB64 := envelopeString(envelope, "nonce")
+	dataB64 := envelopeString(envelope, "data")
 	if targetID == "" || msgID == "" || ts <= 0 || kind == "" ||
 		nonceB64 == "" || dataB64 == "" {
 		return "", nil, fmt.Errorf("malformed sealed envelope")
@@ -127,6 +139,15 @@ func openSealed(
 // v3SendRetryDelay separates upload attempts for one file. Package var so
 // tests can shrink it.
 var v3SendRetryDelay = 1 * time.Second
+
+const (
+	// peerListTimeout bounds how long a one-shot command waits for the
+	// relay's peer list.
+	peerListTimeout = 5 * time.Second
+	// sealedOfferTimeout bounds one sealed offer's download: the staged
+	// ciphertext is resumable, so an expired attempt loses nothing.
+	sealedOfferTimeout = 30 * time.Minute
+)
 
 // runSendV3 uploads each file once and sends a sealed offer to every target.
 // Targets are stable device ids; an offline target is served by the relay's
@@ -264,45 +285,8 @@ func missingChunkIndices(count int, present []int) []int {
 	return missing
 }
 
-func collectSendMetas(filePaths []string, openRequested bool) ([]sendFileMeta, error) {
-	var metas []sendFileMeta
-	for _, path := range filePaths {
-		info, err := os.Stat(path)
-		if err != nil {
-			return nil, fmt.Errorf("cannot open %s: %w", path, err)
-		}
-		if info.IsDir() {
-			err := filepath.Walk(path, func(p string, fi os.FileInfo, walkErr error) error {
-				if walkErr != nil {
-					return walkErr
-				}
-				if fi.Mode().IsRegular() {
-					metas = append(metas, sendFileMeta{
-						Path: p,
-						Name: filepath.Base(p),
-						Size: fi.Size(),
-						Open: openRequested,
-					})
-				}
-				return nil
-			})
-			if err != nil {
-				return nil, fmt.Errorf("cannot read folder %s: %w", path, err)
-			}
-			continue
-		}
-		metas = append(metas, sendFileMeta{
-			Path: path,
-			Name: filepath.Base(path),
-			Size: info.Size(),
-			Open: openRequested,
-		})
-	}
-	return metas, nil
-}
-
 func onlinePeerIDs(conn *websocket.Conn, selfIDs ...string) []string {
-	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetReadDeadline(time.Now().Add(peerListTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 	for {
 		_, msgBytes, err := conn.ReadMessage()
@@ -313,7 +297,7 @@ func onlinePeerIDs(conn *websocket.Conn, selfIDs ...string) []string {
 		if json.Unmarshal(msgBytes, &envelope) != nil {
 			continue
 		}
-		if envelope["type"] != "peers" {
+		if envelopeString(envelope, "type") != "peers" {
 			continue
 		}
 		peersRaw, _ := envelope["peers"].([]interface{})
@@ -339,6 +323,23 @@ func onlinePeerIDs(conn *websocket.Conn, selfIDs ...string) []string {
 	}
 }
 
+// parseStringArray reads a JSON array of strings, skipping non-string
+// entries. Used for the chunk_hashes manifest on both the v2 and sealed
+// offer paths.
+func parseStringArray(raw interface{}) []string {
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // handleIncomingSealed decrypts a v3 envelope and dispatches it. The relay
 // never sees the sender id, file name, or payload.
 func handleIncomingSealed(
@@ -353,15 +354,15 @@ func handleIncomingSealed(
 	// The seal key is shared by the whole cluster per kind, so without this
 	// check a malicious relay could redirect an envelope addressed to another
 	// device here, where it would decrypt and be processed all the same.
-	targetID, _ := envelope["target_id"].(string)
+	targetID := envelopeString(envelope, "target_id")
 	if targetID != cfg.DeviceID {
 		log.Printf("[SEALED] Dropped envelope addressed to %s, not this device (%s)", targetID, cfg.DeviceID)
 		return
 	}
 	// Replay protection: a duplicate msg_id is dropped, and command kinds
 	// (media_command) expire after their freshness window.
-	msgID, _ := envelope["msg_id"].(string)
-	kind, _ := envelope["kind"].(string)
+	msgID := envelopeString(envelope, "msg_id")
+	kind := envelopeString(envelope, "kind")
 	if !replayGuard.Allow(kind, msgID, envelopeRelayTs(envelope)) {
 		log.Printf("[SEALED] Dropped replayed or expired %s envelope (msg_id=%s)", kind, msgID)
 		return
@@ -371,8 +372,8 @@ func handleIncomingSealed(
 		log.Printf("[SEALED] Could not open %v envelope: %v", envelope["kind"], err)
 		return
 	}
-	senderID, _ := inner["sender_id"].(string)
-	senderName, _ := inner["sender_name"].(string)
+	senderID := envelopeString(inner, "sender_id")
+	senderName := envelopeString(inner, "sender_name")
 	if senderID == "" {
 		return
 	}
@@ -401,21 +402,21 @@ func handleIncomingSealed(
 	case "offer":
 		go handleSealedOffer(cfg, relayToken, peerCryptoKey, client, senderID, senderName, inner)
 	case "complete":
-		fileName, _ := inner["file_name"].(string)
+		fileName := envelopeString(inner, "file_name")
 		if fileName == "" {
 			fileName = "file"
 		}
 		notifyUser("Delivered", fmt.Sprintf("%s received %s", senderName, fileName))
 		log.Printf("[SEALED] Delivery receipt from %s for %s", senderID, fileName)
 	case "notification_ack":
-		status, _ := inner["status"].(string)
-		notifKey, _ := inner["notif_key"].(string)
+		status := envelopeString(inner, "status")
+		notifKey := envelopeString(inner, "notif_key")
 		log.Printf("[SEALED] Notification %s on %s: %s", notifKey, senderName, status)
 		if status != "displayed" {
 			notifyUser("Notification blocked", fmt.Sprintf("%s could not display it", senderName))
 		}
 	case "notification":
-		if event, _ := inner["event"].(string); event == "removed" {
+		if event := envelopeString(inner, "event"); event == "removed" {
 			return
 		}
 		data, err := json.Marshal(inner)
@@ -442,16 +443,13 @@ func handleSealedOffer(
 	senderID, senderName string,
 	inner map[string]interface{},
 ) {
-	transferID, _ := inner["transfer_id"].(string)
-	sessionID, _ := inner["session_id"].(string)
-	fileName, _ := inner["file_name"].(string)
-	fileHash, _ := inner["file_hash"].(string)
-	fileSizeFloat, _ := inner["file_size"].(float64)
-	chunkSizeFloat, _ := inner["chunk_size"].(float64)
-	chunkCountFloat, _ := inner["chunk_count"].(float64)
-	fileSize := int64(fileSizeFloat)
-	chunkSize := int(chunkSizeFloat)
-	chunkCount := int(chunkCountFloat)
+	transferID := envelopeString(inner, "transfer_id")
+	sessionID := envelopeString(inner, "session_id")
+	fileName := envelopeString(inner, "file_name")
+	fileHash := envelopeString(inner, "file_hash")
+	fileSize := envelopeInt64(inner, "file_size")
+	chunkSize := int(envelopeInt64(inner, "chunk_size"))
+	chunkCount := int(envelopeInt64(inner, "chunk_count"))
 	chunkHashes := parseStringArray(inner["chunk_hashes"])
 
 	if transferID == "" || sessionID == "" || fileName == "" || fileHash == "" ||
@@ -474,7 +472,7 @@ func handleSealedOffer(
 		return
 	}
 
-	partPath := filepath.Join(cfg.InboxDir, fmt.Sprintf(".%s.%s.part", cleanName, transferID))
+	partPath := partFilePath(cfg, cleanName, transferID)
 	statePath := partPath + ".state"
 
 	// Resume like the v2 path: reuse the .part file and chunk bitmap when
@@ -505,7 +503,7 @@ func handleSealedOffer(
 		log.Printf("[SEALED] Resuming %s: %d/%d chunks already present", cleanName, chunkCount-len(missing), chunkCount)
 	}
 	fileKey := DeriveFileKey(peerCryptoKey, transferID)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), sealedOfferTimeout)
 	defer cancel()
 	if err := downloadChunks(
 		ctx, cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey},

@@ -71,22 +71,6 @@ func NewAEAD(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-func EncryptChunk(key []byte, nonce []byte, plaintext []byte) ([]byte, error) {
-	gcm, err := NewAEAD(key)
-	if err != nil {
-		return nil, err
-	}
-	return gcm.Seal(nil, nonce, plaintext, nil), nil
-}
-
-func DecryptChunk(key []byte, nonce []byte, ciphertext []byte) ([]byte, error) {
-	gcm, err := NewAEAD(key)
-	if err != nil {
-		return nil, err
-	}
-	return gcm.Open(nil, nonce, ciphertext, nil)
-}
-
 // FileDigest is the content-addressed manifest for one file. The transfer id
 // is derived from FileHash, so the same bytes always resume the same transfer
 // while the relay only ever sees an opaque HMAC.
@@ -245,6 +229,15 @@ func RandomBytes(n int) ([]byte, error) {
 		return nil, err
 	}
 	return b, nil
+}
+
+// randomHex returns n cryptographically random bytes as lowercase hex.
+func randomHex(n int) (string, error) {
+	b, err := RandomBytes(n)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 func EncryptClipboard(key, nonce, plaintext, aad []byte) ([]byte, error) {

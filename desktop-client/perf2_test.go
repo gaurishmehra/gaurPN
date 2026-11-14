@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"fmt"
 	"testing"
 )
 
@@ -28,11 +27,8 @@ func BenchmarkEncryptChunkAADReused1MiB(b *testing.B) {
 	rand.Read(plain)
 	nonce := ChunkNonce(0)
 	aad := ChunkAAD("tx", "sess", 0, 1, int64(len(plain)))
-	b.SetBytes(int64(len(plain)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = aead.Seal(nil, nonce, plain, aad)
 	}
 }
-
-var _ = fmt.Sprintf

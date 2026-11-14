@@ -66,3 +66,49 @@ func TestMprisExportAndProperties(t *testing.T) {
 		t.Fatalf("title = %v", fields["xesam:title"].Value())
 	}
 }
+
+// TestMprisSeekMethodRemainsOnWire pins the ExportWithMap remap: the Go
+// method is SeekByOffset (vet's stdmethods check rejects a Seek that does
+// not match io.Seeker), but the D-Bus method must stay exactly
+// org.mpris.MediaPlayer2.Player.Seek with one int64 ("x") argument.
+func TestMprisSeekMethodRemainsOnWire(t *testing.T) {
+	manager, err := NewMprisManager(func(sourceID, sessionID, command string, positionMs int64, volume float64) {})
+	if err != nil {
+		t.Skipf("no session bus: %v", err)
+	}
+	manager.Update(MediaState{
+		SenderID:   "seek-test-device",
+		SenderName: "Seek Phone",
+		SessionID:  "session-1",
+		App:        "Test",
+		Title:      "Song",
+		DurationMs: 180000,
+		PositionMs: 1000,
+		Playing:    true,
+		CanSeek:    true,
+	})
+
+	conn, err := dbus.SessionBus()
+	if err != nil {
+		t.Skipf("no session bus: %v", err)
+	}
+	obj := conn.Object("org.mpris.MediaPlayer2.gaurpn.seek_test_device", "/org/mpris/MediaPlayer2")
+	// MPRIS Seek takes the offset in microseconds: +500 ms.
+	if err := obj.Call("org.mpris.MediaPlayer2.Player.Seek", 0, int64(500*1000)).Store(); err != nil {
+		t.Fatalf("Seek must remain callable on the wire with one int64 arg: %v", err)
+	}
+
+	var position dbus.Variant
+	if err := obj.Call("org.freedesktop.DBus.Properties.Get", 0,
+		"org.mpris.MediaPlayer2.Player", "Position").Store(&position); err != nil {
+		t.Fatalf("Get Position: %v", err)
+	}
+	got, ok := position.Value().(int64)
+	if !ok {
+		t.Fatalf("Position type = %T, want int64", position.Value())
+	}
+	// 1000 ms + 500 ms offset, in microseconds.
+	if got < 1500*1000 {
+		t.Fatalf("Position = %d, want at least %d after a +500ms seek", got, 1500*1000)
+	}
+}

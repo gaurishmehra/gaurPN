@@ -44,7 +44,11 @@ func TestReplayGuardEvictsOldestAtCapacity(t *testing.T) {
 
 func TestReplayGuardMediaCommandFreshness(t *testing.T) {
 	g := NewReplayGuard()
-	now := time.Now().UnixMilli()
+	// Pin the guard's clock: the boundary case must evaluate exactly, not
+	// race the millisecond tick between this test's now and Fresh's own
+	// time.Now (the same fake-clock pattern as the eviction test below).
+	now := int64(1_000_000)
+	g.now = func() int64 { return now }
 
 	cases := []struct {
 		name string

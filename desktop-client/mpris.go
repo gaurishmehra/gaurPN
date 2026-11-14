@@ -192,7 +192,6 @@ func (p *MprisPlayer) export() error {
 	}
 	for _, iface := range []string{
 		"org.mpris.MediaPlayer2",
-		"org.mpris.MediaPlayer2.Player",
 		"org.freedesktop.DBus.Properties",
 		"org.freedesktop.DBus.Introspectable",
 	} {
@@ -200,7 +199,11 @@ func (p *MprisPlayer) export() error {
 			return err
 		}
 	}
-	return nil
+	// The Player interface is exported with a name map so the D-Bus method
+	// stays exactly "Seek" while the Go method is SeekByOffset (see its
+	// comment); every other method keeps its Go name, so the wire surface
+	// is unchanged.
+	return p.conn.ExportWithMap(p, map[string]string{"SeekByOffset": "Seek"}, mprisPath, "org.mpris.MediaPlayer2.Player")
 }
 
 func (p *MprisPlayer) Update(state MediaState) {
@@ -446,7 +449,10 @@ func (p *MprisPlayer) Stop() *dbus.Error {
 	return nil
 }
 
-func (p *MprisPlayer) Seek(offset int64) *dbus.Error {
+// SeekByOffset implements the MPRIS Seek method. The Go name differs from
+// the wire name because vet's stdmethods check rejects a Seek that does not
+// match io.Seeker's signature; export() maps it back to "Seek".
+func (p *MprisPlayer) SeekByOffset(offset int64) *dbus.Error {
 	p.mu.Lock()
 	position := p.positionLocked()/1000 + offset/1000
 	if position < 0 {

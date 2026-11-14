@@ -29,7 +29,6 @@ const (
 	// ChunkConcurrency bounds parallel uploads and downloads.
 	ChunkConcurrency = 4
 
-	uploadRetries   = 6
 	downloadRetries = 30
 )
 

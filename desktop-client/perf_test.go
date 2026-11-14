@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"regexp"
 	"testing"
@@ -67,19 +66,3 @@ func BenchmarkSha256Hex1MiB(b *testing.B) {
 		_ = Sha256Hex(data)
 	}
 }
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-var _ = fmt.Sprintf

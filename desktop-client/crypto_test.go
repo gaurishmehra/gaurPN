@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestCryptoECDHAndEncryption(t *testing.T) {
+func TestCryptoECDH(t *testing.T) {
 	aliceKP, err := GenerateKeyPair()
 	if err != nil {
 		t.Fatalf("Alice keypair failed: %v", err)
@@ -31,24 +31,6 @@ func TestCryptoECDHAndEncryption(t *testing.T) {
 
 	if !bytes.Equal(aliceSecret, bobSecret) {
 		t.Fatalf("Shared secrets mismatch between Alice and Bob")
-	}
-
-	plaintext := []byte("Testing in-tunnel payload encryption across peers")
-	nonce := make([]byte, 12)
-	nonce[11] = 1
-
-	ciphertext, err := EncryptChunk(aliceSecret, nonce, plaintext)
-	if err != nil {
-		t.Fatalf("EncryptChunk failed: %v", err)
-	}
-
-	decrypted, err := DecryptChunk(bobSecret, nonce, ciphertext)
-	if err != nil {
-		t.Fatalf("DecryptChunk failed: %v", err)
-	}
-
-	if !bytes.Equal(plaintext, decrypted) {
-		t.Fatalf("Decrypted plaintext mismatch: got %q, want %q", decrypted, plaintext)
 	}
 }
 
