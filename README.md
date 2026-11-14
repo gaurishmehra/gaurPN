@@ -384,15 +384,18 @@ For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.m
 ## Security Model
 
 - **Zero Telemetry**: No trackers, no analytics SDKs, no third-party network calls.
-- **Local Storage**: Access keys and cluster tokens stay on your device in Jetpack DataStore.
-- **Zero-Knowledge Relay**: The relay server runs on loopback inside the VPN server and possesses no keys to decrypt inner payloads. It stages opaque ciphertext chunks on disk for resume and evicts them by TTL and a byte cap.
+- **Local Storage**: Access keys and cluster tokens stay on your device, wrapped with Android Keystore (AES-256-GCM) inside Jetpack DataStore; nothing is cloud-backed up.
+- **Zero-Knowledge Relay**: The relay server runs on loopback inside the VPN server and possesses no keys to decrypt inner payloads. It stages opaque ciphertext chunks on disk for resume and evicts them by TTL and a byte cap. It refuses to start on a non-loopback bind, caps peers and input sizes, and throttles repeated auth failures.
+- **Transfer Ownership**: Chunk endpoints carry a per-transfer capability tag (`HMAC(K_peer, "gaur-cap-v1:…")`) and the creator's device id, so cluster members cannot silently read, overwrite, or drop each other's staged transfers. A malicious relay cannot redirect sealed envelopes — receivers verify the target and dedup by message id, and media commands expire after 30 seconds.
+- **Pairing Confirmation**: `gaur://pair` links show a confirmation dialog (relay, masked token, DNS) before anything is written; the app refuses relays on public hosts.
 - **Isolated Transport**: File transfers do not touch local LAN broadcast or multicast domains, protecting peer visibility on public Wi-Fi networks.
 - **DNS Privacy**: DNS queries are answered by AdGuard Home on the VPS through the tunnel. No public resolver sees them unless you explicitly choose System mode.
 - **Kill Switch**: While reconnecting, the TUN stays up and drops traffic instead of falling back to the physical network.
-- **Trusted Devices**: Auto-accept can be restricted to pinned device IDs on Android (Settings → Trusted devices) and on the desktop (`gaur-share trust` / `trust-mode`). Revoking removes the peer from this device's trust list; rotate the cluster token to remove its relay access entirely.
-- **Sealed Sender**: v3 messages omit the sender from the relay-visible envelope. The relay routes by target, timestamp, and kind only.
-- **Ephemeral Mailbox**: Offline messages are ciphertext with a TTL (default 1h) and byte cap (default 16 MiB); the relay never parses them.
-- **Notification Privacy**: Mirrored notifications are sealed; the relay sees only that a notification event exists. The source app ignores gaurPN's own notifications to prevent loops.
+- **Trusted Devices**: Auto-accept can be restricted to pinned device IDs on Android (Settings → Trusted devices) and on the desktop (`gaur-share trust` / `trust-mode`). Revoking removes the peer from this device's trust list; rotate the cluster token to remove its relay access entirely. The trust gate covers every inbound kind — files, text, clipboard, notifications, and notification actions.
+- **Sealed Sender**: v3 messages omit the sender from the relay-visible envelope. The relay routes by target, timestamp, and kind only, and strips sender fields even if a client includes them.
+- **Ephemeral Mailbox**: Offline messages are ciphertext with a TTL (default 1h) and byte caps (global and per-target); the relay never parses them, and delivery is ack-based so a failed write re-queues instead of dropping.
+- **Notification Privacy**: Mirrored notifications are sealed; the relay sees only that a notification event exists. The source app ignores gaurPN's own notifications to prevent loops, and shared content is hidden from the lock screen.
+- **Resumable Transfers**: v2 and v3 transfers resume from a `.part` file and chunk bitmap after a dropped connection or app restart — senders skip chunks the relay still holds, receivers keep progress across attempts.
 
 ---
 
