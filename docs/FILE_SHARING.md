@@ -94,8 +94,13 @@ second connection claiming an occupied role gets 409), `device_id` matching
 `^[A-Za-z0-9._-]{1,64}$` and names ≤128 bytes on `/ws` (400 otherwise), a
 `-max-peers` cap (default 32; a reconnecting device still replaces itself),
 a per-IP auth-failure budget (10 failures/minute → 429 with `Retry-After`),
-and a startup bind guard that refuses to listen on any address not assigned
-to a loopback interface.
+a startup bind guard that refuses to listen on any address not assigned
+to a loopback interface, and WebSocket liveness deadlines: the relay pings
+every client every 30 s (standard clients auto-pong), drops a connection
+that neither sends traffic nor answers pings within 75 s, and bounds every
+write to a client by a 15 s deadline so a stalled client cannot block its
+correspondents. SIGTERM drains in-flight requests for up to 10 s, closes
+WebSocket peers cleanly, and then exits.
 
 ### Resume flow
 
@@ -494,7 +499,13 @@ v3 messages use a sealed envelope:
   envelopes additionally expire 30 s after their `relay_ts` (§13).
 - If the target is offline, the relay stores the envelope in an in-memory
   mailbox with a TTL (default 1h) and byte cap (default 16 MiB). On reconnect,
-  the mailbox is drained to the device.
+  the mailbox is drained to the device with ack-based delivery: an entry is
+  removed only after the relay's write succeeds, so a rejoin that dies
+  mid-drain loses nothing, and a sealed envelope whose direct write to a
+  present-but-unwritable peer fails is re-queued instead of dropped. The
+  re-queued envelope keeps its original `relay_ts`, which — combined with the
+  receivers' `msg_id` dedupe — makes the resulting at-least-once delivery
+  safe.
 - The mailbox is cleared on relay restart. Chunks staged for a transfer are also
   cleared on restart.
 
@@ -503,8 +514,19 @@ v3 messages use a sealed envelope:
 - `file_key = HMAC-SHA256(K_peer, "gaur-shared-file-v1:" + transfer_id)`.
 - Chunks are encrypted with `file_key` using the same v2 chunk AAD and nonce
   scheme.
-- The sender uploads every chunk once, then sends a sealed `offer` to each
-  target.
+- `session_id` is deterministic, unlike v2: the first 16 hex chars of
+  `HMAC-SHA256(K_peer, "gaur-session-v3:" + transfer_id)`. Because the same
+  file always maps to the same transfer id, a retried send addresses the
+  chunks it staged on the previous attempt instead of re-uploading from
+  zero. Android and desktop derive it identically.
+- Before uploading, the sender asks `GET /chunk/status` which chunk indices
+  are already staged and uploads only the rest; on any error it fails open
+  to a full upload. The receiver mirrors the v2 resume logic: `.part` and
+  `.state` are reused when they match the offer's `file_hash`, and kept for
+  resume when a download dies mid-flight (an integrity failure still clears
+  them, since that state is poisoned).
+- The sender uploads the chunks that are not already staged, then sends a
+  sealed `offer` to each target.
 - The offer inner JSON contains `sender_id`, `sender_name`, `transfer_id`,
   `session_id`, `file_name`, `file_size`, `chunk_size`, `chunk_count`,
   `file_hash`, `chunk_hashes`, and batch metadata.
