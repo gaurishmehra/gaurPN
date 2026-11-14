@@ -639,3 +639,110 @@ player. Quickshell's media widget discovers it like any other player.
 - Artwork is sent once per hash, cached under `~/.cache/gaur-share/`, and exposed
   as `mpris:artUrl`.
 - Test with `playerctl -l` and `playerctl -p <player> play-pause`.
+
+---
+
+## 14. Requests (Pull Transfers)
+
+Everything else in this document is push. Requests let any device ask any
+other device for files: the target shows a picker (Android: the system
+document picker via a notification; desktop: zenity/kdialog), and the picked
+files stream back to the requester.
+
+### Protocol (v3.2)
+
+- Sealed kind `request`, inner JSON:
+  `{"request_id":"req-<16hex>","requester_id","origin_id"?,"requester_name","target_id","kind":"files"|"screenshot","expires_ts","grant","ts"}`.
+- `request_id` is 16 random hex chars; `expires_ts` is at most
+  `now + 5 min` (receivers reject anything beyond `+7 min` for clock skew and
+  anything already past).
+- `grant = hex(HMAC-SHA256(K_peer, "gaur-request-grant-v1:" + request_id + ":" + requester_id + ":" + target_id + ":" + expires_ts))`.
+- `requester_id` is the id of the connection that will receive the response
+  (the desktop CLI connects under an ephemeral `reqdev-…` id so it does not
+  evict the daemon's connection). `origin_id`, when present, is the
+  requester's STABLE device id — targets apply the trust gate to it.
+- Sealed kind `request_declined`, inner
+  `{"request_id","reason","ts"}` with reason one of
+  `declined|busy|expired|unsupported|picker_unavailable|not_allowed`.
+- The response is a normal v3 sealed offer whose inner JSON additionally
+  carries `request_id` and `grant` (echoed verbatim). A desktop CLI requester
+  auto-accepts an offer iff its grant matches the one it computed and its
+  claimed sender id equals the target it asked; the request TTL bounds
+  time-to-first-offer, and the receive window then extends by the normal
+  completion timeout so large files survive.
+
+### Behavior and limits
+
+- Android: one request active at a time (extra requests are declined `busy`);
+  request ids are deduplicated; toggles live in **Settings → Transfers**
+  (file requests default on, screenshot requests default off and additionally
+  require the media-read permission, granted when the toggle is enabled).
+  Screenshot requests auto-send the newest file in `Pictures/Screenshots/`,
+  rate-limited to one per requester per 60 seconds. Peer-supplied names are
+  shown with the stable id prefix (`Lilac (lilac-76…)`) — the name is a
+  claim, the id is what the trust list contains.
+- Desktop: `gaur-share request <target> [--screenshot]`. As a target the
+  daemon pops a zenity/kdialog multi-file picker (one at a time; a hung
+  picker times out with `expired`), then spawns a `send --to --request-meta`
+  subprocess with a 1-hour lifetime bound. Screenshot requests to a desktop
+  are declined `unsupported`.
+- The relay is not involved beyond sealed forwarding; requests to offline
+  devices ride the mailbox and are declined `expired` if they surface late.
+
+### Security model — read this
+
+The grant proves "a cluster member that saw this request responded", not
+"the device you asked responded": every member holds `K_peer` and can mint
+grants and claim any sender/origin id. Under the shared-token model the
+trust gate on requests is therefore **advisory**, exactly like offer
+`sender_id` claims everywhere else in the protocol. The mitigations are:
+the picker always shows the claimed stable id next to the name, screenshot
+requests are off by default and rate-limited, and unsolicited declines are
+only surfaced for requests the device itself issued. The real boundary is
+per-device identity keys (protocol v4).
+
+---
+
+## 15. Peer Status Telemetry (battery/charging)
+
+Cluster presence carries encrypted battery and charging state so you can see
+whether the phone will survive a transfer before sending one.
+
+- `K_status = HMAC-SHA256(K_peer, "gaur-status-v1")`.
+- Payload (manually serialized, byte-identical on all platforms):
+  `{"battery":<0-100>,"charging":<true|false>,"ts":<epoch-ms>}`.
+- AES-256-GCM with a fresh 12-byte nonce, AAD `"status:v1:" + device_id`
+  (binds the blob to its device — blobs cannot be swapped between peers).
+- The relay-native frame `{"type":"status","v":1,"status":"<base64(nonce||ct||tag)>"}
+  is NOT sealed: the relay stores the opaque blob per peer (rate-limited to
+  one frame per device per 2 seconds) and includes it in the peers broadcast
+  as an optional `"status"` field. The relay never learns the battery level;
+  it validates only length (≤160 chars) and base64 shape.
+- Receivers drop blobs whose authenticated `ts` is older than 10 minutes.
+- Publishers are event-driven, never polled: Android listens to
+  `ACTION_BATTERY_CHANGED` while the relay connection is up; the desktop
+  daemon watches UPower's `PropertiesChanged` on the system bus (battery-less
+  desktops publish nothing).
+- The desktop daemon decrypts blobs and republishes them in
+  `~/.cache/gaur-share/peers.json` as optional `"battery"` and `"charging"`
+  fields per peer (schema addition; the file is 0600). Android shows them on
+  the cluster device cards.
+
+---
+
+## 16. URL Handling on Text Shares
+
+Shared text that validates as a URL gets an open action:
+
+- Validation (identical on both platforms): trim, ≤2048 UTF-16 units, reject
+  control chars/space/`" < > \ ^ \` { | }`, scheme must be `http` or `https`,
+  host non-empty. The canonical parsed form is what gets opened — never the
+  raw text. No other scheme (`steam:`, `file:`, `javascript:`, custom
+  protocol handlers) is ever passed to a launcher, so a malicious peer cannot
+  trigger app launches.
+- Desktop: the text notification gains an "Open in browser" action running
+  `xdg-open <canonical-url>` as a single argv (no shell, at most two
+  concurrent action notifications, plain fallback beyond).
+- Android: the existing Open action on text-share notifications opens the
+  validated canonical URL via `ACTION_VIEW` and is hidden when validation
+  fails (Copy still works).

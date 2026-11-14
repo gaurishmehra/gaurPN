@@ -38,6 +38,9 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 - **One Upload, Many Recipients**: Send a file to every online device with a single upload; each recipient unwraps the shared content key.
 - **Notification Mirroring**: Android notifications appear on every cluster device with the app icon, action buttons, and inline replies. The app ignores its own notifications to prevent loops. Quickshell forwards desktop notifications to every online device with `gaur-share notify --all`; gaurPN-tagged notifications are skipped.
 - **Media Control (MPRIS)**: Android media sessions appear as local MPRIS players on the desktop, so Quickshell's media widget can play, pause, skip, seek, and set volume. Position is interpolated locally; commands are sealed and expire after 30 seconds.
+- **Request (Pull) Transfers**: Ask any cluster device for files — `gaur-share request "Pixel 8"` pops the phone's file picker and the chosen files stream back; long-press a peer card on Android to request from the desktop. Requests are sealed, expire after five minutes, and are answered by a grant-verified transfer.
+- **Peer Telemetry**: Battery and charging state travel end-to-end encrypted inside presence updates — the relay stores only opaque ciphertext — so the desktop and the phone's cluster cards show whether a device can survive a transfer before you send one.
+- **Safe URL Opening**: Shared links get an "Open in browser" action on the desktop and an Open action on Android, restricted to validated `http`/`https` URLs — a malicious peer can never trigger other protocol handlers.
 - **Desktop Companion Client**: Single standalone Go binary for Linux, macOS, and Windows with `daemon`, `list`, `send`, `send-text`, `notify`, `pair`, and `ui` commands.
 
 ### In-Tunnel Clipboard Sync
@@ -345,6 +348,12 @@ gaur-share notify "Lavander" "Build finished" "The release APK is ready"
 
 # Send a notification to every online device
 gaur-share notify --all "Build finished" "The release APK is ready"
+
+# Request files from a device (its picker opens, files stream back)
+gaur-share request "Pixel 8"
+
+# Ask a phone for its latest screenshot (toggle required on the phone)
+gaur-share request "Pixel 8" --screenshot
 ```
 
 #### On Android (`gaurPN`)
@@ -396,6 +405,7 @@ For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.m
 - **Ephemeral Mailbox**: Offline messages are ciphertext with a TTL (default 1h) and byte caps (global and per-target); the relay never parses them, and delivery is ack-based so a failed write re-queues instead of dropping.
 - **Notification Privacy**: Mirrored notifications are sealed; the relay sees only that a notification event exists. The source app ignores gaurPN's own notifications to prevent loops, and shared content is hidden from the lock screen.
 - **Resumable Transfers**: v2 and v3 transfers resume from a `.part` file and chunk bitmap after a dropped connection or app restart — senders skip chunks the relay still holds, receivers keep progress across attempts.
+- **Request Security**: Pull requests are sealed and grant-verified, expire in five minutes, and are rate-limited on the target. The grant proves a cluster member answered — under the shared-token model identity claims are advisory (the picker always shows the claimed device id); per-device identity keys (v4) are the planned hard boundary.
 
 ---
 

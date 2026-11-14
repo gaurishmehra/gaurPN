@@ -97,7 +97,7 @@ Integration points, all outside this repo:
 | `~/.config/quickshell/dashboard/pages/SharePage.qml` | Watches `~/.cache/gaur-share/peers.json` |
 | `~/.config/quickshell/scripts/share_picker.py` | Reads peers and invokes `gaur-share send -open` |
 
-Keep these stable: the peers JSON schema, the clipboard socket message shape, and the CLI flags. Changing any of them means editing the Quickshell config in the same piece of work.
+Keep these stable: the peers JSON schema, the clipboard socket message shape, and the CLI flags. Changing any of them means editing the Quickshell config in the same piece of work. The peers JSON entries carry optional additive fields (`battery`, `charging`) that older `FileView` consumers must ignore.
 
 ## Security invariants
 
