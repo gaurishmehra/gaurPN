@@ -1,11 +1,13 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,12 +15,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -36,6 +40,19 @@ const (
 	authFailureWindow = time.Minute
 )
 
+// WebSocket liveness windows. The relay pings every client each
+// wsPingInterval; a client that neither sends traffic nor answers pings
+// within wsReadWindow is dropped instead of lingering forever as a stale
+// "online" peer. Every write to a client is bounded by wsWriteTimeout so
+// a client that connected but stopped reading can never block its
+// correspondents. Package vars so tests can shrink them; each connection
+// copies the current values at join time (see Peer).
+var (
+	wsPingInterval = 30 * time.Second
+	wsReadWindow   = 75 * time.Second
+	wsWriteTimeout = 15 * time.Second
+)
+
 // validDeviceID bounds the join-time device id: opaque, URL-safe, short.
 var validDeviceID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
@@ -51,6 +68,15 @@ type Peer struct {
 	conn     *websocket.Conn `json:"-"`
 	writeMu  sync.Mutex      `json:"-"`
 	joinedAt time.Time
+
+	// Liveness settings copied from the ws* package vars when the peer
+	// joins. Capturing them per connection means goroutines serving
+	// older connections never read the vars again, so tests can shrink
+	// the windows between connections without tripping the race
+	// detector.
+	pingInterval time.Duration
+	readWindow   time.Duration
+	writeTimeout time.Duration
 }
 
 type PeerInfo struct {
@@ -58,16 +84,50 @@ type PeerInfo struct {
 	Name string `json:"name"`
 }
 
-func (p *Peer) WriteMessage(messageType int, data []byte) error {
+// writeMessage sends one frame under the write mutex with a bounded write
+// deadline, so a stalled client can never block a writer (or hold
+// writeMu) indefinitely. Every relay write to a peer goes through this
+// helper or writeJSON.
+func (p *Peer) writeMessage(messageType int, data []byte) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeTimeout))
 	return p.conn.WriteMessage(messageType, data)
 }
 
-func (p *Peer) WriteJSON(v interface{}) error {
+// writeJSON is writeMessage for JSON envelopes.
+func (p *Peer) writeJSON(v interface{}) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	_ = p.conn.SetWriteDeadline(time.Now().Add(p.writeTimeout))
 	return p.conn.WriteJSON(v)
+}
+
+// runPingLoop probes the client with WebSocket pings until stop closes.
+// The app-level ping is client-initiated, so it proves the relay is
+// reachable but never the reverse. A ping that cannot be written within
+// the write timeout means the client is gone or wedged: closing the conn
+// unblocks the read loop, whose deferred cleanup removes the peer and
+// broadcasts the leave.
+func (p *Peer) runPingLoop(stop <-chan struct{}) {
+	ticker := time.NewTicker(p.pingInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			p.writeMu.Lock()
+			deadline := time.Now().Add(p.writeTimeout)
+			_ = p.conn.SetWriteDeadline(deadline)
+			err := p.conn.WriteControl(websocket.PingMessage, nil, deadline)
+			p.writeMu.Unlock()
+			if err != nil {
+				_ = p.conn.Close()
+				return
+			}
+		case <-stop:
+			return
+		}
+	}
 }
 
 type Hub struct {
@@ -268,6 +328,28 @@ func (h *Hub) Close() {
 	})
 }
 
+// Closed reports whether Close has run and the eviction goroutine has
+// stopped. Exposed for shutdown tests.
+func (h *Hub) Closed() bool {
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// closePeerConns closes every live peer connection. Shutdown uses it to
+// give WebSocket clients a clean close and let their handlers exit:
+// hijacked connections are invisible to http.Server.Shutdown, so without
+// this they would only die with the process.
+func (h *Hub) closePeerConns() {
+	_, peers := h.peersSnapshot()
+	for _, p := range peers {
+		_ = p.conn.Close()
+	}
+}
+
 // authenticate reports whether token is either the master cluster token or
 // the derived relay auth token K_relay = hex(HMAC-SHA256(master, "gaur-relay-auth-v1")).
 func (h *Hub) authenticate(token string) bool {
@@ -326,7 +408,7 @@ func (h *Hub) broadcastPeerList() {
 	}
 
 	for _, p := range peers {
-		_ = p.WriteMessage(websocket.TextMessage, payload)
+		_ = p.writeMessage(websocket.TextMessage, payload)
 	}
 }
 
@@ -336,7 +418,7 @@ func (h *Hub) sendPeerList(peer *Peer) {
 	if err != nil {
 		return
 	}
-	_ = peer.WriteMessage(websocket.TextMessage, payload)
+	_ = peer.writeMessage(websocket.TextMessage, payload)
 }
 
 func (h *Hub) peersSnapshot() ([]PeerInfo, []*Peer) {
@@ -403,11 +485,24 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(1 << 20)
 
 	peer := &Peer{
-		ID:       deviceID,
-		Name:     deviceName,
-		conn:     conn,
-		joinedAt: time.Now(),
+		ID:           deviceID,
+		Name:         deviceName,
+		conn:         conn,
+		joinedAt:     time.Now(),
+		pingInterval: wsPingInterval,
+		readWindow:   wsReadWindow,
+		writeTimeout: wsWriteTimeout,
 	}
+
+	// Liveness: the read loop runs under a rolling deadline. Any inbound
+	// frame — data or pong — extends it; silence past the window means
+	// the client is gone, and the connection is dropped instead of
+	// lingering as a stale "online" peer.
+	_ = conn.SetReadDeadline(time.Now().Add(peer.readWindow))
+	conn.SetPongHandler(func(string) error {
+		_ = conn.SetReadDeadline(time.Now().Add(peer.readWindow))
+		return nil
+	})
 
 	h.mu.Lock()
 	if old, exists := h.peers[deviceID]; exists {
@@ -419,12 +514,25 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[HUB] Device joined: %s (%s)", deviceName, deviceID)
 	h.broadcastPeerList()
 
-	// Deliver sealed messages that arrived while this device was offline.
-	for _, pending := range h.mailbox.Take(deviceID) {
-		_ = peer.WriteMessage(websocket.TextMessage, pending)
-	}
+	// Server-side pings: without them the read deadline above could only
+	// be extended by client-initiated traffic, so a silently dead client
+	// would look online forever.
+	pingDone := make(chan struct{})
+	var stopPingOnce sync.Once
+	stopPing := func() { stopPingOnce.Do(func() { close(pingDone) }) }
+	go peer.runPingLoop(pingDone)
+
+	// Deliver sealed messages that arrived while this device was
+	// offline. Drain removes an entry only after its write succeeds, so
+	// a client that vanishes mid-join loses nothing: undelivered entries
+	// stay queued, in order, for the next join. Receivers dedupe by
+	// msg_id, so the resulting at-least-once delivery is harmless.
+	h.mailbox.Drain(deviceID, func(pending []byte) bool {
+		return peer.writeMessage(websocket.TextMessage, pending) == nil
+	})
 
 	defer func() {
+		stopPing()
 		h.mu.Lock()
 		if curr, ok := h.peers[deviceID]; ok && curr == peer {
 			delete(h.peers, deviceID)
@@ -436,6 +544,9 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
+		// Any successful read proves the client is alive; re-arm the
+		// read window before blocking in ReadMessage again.
+		_ = conn.SetReadDeadline(time.Now().Add(peer.readWindow))
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			break
@@ -448,7 +559,7 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 		msgType, _ := envelope["type"].(string)
 		if msgType == "ping" {
-			_ = peer.WriteJSON(map[string]string{"type": "pong"})
+			_ = peer.writeJSON(map[string]string{"type": "pong"})
 			continue
 		}
 		if msgType == "list_peers" {
@@ -476,7 +587,15 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 			targetPeer, exists := h.peers[targetID]
 			h.mu.RUnlock()
 			if exists && targetPeer != nil {
-				_ = targetPeer.WriteMessage(websocket.TextMessage, forwardBytes)
+				if err := targetPeer.writeMessage(websocket.TextMessage, forwardBytes); err != nil {
+					// The peer looked present but the write failed: the
+					// device died mid-join or stopped reading. Re-queue
+					// the envelope instead of dropping it. Put enforces
+					// the byte cap and TTL, and the re-queued bytes keep
+					// their original relay_ts, so receiver-side
+					// freshness still applies.
+					h.mailbox.Put(targetID, forwardBytes)
+				}
 			} else {
 				h.mailbox.Put(targetID, forwardBytes)
 			}
@@ -501,7 +620,7 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 			// last-write-wins clipboard updates, independent of device clocks.
 			envelope["relay_ts"] = time.Now().UnixMilli()
 			forwardBytes, _ := json.Marshal(envelope)
-			_ = targetPeer.WriteMessage(websocket.TextMessage, forwardBytes)
+			_ = targetPeer.writeMessage(websocket.TextMessage, forwardBytes)
 		}
 	}
 }
@@ -917,6 +1036,54 @@ func isLoopbackBind(addr string, ifaces []net.Interface) (bool, error) {
 	return false, nil
 }
 
+// newRelayMux builds the relay's full HTTP surface. Extracted from main
+// so tests boot the identical routing table.
+func newRelayMux(h *Hub) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", h.handleWS)
+	mux.HandleFunc("/pipe", h.handlePipe)
+	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			h.handleChunkPut(w, r)
+		case http.MethodGet, http.MethodHead:
+			h.handleChunkGet(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/chunk/status", h.handleChunkStatus)
+	mux.HandleFunc("/transfer", h.handleTransferDelete)
+	mux.HandleFunc("/health", h.handleHealth)
+	return mux
+}
+
+// shutdownTimeout bounds how long in-flight requests (chunk uploads,
+// pipe streams) may take to complete during graceful shutdown before the
+// relay exits anyway. Package var so tests can shrink it.
+var shutdownTimeout = 10 * time.Second
+
+// shutdownRelay drains the HTTP server, then stops the hub's and chunk
+// store's background workers. Both Close methods are sync.Once-guarded,
+// so the deferred hub.Close in main (and test cleanups) can run them
+// again safely. Extracted from main so tests can exercise it end to end.
+func shutdownRelay(srv *http.Server, hub *Hub, chunks *ChunkStore) {
+	// WebSocket connections are hijacked from the HTTP server, so
+	// Shutdown neither closes nor waits for them. Close the peers first
+	// for a prompt stop and a clean close instead of a socket reset at
+	// process exit.
+	hub.closePeerConns()
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("[SHUTDOWN] HTTP drain incomplete: %v", err)
+	}
+	hub.Close()
+	if chunks != nil {
+		chunks.Close()
+	}
+}
+
 func main() {
 	var cfg Config
 	flag.StringVar(&cfg.BindAddr, "bind", "127.0.0.1:9876", "Internal address and port to bind to (loopback only)")
@@ -958,24 +1125,12 @@ func main() {
 	mailbox := NewMailbox(*mailboxTTL, *mailboxMax)
 	hub := NewHub([]byte(token), chunks, mailbox)
 	hub.SetMaxPeers(*maxPeers)
+	// shutdownRelay calls hub.Close itself; sync.Once makes this deferred
+	// call a safe no-op if shutdown already ran (and the only cleanup if
+	// main returns some other way).
 	defer hub.Close()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", hub.handleWS)
-	mux.HandleFunc("/pipe", hub.handlePipe)
-	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPut:
-			hub.handleChunkPut(w, r)
-		case http.MethodGet, http.MethodHead:
-			hub.handleChunkGet(w, r)
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	mux.HandleFunc("/chunk/status", hub.handleChunkStatus)
-	mux.HandleFunc("/transfer", hub.handleTransferDelete)
-	mux.HandleFunc("/health", hub.handleHealth)
+	mux := newRelayMux(hub)
 
 	// The relay must stay loopback-only per the security model: clients reach
 	// it through the Shadowsocks tunnel, never over a public interface.
@@ -1000,7 +1155,26 @@ func main() {
 		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("[FATAL] Server terminated: %v", err)
+	// SIGTERM (systemd stop, restart) drains in-flight transfers instead
+	// of killing them mid-stream; a serve error aborts with status 1.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+		}
+	}()
+
+	select {
+	case err := <-serveErr:
+		log.Printf("[FATAL] Server terminated: %v", err)
+		shutdownRelay(server, hub, chunks)
+		os.Exit(1)
+	case <-ctx.Done():
+		log.Printf("[SHUTDOWN] Signal received, draining relay")
+		shutdownRelay(server, hub, chunks)
 	}
+	log.Printf("[SHUTDOWN] gaur-relay stopped")
 }

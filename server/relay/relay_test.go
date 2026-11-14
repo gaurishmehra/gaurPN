@@ -54,7 +54,7 @@ func TestPeerConcurrentWrites(t *testing.T) {
 		go func(workerID int) {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				_ = peer.WriteJSON(map[string]interface{}{
+				_ = peer.writeJSON(map[string]interface{}{
 					"type":   "test",
 					"worker": workerID,
 					"iter":   j,
