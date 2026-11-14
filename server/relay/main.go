@@ -12,6 +12,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -58,6 +60,8 @@ type Hub struct {
 	upgrader  websocket.Upgrader
 	pipeMu    sync.Mutex
 	pipes     map[string]*PipeSession
+	chunks    *ChunkStore
+	mailbox   *Mailbox
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -124,12 +128,21 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
-func NewHub(token []byte) *Hub {
+func NewHub(token []byte, chunks *ChunkStore, mailboxes ...*Mailbox) *Hub {
+	if chunks == nil {
+		chunks = NewChunkStore("", 0, 0)
+	}
+	mailbox := NewMailbox(time.Hour, 16<<20)
+	if len(mailboxes) > 0 && mailboxes[0] != nil {
+		mailbox = mailboxes[0]
+	}
 	h := &Hub{
-		peers: make(map[string]*Peer),
-		token: token,
-		pipes: make(map[string]*PipeSession),
-		done:  make(chan struct{}),
+		peers:   make(map[string]*Peer),
+		token:   token,
+		pipes:   make(map[string]*PipeSession),
+		chunks:  chunks,
+		mailbox: mailbox,
+		done:    make(chan struct{}),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // loopback / tunnel only
@@ -162,10 +175,13 @@ func NewHub(token []byte) *Hub {
 	return h
 }
 
-// Close stops the eviction goroutine. Safe to call more than once.
+// Close stops the eviction goroutines. Safe to call more than once.
 func (h *Hub) Close() {
 	h.closeOnce.Do(func() {
 		close(h.done)
+		if h.chunks != nil {
+			h.chunks.Close()
+		}
 	})
 }
 
@@ -239,6 +255,10 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[WS] Upgrade failed: %v", err)
 		return
 	}
+	// Signaling messages are small (offers, accepts, text, clipboard). Chunk
+	// bodies travel over HTTP, so a 1 MiB frame cap is generous and prevents a
+	// token holder from forcing the relay to buffer arbitrary payloads.
+	conn.SetReadLimit(1 << 20)
 
 	peer := &Peer{
 		ID:       deviceID,
@@ -256,6 +276,11 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[HUB] Device joined: %s (%s)", deviceName, deviceID)
 	h.broadcastPeerList()
+
+	// Deliver sealed messages that arrived while this device was offline.
+	for _, pending := range h.mailbox.Take(deviceID) {
+		_ = peer.WriteMessage(websocket.TextMessage, pending)
+	}
 
 	defer func() {
 		h.mu.Lock()
@@ -289,6 +314,27 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
+		// Sealed envelopes are opaque to the relay. They carry only a target,
+		// a message id, a timestamp, and a kind. If the target is offline the
+		// envelope is queued in the mailbox; no sender identity is attached.
+		if msgType == "sealed" {
+			targetID, _ := envelope["target_id"].(string)
+			if targetID == "" {
+				continue
+			}
+			envelope["relay_ts"] = time.Now().UnixMilli()
+			forwardBytes, _ := json.Marshal(envelope)
+			h.mu.RLock()
+			targetPeer, exists := h.peers[targetID]
+			h.mu.RUnlock()
+			if exists && targetPeer != nil {
+				_ = targetPeer.WriteMessage(websocket.TextMessage, forwardBytes)
+			} else {
+				h.mailbox.Put(targetID, forwardBytes)
+			}
+			continue
+		}
+
 		targetID, _ := envelope["target_id"].(string)
 		if targetID == "" {
 			continue
@@ -303,6 +349,9 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		h.mu.RUnlock()
 
 		if exists && targetPeer != nil {
+			// Server receive time gives receivers a common ordering clock for
+			// last-write-wins clipboard updates, independent of device clocks.
+			envelope["relay_ts"] = time.Now().UnixMilli()
 			forwardBytes, _ := json.Marshal(envelope)
 			_ = targetPeer.WriteMessage(websocket.TextMessage, forwardBytes)
 		}
@@ -420,6 +469,130 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func requestToken(r *http.Request) string {
+	token := strings.TrimSpace(r.Header.Get("X-Gaur-Token"))
+	if token == "" {
+		token = strings.TrimSpace(r.URL.Query().Get("token"))
+	}
+	return token
+}
+
+// transferKey parses the shared chunk parameters. index is -1 when the caller
+// did not supply one (status and delete endpoints do not need it).
+func (h *Hub) transferKey(r *http.Request) (key string, index int, ok bool) {
+	transferID := strings.TrimSpace(r.URL.Query().Get("transfer_id"))
+	sessionID := strings.TrimSpace(r.URL.Query().Get("session_id"))
+	if transferID == "" || sessionID == "" {
+		return "", 0, false
+	}
+	index = -1
+	if raw := strings.TrimSpace(r.URL.Query().Get("index")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 || parsed >= maxChunksPerTransfer {
+			return "", 0, false
+		}
+		index = parsed
+	}
+	return transferID + "/" + sessionID, index, true
+}
+
+func (h *Hub) handleChunkPut(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.authenticate(requestToken(r)) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	key, index, ok := h.transferKey(r)
+	if !ok || index < 0 {
+		http.Error(w, "Invalid transfer_id, session_id, or index", http.StatusBadRequest)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxChunkSize+1))
+	if err != nil {
+		http.Error(w, "Read failed", http.StatusBadRequest)
+		return
+	}
+	if err := h.chunks.Put(key, index, body); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "index": index})
+}
+
+func (h *Hub) handleChunkGet(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.authenticate(requestToken(r)) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	key, index, ok := h.transferKey(r)
+	if !ok || index < 0 {
+		http.Error(w, "Invalid transfer_id, session_id, or index", http.StatusBadRequest)
+		return
+	}
+	data, found := h.chunks.Get(key, index)
+	if !found {
+		http.Error(w, "Chunk not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	_, _ = w.Write(data)
+}
+
+func (h *Hub) handleChunkStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.authenticate(requestToken(r)) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	key, _, ok := h.transferKey(r)
+	if !ok {
+		http.Error(w, "Invalid transfer_id or session_id", http.StatusBadRequest)
+		return
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(r.URL.Query().Get("count")))
+	if err != nil || count < 0 || count > maxChunksPerTransfer {
+		http.Error(w, "Invalid count", http.StatusBadRequest)
+		return
+	}
+	present := h.chunks.Present(key, count)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"present": present})
+}
+
+func (h *Hub) handleTransferDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.authenticate(requestToken(r)) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	key, _, ok := h.transferKey(r)
+	if !ok {
+		http.Error(w, "Invalid transfer_id or session_id", http.StatusBadRequest)
+		return
+	}
+	h.chunks.Delete(key)
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func loadToken(cfg Config) ([]byte, error) {
 	if cfg.TokenFile != "" {
 		data, err := os.ReadFile(cfg.TokenFile)
@@ -444,23 +617,68 @@ func main() {
 	flag.StringVar(&cfg.BindAddr, "bind", "127.0.0.1:9876", "Internal address and port to bind to (loopback only)")
 	flag.StringVar(&cfg.TokenFile, "token-file", "/etc/gaur-relay/cluster.key", "Path to cluster secret token file")
 	flag.StringVar(&cfg.TokenEnv, "token-env", "GAURPN_CLUSTER_TOKEN", "Environment variable for token fallback")
+	chunkDir := flag.String("chunk-dir", filepath.Join(os.TempDir(), "gaur-relay-chunks"), "Directory for resumable chunk staging (empty = memory only)")
+	chunkMax := flag.Int64("chunk-max-bytes", 8<<30, "Maximum bytes of staged chunks across all transfers")
+	chunkTTL := flag.Duration("chunk-ttl", 24*time.Hour, "Idle time before a staged transfer is evicted")
+	mailboxTTL := flag.Duration("mailbox-ttl", time.Hour, "How long sealed messages for offline peers are held")
+	mailboxMax := flag.Int64("mailbox-max-bytes", 16<<20, "Maximum bytes of queued sealed messages")
+	initMode := flag.Bool("init", false, "Generate a cluster token, write it, print a pairing QR, and exit")
+	qrMode := flag.Bool("qr", false, "Print a pairing QR for the existing token and exit")
+	initForce := flag.Bool("force", false, "Overwrite an existing token file with -init")
+	initRelay := flag.String("pair-relay", defaultPairRelay, "Relay address advertised in the pairing QR")
+	initDNS := flag.String("pair-dns", defaultPairDNS, "DNS server advertised in the pairing QR")
+	initName := flag.String("pair-name", "", "Optional device name advertised in the pairing QR")
 	flag.Parse()
+
+	if *initMode {
+		if err := runInit(cfg.TokenFile, *initRelay, *initDNS, *initName, *initForce); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		return
+	}
+	if *qrMode {
+		if err := runQR(cfg.TokenFile, *initRelay, *initDNS, *initName); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		return
+	}
 
 	token, err := loadToken(cfg)
 	if err != nil {
 		log.Fatalf("[FATAL] %v", err)
 	}
 
-	hub := NewHub(token)
+	chunks := NewChunkStore(*chunkDir, *chunkMax, *chunkTTL)
+	mailbox := NewMailbox(*mailboxTTL, *mailboxMax)
+	hub := NewHub(token, chunks, mailbox)
+	defer hub.Close()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", hub.handleWS)
 	mux.HandleFunc("/pipe", hub.handlePipe)
+	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			hub.handleChunkPut(w, r)
+		case http.MethodGet, http.MethodHead:
+			hub.handleChunkGet(w, r)
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+	mux.HandleFunc("/chunk/status", hub.handleChunkStatus)
+	mux.HandleFunc("/transfer", hub.handleTransferDelete)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		transfers, bytes := chunks.Stats()
+		mailboxPeers, mailboxBytes := hub.mailbox.Stats()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"status": "healthy",
-			"peers":  len(hub.peers),
+			"status":          "healthy",
+			"peers":           len(hub.peers),
+			"chunk_transfers": transfers,
+			"chunk_bytes":     bytes,
+			"mailbox_peers":   mailboxPeers,
+			"mailbox_bytes":   mailboxBytes,
 		})
 	})
 

@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -19,7 +20,7 @@ import (
 
 func TestPeerConcurrentWrites(t *testing.T) {
 	token := []byte("test-cluster-token-secret")
-	hub := NewHub(token)
+	hub := NewHub(token, NewChunkStore("", 0, 0))
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
@@ -67,7 +68,7 @@ func TestPeerConcurrentWrites(t *testing.T) {
 
 func TestPipeSessionCleanup(t *testing.T) {
 	token := []byte("test-secret-token")
-	hub := NewHub(token)
+	hub := NewHub(token, NewChunkStore("", 0, 0))
 	defer hub.Close()
 
 	transferID := "tx-test-cleanup-1"
@@ -94,7 +95,7 @@ func TestPipeSessionCleanup(t *testing.T) {
 
 func TestPipeSessionSuccessfulStream(t *testing.T) {
 	token := []byte("test-secret-token")
-	hub := NewHub(token)
+	hub := NewHub(token, NewChunkStore("", 0, 0))
 	defer hub.Close()
 
 	transferID := fmt.Sprintf("tx-test-success-%d", time.Now().UnixNano())
@@ -146,7 +147,7 @@ func TestPipeSessionSuccessfulStream(t *testing.T) {
 
 func TestHubAuthenticateWithDerivedToken(t *testing.T) {
 	masterToken := []byte("super-secret-cluster-token")
-	hub := NewHub(masterToken)
+	hub := NewHub(masterToken, NewChunkStore("", 0, 0))
 	defer hub.Close()
 
 	// Direct master token should authenticate
@@ -166,5 +167,60 @@ func TestHubAuthenticateWithDerivedToken(t *testing.T) {
 	// Invalid token must fail
 	if hub.authenticate("wrong-token") {
 		t.Errorf("Invalid token authenticated unexpectedly")
+	}
+}
+
+func TestRelayAddsTimestampAndSenderIdentity(t *testing.T) {
+	token := []byte("test-cluster-token-secret")
+	hub := NewHub(token, NewChunkStore("", 0, 0))
+	defer hub.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	connA, _, err := websocket.DefaultDialer.Dial(wsURL+"?device_id=device-a&name=DeviceA&token=test-cluster-token-secret", nil)
+	if err != nil {
+		t.Fatalf("dial A: %v", err)
+	}
+	defer connA.Close()
+
+	connB, _, err := websocket.DefaultDialer.Dial(wsURL+"?device_id=device-b&name=DeviceB&token=test-cluster-token-secret", nil)
+	if err != nil {
+		t.Fatalf("dial B: %v", err)
+	}
+	defer connB.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	if err := connA.WriteJSON(map[string]interface{}{
+		"type":      "clipboard_update",
+		"target_id": "device-b",
+		"msg_id":    "clip-1",
+		"ts":        123,
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	_ = connB.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, data, err := connB.ReadMessage()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		var envelope map[string]interface{}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			continue
+		}
+		if envelope["type"] != "clipboard_update" {
+			continue
+		}
+		if envelope["from_id"] != "device-a" {
+			t.Fatalf("from_id = %v, want device-a", envelope["from_id"])
+		}
+		if _, ok := envelope["relay_ts"].(float64); !ok {
+			t.Fatalf("relay_ts missing or not numeric: %v", envelope["relay_ts"])
+		}
+		return
 	}
 }
