@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/all;
+Actions=send;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+
+[Desktop Action send]
+Name=Send with gaurPN
+Icon=network-transmit
+Exec=gaur-share-send.sh %F

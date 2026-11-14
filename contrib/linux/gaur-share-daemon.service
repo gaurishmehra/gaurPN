@@ -1,0 +1,16 @@
+[Unit]
+Description=gaur-share in-tunnel receiver
+Documentation=https://github.com/gaurishmehra/gaurPN
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Quickshell owns the clipboard event source; socket mode keeps the daemon
+# idle-cheap. Use -clipboard-source=poll only on machines without Quickshell.
+ExecStart=%h/.local/bin/gaur-share -clipboard-source=socket daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

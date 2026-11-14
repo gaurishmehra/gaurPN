@@ -17,15 +17,36 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 - **Reliable Lifecycle**: Automatic reconnect with exponential backoff, battery-optimization exemption shortcut, and optional start-on-boot.
 - **Quick Settings Tile**: Instant two-way toggle from the system notification shade.
 - **ss:// Import**: Deep link and clipboard parser supporting SIP002 URIs, percent-encoded userinfo, IPv6 host brackets, legacy base64 strings, and port bounds checking.
+- **Kill Switch**: Keeps the TUN interface up while reconnecting, so packets are dropped instead of escaping directly during the backoff window.
+- **DNS Through the Tunnel**: Queries go to AdGuard Home on the VPS over the Shadowsocks tunnel, not to a public resolver. The default is `10.0.0.182`; it is configurable and forced into the tunnel with a host route.
+- **IPv6-Aware LAN Bypass**: When LAN access is enabled, IPv4 private ranges and IPv6 link-local/ULA/multicast stay local while global IPv6 unicast remains tunneled.
 
 ### In-Tunnel File Sharing (`gaur-share`)
 - **Zero Local Wi-Fi Leakage**: All traffic stays inside the Shadowsocks tunnel. No mDNS, no Bonjour, no ARP broadcasts, and no UDP hole punching on your local network.
-- **Double Encryption**: Outer Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`) wraps an inner layer of ephemeral ECDH (NIST P-256) key exchange, HKDF-SHA256 session key derivation, and authenticated AES-256-GCM chunked streaming (256 KB chunks with sequential nonces).
-- **Zero-Knowledge Dual-Key Architecture**: Derives separate relay presence keys ($K_{relay}$) and local peer authentication keys ($K_{peer}$), with HMAC-SHA256 authentication tags preventing relay Man-In-The-Middle attacks and safety number verification.
+- **Double Encryption**: Outer Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`) wraps an inner layer of ephemeral ECDH (NIST P-256) key exchange, HKDF-SHA256 session key derivation, and authenticated AES-256-GCM chunked streaming (1 MiB chunks, index-bound nonces, per-chunk AAD).
+- **Content-Addressed Resume**: Transfers are keyed by `HMAC(K_peer, sha256(file))`, so the same bytes always resume the same transfer. The receiver keeps a `.part` file and a chunk bitmap in `Downloads`; a dropped connection re-uploads only the missing chunks. A signed completion receipt means "Sent" only after the receiver decrypted and saved the file.
+- **Zero-Knowledge Dual-Key Architecture**: Derives separate relay presence keys ($K_{relay}$) and local peer authentication keys ($K_{peer}$), with HMAC-SHA256 authentication tags binding the transfer ID, recipient ID, ephemeral public keys, and the v2 file manifest, preventing relay Man-In-The-Middle attacks and enabling safety number verification.
 - **Path Traversal & Collision Protection**: Automatic filename sanitization, staging to `.part` files, and automatic non-destructive collision resolution preserving seamless file auto-acceptance.
-- **Zero-Knowledge VPS Relay**: The relay daemon binds only to `127.0.0.1:9876` on your VPS. It pipes streams in memory via `io.Pipe`, never writes payloads to disk, and requires pre-shared cluster token authentication.
+- **Zero-Knowledge VPS Relay**: The relay daemon binds only to the loopback alias `198.51.100.1:9876` on your VPS and requires pre-shared cluster token authentication. It stages opaque ciphertext chunks on disk for resume and holds sealed envelopes for offline peers; it possesses no keys and cannot decrypt them. Chunks and mailbox entries are evicted by TTL and byte caps.
 - **Android Integration**: Live peer cards on the home screen, native file picker, progress notifications, and automatic saving to the public `Downloads` directory.
-- **Desktop Companion Client**: Single standalone Go binary for Linux, macOS, and Windows with `daemon`, `list`, and `send` commands.
+- **Text and Link Sharing**: Share a URL or snippet from Android's Sharesheet or `gaur-share send-text`; the receiver gets a notification with Copy/Open instead of a silent clipboard overwrite.
+- **Transfer History**: Local-only list of sent/received files and text, with open, retry, resend, and cancel.
+- **Trusted Devices**: Pin devices by stable ID on Android or with `gaur-share trust`, auto-accept only from trusted peers, and revoke without rotating the cluster token.
+- **Broadcast and Folders**: Send to every online peer at once from the Android share dialog, and send a folder as a flat batch from the desktop client.
+- **Sealed Sender (v3)**: New transfers, text, and notifications use a sealed envelope. The relay sees only the target, timestamp, and kind — not the sender, file name, or payload.
+- **Offline Delivery**: Queue a file, text, or notification for a device that is offline. The relay holds only ciphertext in a TTL/byte-capped mailbox and delivers it on reconnect.
+- **One Upload, Many Recipients**: Send a file to every online device with a single upload; each recipient unwraps the shared content key.
+- **Notification Mirroring**: Android notifications appear on every cluster device with the app icon, action buttons, and inline replies. The app ignores its own notifications to prevent loops. Quickshell forwards desktop notifications to every online device with `gaur-share notify --all`; gaurPN-tagged notifications are skipped.
+- **Media Control (MPRIS)**: Android media sessions appear as local MPRIS players on the desktop, so Quickshell's media widget can play, pause, skip, seek, and set volume. Position is interpolated locally; commands are sealed and expire after 30 seconds.
+- **Desktop Companion Client**: Single standalone Go binary for Linux, macOS, and Windows with `daemon`, `list`, `send`, `send-text`, `notify`, `pair`, and `ui` commands.
+
+### In-Tunnel Clipboard Sync
+- **Latest Clip Wins**: Copy text or an image on any cluster device and it is pushed to every other online device. Clipboard updates are ordered by the relay's receive timestamp, so the newest copy wins even with clock skew.
+- **Text and Images**: Android images are decoded, downscaled to 2048 px, and re-encoded before transfer. Desktop images use the native clipboard (`wl-clipboard`/`xclip` on Linux, `pngpaste` on macOS, PowerShell on Windows).
+- **End-to-End Encrypted**: Clipboard payloads use AES-256-GCM with a key derived from the cluster token (`K_clipboard = HMAC-SHA256(K_peer, "gaur-clipboard-v1")`). The relay only sees ciphertext and routing metadata.
+- **Echo and Replay Protection**: Content hashes suppress local echo, and relay timestamps reject stale or replayed updates. Sensitive clips (passwords/OTP) are skipped by default on Android; desktop clients cannot detect the platform sensitive flag, so disable desktop clipboard sync when handling secrets.
+- **Per-Device Control**: Disable clipboard sync for specific peers, such as a work laptop, without turning it off everywhere.
+- **Android Background Read**: Android 10+ only allows the focused app or default IME to read the clipboard. gaurPN uses a 1x1 focusable overlay while the screen is unlocked to read the clipboard, then removes it. Android may show its "pasted from clipboard" privacy toast when a new clip is captured.
 
 ### Network Control
 - **Per-App Split Tunneling**: Exclude chosen apps (banking apps, local streaming apps, games) from the VPN tunnel. Includes a searchable installed app list.
@@ -61,9 +82,13 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 │                                                                                                       │
 │  Shadowsocks Server Daemon (e.g. outline-ss-server)                                                   │
 │                                                                                                       │
-│  gaur-relay (Go daemon listening on 127.0.0.1:9876 loopback only)                                     │
-│    ├── /ws: Authenticated WebSocket presence and signaling (pre-shared cluster token)                │
-│    ├── /pipe: Zero-copy in-memory io.Pipe stream forwarder (no disk writes, zero payload inspection) │
+│  AdGuard Home (DNS on 10.0.0.182:53, reachable only through the tunnel)                               │
+│                                                                                                       │
+│  gaur-relay (Go daemon listening on the 198.51.100.1:9876 loopback alias)                             │
+│    ├── /ws: Authenticated WebSocket presence and signaling (pre-shared cluster token)                 │
+│    ├── /chunk: Ciphertext chunk staging for resumable transfers (no keys, no plaintext)               │
+│    ├── mailbox: Sealed envelopes for offline peers (TTL and byte capped)                              │
+│    ├── /pipe: Legacy in-memory stream forwarder for v1 clients                                        │
 │    └── /health: Loopback health status                                                                │
 └───────────────────────────────────────────────────▲───────────────────────────────────────────────────┘
                                                     │
@@ -207,6 +232,31 @@ openssl rand -hex 32 > /etc/gaur-relay/cluster.key
 chmod 600 /etc/gaur-relay/cluster.key
 ```
 
+Or generate the token and a pairing QR in one step:
+
+```bash
+sudo /opt/gaur-relay/gaur-relay -init \
+  -token-file /etc/gaur-relay/cluster.key \
+  -pair-relay 198.51.100.1:9876 \
+  -pair-dns 10.0.0.182
+```
+
+Scan the QR with the phone camera. The `gaur://pair` link opens gaurPN and
+stores the relay address, cluster token, and DNS server without typing the
+secret. On the desktop, run `gaur-share pair '<uri>'` with the printed URI.
+
+If the relay is already running, restart it after `-init` so it loads the new
+token: `sudo systemctl restart gaur-relay`.
+
+To pair another device to the existing cluster without rotating the token:
+
+```bash
+sudo /opt/gaur-relay/gaur-relay -qr \
+  -token-file /etc/gaur-relay/cluster.key \
+  -pair-relay 198.51.100.1:9876 \
+  -pair-dns 10.0.0.182
+```
+
 Run `gaur-relay` as a systemd service (`/etc/systemd/system/gaur-relay.service`):
 ```ini
 [Unit]
@@ -215,8 +265,13 @@ After=network.target
 
 [Service]
 Type=simple
-User=ubuntu
-ExecStart=/opt/gaur-relay/gaur-relay -bind 127.0.0.1:9876 -token-file /etc/gaur-relay/cluster.key
+# The relay only needs privileges to create the loopback alias. On a hardened
+# host, create 198.51.100.1/32 with a separate oneshot unit and run this
+# service as a dedicated user instead.
+User=root
+ExecStartPre=-/usr/sbin/ip addr replace 198.51.100.1/32 dev lo
+ExecStart=/opt/gaur-relay/gaur-relay -bind 198.51.100.1:9876 -token-file /etc/gaur-relay/cluster.key -chunk-dir /var/lib/gaur-relay/chunks -chunk-max-bytes 8589934592 -mailbox-ttl 1h -mailbox-max-bytes 16777216
+StateDirectory=gaur-relay
 Restart=always
 RestartSec=3
 LimitNOFILE=65535
@@ -237,7 +292,7 @@ Create `~/.config/gaur-share/config.json`:
 ```json
 {
   "device_name": "My-Laptop",
-  "relay": "127.0.0.1:9876"
+  "relay": "198.51.100.1:9876"
 }
 ```
 Place your cluster token in `~/.config/gaur-share/cluster.key` or export `GAURPN_CLUSTER_TOKEN="your-secret-token"`.
@@ -254,12 +309,73 @@ gaur-share list
 
 # Send a file to an Android device
 gaur-share send "Pixel 8" ~/Documents/notes.pdf ~/Documents/report.pdf
+
+# Send a link or a short text (use - to read stdin)
+gaur-share send-text "Pixel 8" "https://example.com/recipe"
+echo "otp 482913" | gaur-share send-text "Pixel 8" -
+
+# Send a folder as a flat batch
+gaur-share send "Pixel 8" ~/Pictures/holiday
+
+# Pair from the relay's QR URI
+gaur-share pair "gaur://pair?relay=198.51.100.1%3A9876&token=..."
+
+# Local browser UI (peers, text, drag-and-drop files)
+gaur-share ui
+
+# Trust a device and require trust for incoming offers
+gaur-share trust "Lavander"
+gaur-share trust-mode on
+gaur-share trusted
+
+# Revoke a device
+gaur-share untrust "Lavander"
+
+# One upload, every online device
+gaur-share send --all ~/Pictures/holiday
+
+# Queue for a device that is offline (use its stable ID)
+gaur-share send --offline android-897a85f2 ~/Documents/contract.pdf
+
+# Send to specific device IDs
+gaur-share send --to android-897a85f2,android-f3dd4a01 ~/Documents/report.pdf
+
+# Send a notification to a device
+gaur-share notify "Lavander" "Build finished" "The release APK is ready"
+
+# Send a notification to every online device
+gaur-share notify --all "Build finished" "The release APK is ready"
 ```
 
 #### On Android (`gaurPN`)
-1. In gaurPN, edit your active server profile to set your **Cluster Token** and relay address (`127.0.0.1:9876`).
+1. In gaurPN, edit your active server profile to set your **Cluster Token** and relay address (`198.51.100.1:9876`).
 2. When connected to the VPN, the **Cluster Devices** card displays online peers.
 3. Tap any peer to pick a file and send it. Incoming files stream straight into your device's `Downloads` folder.
+
+### 4. Clipboard Sync
+
+Clipboard sync rides the same authenticated WebSocket as file sharing. It is enabled per-device.
+
+**Android**
+1. Open **Settings → Clipboard Sync** and enable **Sync clipboard**.
+2. Grant **Display over other apps** when prompted. Android 10+ does not allow a background app to read the clipboard; gaurPN briefly adds a 1x1 focusable overlay to read it, then removes it.
+3. Copy text or an image on any device. The newest clip is sent to every other online cluster device.
+4. Leave **Include sensitive clips** off unless you explicitly want passwords and OTP codes synced.
+
+**Desktop**
+The daemon has three clipboard sources:
+
+- `-clipboard-source=socket` (recommended with Quickshell): Quickshell watches cliphist's BoltDB with inotify and sends new clips over a Unix socket. The daemon never polls the clipboard. This is what the included `~/.config/quickshell/services/ClipboardSync.qml` uses.
+- `-clipboard-source=poll` (default for standalone use): the daemon polls the clipboard once per second. Use this only when no event source is available.
+- `-clipboard-source=off` (or `-clipboard=false`): disable clipboard sync. Flags go before the subcommand: `gaur-share -clipboard-source=off daemon`.
+
+The socket defaults to `$XDG_CACHE_HOME/gaur-share/clipboard.sock` (usually `~/.cache/gaur-share/clipboard.sock`).
+
+- Linux: install `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11). Image sync requires one of those tools.
+- macOS: text works out of the box; install `pngpaste` for image sync.
+- Windows: uses built-in PowerShell clipboard cmdlets.
+
+Android will show its standard "pasted from clipboard" privacy toast when a new clip is captured. That indicator is enforced by the platform and cannot be suppressed without being the default IME or using root/Shizuku.
 
 For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.md).
 
@@ -269,8 +385,14 @@ For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.m
 
 - **Zero Telemetry**: No trackers, no analytics SDKs, no third-party network calls.
 - **Local Storage**: Access keys and cluster tokens stay on your device in Jetpack DataStore.
-- **Zero-Knowledge Relay**: The relay server runs on loopback inside the VPN server, processes streams in memory, and possesses no keys to decrypt inner payloads.
+- **Zero-Knowledge Relay**: The relay server runs on loopback inside the VPN server and possesses no keys to decrypt inner payloads. It stages opaque ciphertext chunks on disk for resume and evicts them by TTL and a byte cap.
 - **Isolated Transport**: File transfers do not touch local LAN broadcast or multicast domains, protecting peer visibility on public Wi-Fi networks.
+- **DNS Privacy**: DNS queries are answered by AdGuard Home on the VPS through the tunnel. No public resolver sees them unless you explicitly choose System mode.
+- **Kill Switch**: While reconnecting, the TUN stays up and drops traffic instead of falling back to the physical network.
+- **Trusted Devices**: Auto-accept can be restricted to pinned device IDs on Android (Settings → Trusted devices) and on the desktop (`gaur-share trust` / `trust-mode`). Revoking removes the peer from this device's trust list; rotate the cluster token to remove its relay access entirely.
+- **Sealed Sender**: v3 messages omit the sender from the relay-visible envelope. The relay routes by target, timestamp, and kind only.
+- **Ephemeral Mailbox**: Offline messages are ciphertext with a TTL (default 1h) and byte cap (default 16 MiB); the relay never parses them.
+- **Notification Privacy**: Mirrored notifications are sealed; the relay sees only that a notification event exists. The source app ignores gaurPN's own notifications to prevent loops.
 
 ---
 
