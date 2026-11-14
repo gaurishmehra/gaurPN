@@ -224,3 +224,242 @@ func TestRelayAddsTimestampAndSenderIdentity(t *testing.T) {
 		return
 	}
 }
+
+func TestSealedForwardStripsSenderIdentity(t *testing.T) {
+	token := []byte("test-cluster-token-secret")
+	hub := NewHub(token, NewChunkStore("", 0, 0))
+	defer hub.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	connA, _, err := websocket.DefaultDialer.Dial(wsURL+"?device_id=device-a&name=DeviceA&token=test-cluster-token-secret", nil)
+	if err != nil {
+		t.Fatalf("dial A: %v", err)
+	}
+	defer connA.Close()
+
+	connB, _, err := websocket.DefaultDialer.Dial(wsURL+"?device_id=device-b&name=DeviceB&token=test-cluster-token-secret", nil)
+	if err != nil {
+		t.Fatalf("dial B: %v", err)
+	}
+	defer connB.Close()
+
+	time.Sleep(100 * time.Millisecond)
+
+	// A sealed envelope from a buggy or hostile client that smuggles sender
+	// identity fields alongside the opaque payload.
+	if err := connA.WriteJSON(map[string]interface{}{
+		"type":      "sealed",
+		"target_id": "device-b",
+		"msg_id":    "sealed-1",
+		"kind":      "text",
+		"payload":   "opaque-ciphertext",
+		"from_id":   "device-a",
+		"from_name": "DeviceA",
+	}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	_ = connB.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		_, data, err := connB.ReadMessage()
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		var envelope map[string]interface{}
+		if err := json.Unmarshal(data, &envelope); err != nil {
+			continue
+		}
+		if envelope["type"] != "sealed" {
+			continue
+		}
+		if _, ok := envelope["from_id"]; ok {
+			t.Fatalf("sealed forward leaked from_id: %v", envelope["from_id"])
+		}
+		if _, ok := envelope["from_name"]; ok {
+			t.Fatalf("sealed forward leaked from_name: %v", envelope["from_name"])
+		}
+		if envelope["msg_id"] != "sealed-1" || envelope["kind"] != "text" || envelope["payload"] != "opaque-ciphertext" {
+			t.Fatalf("sealed fields were not forwarded intact: %v", envelope)
+		}
+		if _, ok := envelope["relay_ts"].(float64); !ok {
+			t.Fatalf("relay_ts missing or not numeric: %v", envelope["relay_ts"])
+		}
+		return
+	}
+}
+
+// waitPipeRole polls until the given role is claimed on the transfer's pipe
+// session, proving a connection is live in that role.
+func waitPipeRole(t *testing.T, hub *Hub, transferID, role string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		hub.pipeMu.Lock()
+		session := hub.pipes[transferID]
+		claimed := session != nil &&
+			((role == "sender" && session.senderActive) ||
+				(role == "receiver" && session.receiverActive))
+		hub.pipeMu.Unlock()
+		if claimed {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("role %s on transfer %s was never claimed", role, transferID)
+}
+
+func TestPipeRoleGuardRejectsSecondSender(t *testing.T) {
+	hub := NewHub([]byte("role-token"), NewChunkStore("", 0, 0))
+	defer hub.Close()
+	transferID := "tx-role-sender"
+
+	// Sender 1 joins and blocks waiting for a receiver.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodPost, "/pipe?transfer_id="+transferID+"&role=sender&token=role-token", strings.NewReader("payload"))
+		req = req.WithContext(ctx1)
+		hub.handlePipe(httptest.NewRecorder(), req)
+	}()
+	waitPipeRole(t, hub, transferID, "sender")
+
+	// A second live sender on the same transfer is refused.
+	req2 := httptest.NewRequest(http.MethodPost, "/pipe?transfer_id="+transferID+"&role=sender&token=role-token", strings.NewReader("evil-interleave"))
+	rec2 := httptest.NewRecorder()
+	hub.handlePipe(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("second sender status = %d, want 409", rec2.Code)
+	}
+
+	cancel1()
+	wg.Wait()
+}
+
+func TestPipeRoleGuardRejectsSecondReceiver(t *testing.T) {
+	hub := NewHub([]byte("role-token"), NewChunkStore("", 0, 0))
+	defer hub.Close()
+	transferID := "tx-role-receiver"
+
+	// Receiver 1 joins and blocks waiting for a sender.
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req := httptest.NewRequest(http.MethodGet, "/pipe?transfer_id="+transferID+"&role=receiver&token=role-token", nil)
+		req = req.WithContext(ctx1)
+		hub.handlePipe(httptest.NewRecorder(), req)
+	}()
+	waitPipeRole(t, hub, transferID, "receiver")
+
+	// A second live receiver on the same transfer is refused.
+	req2 := httptest.NewRequest(http.MethodGet, "/pipe?transfer_id="+transferID+"&role=receiver&token=role-token", nil)
+	rec2 := httptest.NewRecorder()
+	hub.handlePipe(rec2, req2)
+	if rec2.Code != http.StatusConflict {
+		t.Fatalf("second receiver status = %d, want 409", rec2.Code)
+	}
+
+	cancel1()
+	wg.Wait()
+}
+
+func TestPipeRoleFreesAfterSenderDisconnect(t *testing.T) {
+	hub := NewHub([]byte("role-token"), NewChunkStore("", 0, 0))
+	defer hub.Close()
+	transferID := "tx-role-free"
+
+	// Sender 1 joins with a short-lived context and never gets a receiver;
+	// its handler returns and must release the sender slot.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel1()
+	req1 := httptest.NewRequest(http.MethodPost, "/pipe?transfer_id="+transferID+"&role=sender&token=role-token", strings.NewReader("x"))
+	req1 = req1.WithContext(ctx1)
+	hub.handlePipe(httptest.NewRecorder(), req1)
+
+	// Sender 2 joins afterwards and must be allowed to claim the freed slot.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	rec2 := httptest.NewRecorder()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		req2 := httptest.NewRequest(http.MethodPost, "/pipe?transfer_id="+transferID+"&role=sender&token=role-token", strings.NewReader("y"))
+		req2 = req2.WithContext(ctx2)
+		hub.handlePipe(rec2, req2)
+	}()
+	waitPipeRole(t, hub, transferID, "sender")
+	cancel2()
+	wg.Wait()
+
+	if rec2.Code == http.StatusConflict {
+		t.Fatalf("new sender after disconnect was refused with 409")
+	}
+}
+
+func TestHealthConcurrentWithWSChurn(t *testing.T) {
+	hub := NewHub([]byte("race-token"), NewChunkStore("", 0, 0))
+	defer hub.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", hub.handleWS)
+	mux.HandleFunc("/health", hub.handleHealth)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+	wsBase := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Hammer /health while peers churn; the race detector fails the test if
+	// the handler reads the peers map without the hub mutex.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client := &http.Client{Timeout: 2 * time.Second}
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				resp, err := client.Get(server.URL + "/health")
+				if err == nil {
+					resp.Body.Close()
+				}
+			}
+		}()
+	}
+
+	for i := 0; i < 4; i++ {
+		deviceID := fmt.Sprintf("race-device-%d", i)
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				conn, _, err := websocket.DefaultDialer.Dial(wsBase+"/ws?device_id="+id+"&token=race-token", nil)
+				if err == nil {
+					conn.Close()
+				}
+			}
+		}(deviceID)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
