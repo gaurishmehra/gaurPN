@@ -40,6 +40,11 @@ dropped connection resumes instead of restarting.
 - The offer carries `chunk_size`, `chunk_count`, `file_hash`, and the
   per-chunk SHA-256 list. The offer auth tag binds all of them:
   `offer:v2:<transfer_id>:<receiver_id>:<sender_pub>:<file_hash>:<chunk_count>:<chunk_size>`.
+- The legacy v1 tag also binds its offer metadata (since v3.1):
+  `offer:v1:<transfer_id>:<receiver_id>:<sender_pub>:<base64(file_name)>:<file_size>`,
+  computed over the raw pre-sanitization filename. Both current clients verify
+  this format; peers older than v3.1 that sign the shorter `offer:` tag are
+  rejected.
 
 ### Per-chunk encryption
 
@@ -57,16 +62,40 @@ chunk from another session.
 
 | Method | Path | Purpose |
 |---|---|---|
-| `PUT` | `/chunk?transfer_id=&session_id=&index=` | Stage one ciphertext chunk |
-| `GET` | `/chunk?transfer_id=&session_id=&index=` | Fetch one ciphertext chunk |
+| `PUT` | `/chunk?transfer_id=&session_id=&index=&device_id=&cap=` | Stage one ciphertext chunk |
+| `GET` | `/chunk?transfer_id=&session_id=&index=&device_id=&cap=` | Fetch one ciphertext chunk |
 | `GET` | `/chunk/status?transfer_id=&session_id=&count=` | List staged indices |
-| `DELETE` | `/transfer?transfer_id=&session_id=` | Drop a completed transfer |
+| `DELETE` | `/transfer?transfer_id=&session_id=&device_id=&cap=` | Drop a completed transfer |
 
-All endpoints require `X-Gaur-Token` (the derived relay token). Chunks are
+All endpoints require `X-Gaur-Token` (the derived relay token). The token may
+also arrive as a `token` query parameter from pre-v3.1 clients; current clients
+always send the header so the token never appears in a URL. Chunks are
 ciphertext; the relay cannot read them. The store is a cache, not durable
 storage: it is cleared on relay restart, evicted after `-chunk-ttl` (default
 24h), and bounded by `-chunk-max-bytes` (default 8 GiB). Set
 `-chunk-dir=""` to keep chunks in memory only.
+
+### Transfer ownership (v3.1)
+
+Chunk and transfer requests carry two extra params: `device_id` (the caller)
+and `cap = hex(HMAC-SHA256(K_peer, "gaur-cap-v1:" + transfer_id + ":" + session_id))`.
+
+- The first `PUT` for a transfer records its creator's `device_id` as the owner.
+- Later requests are allowed for the owner, for any request with a valid `cap`
+  (all cluster members can compute it), or — for legacy clients that send
+  neither param — in "open mode" with a deprecation log. Once an owner exists,
+  legacy open-mode access is refused with 403.
+- This is relay-side policy, not a cryptographic boundary: every cluster member
+  holds `K_peer` and can mint caps. Per-device identity keys (protocol v4) are
+  the planned real fix.
+
+The relay also enforces: one sender and one receiver per `/pipe` transfer (a
+second connection claiming an occupied role gets 409), `device_id` matching
+`^[A-Za-z0-9._-]{1,64}$` and names ≤128 bytes on `/ws` (400 otherwise), a
+`-max-peers` cap (default 32; a reconnecting device still replaces itself),
+a per-IP auth-failure budget (10 failures/minute → 429 with `Retry-After`),
+and a startup bind guard that refuses to listen on any address not assigned
+to a loopback interface.
 
 ### Resume flow
 
@@ -456,8 +485,13 @@ v3 messages use a sealed envelope:
 - Key: `K_seal = HMAC-SHA256(K_peer, "gaur-seal-v3:" + kind)`.
 - AAD: `seal:v3:<target_id>:<msg_id>:<ts>:<kind>`.
 - The inner JSON includes `sender_id`, `sender_name`, and the payload.
-- The relay does **not** add `from_id`/`from_name` for `sealed` messages. It
-  adds `relay_ts` and forwards to `target_id`.
+- The relay does **not** add `from_id`/`from_name` for `sealed` messages, and
+  strips them if a client includes them. It adds only `relay_ts` and forwards
+  to `target_id`.
+- Receivers drop any sealed envelope whose `target_id` does not match their own
+  device id (defense against a malicious relay redirecting mail), and dedup by
+  `msg_id` so a replayed envelope is processed once. `media_command`
+  envelopes additionally expire 30 s after their `relay_ts` (§13).
 - If the target is offline, the relay stores the envelope in an in-memory
   mailbox with a TTL (default 1h) and byte cap (default 16 MiB). On reconnect,
   the mailbox is drained to the device.
