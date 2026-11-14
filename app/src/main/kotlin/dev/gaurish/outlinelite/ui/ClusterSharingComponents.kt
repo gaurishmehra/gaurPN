@@ -42,6 +42,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -56,6 +57,7 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.KeyRepository
+import dev.gaurish.outlinelite.data.TrustedDeviceRepository
 import dev.gaurish.outlinelite.transfer.ClusterPeer
 import dev.gaurish.outlinelite.transfer.RelayManager
 import dev.gaurish.outlinelite.transfer.TransferState
@@ -64,6 +66,7 @@ import dev.gaurish.outlinelite.tunnel.TunnelService
 import dev.gaurish.outlinelite.tunnel.TunnelStatus
 import dev.gaurish.outlinelite.tunnel.TunnelState
 import androidx.compose.ui.res.stringResource
+import kotlinx.coroutines.launch
 
 @Composable
 fun LanAccessRow(
@@ -270,14 +273,22 @@ fun ClusterSharingSection(
 @Composable
 fun ShareTargetDialog(
     uris: List<Uri>,
+    text: String? = null,
+    openOnArrival: Boolean = false,
     onConnectToVpn: () -> Unit,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
     val token by KeyRepository.observeClusterToken(context).collectAsStateWithLifecycle(initialValue = "")
+    val trustedDevices by TrustedDeviceRepository.observe(context)
+        .collectAsStateWithLifecycle(initialValue = emptyList())
     val tunnelStatus by TunnelState.flow.collectAsStateWithLifecycle()
     val otherPeers = remember(peers) { peers.filter { !it.isSelf } }
+    val offlineTrusted = remember(trustedDevices, otherPeers) {
+        trustedDevices.filter { device -> otherPeers.none { it.id == device.id } }
+    }
     val isVpnConnected = tunnelStatus.phase == TunnelPhase.CONNECTED
     val hasAvailablePeers = isVpnConnected && otherPeers.isNotEmpty()
     val emptyStateMessage = when {
@@ -298,6 +309,28 @@ fun ShareTargetDialog(
                     .heightIn(max = 420.dp)
                     .verticalScroll(rememberScrollState()),
             ) {
+                if (text != null) {
+                    Text(
+                        if (text.startsWith("http://") || text.startsWith("https://")) {
+                            "Send this link to a device:"
+                        } else {
+                            "Send this text to a device:"
+                        },
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                }
+
                 if (!hasAvailablePeers) {
                     Text(
                         stringResource(emptyStateMessage),
@@ -305,17 +338,98 @@ fun ShareTargetDialog(
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
-                    Text(
-                        stringResource(R.string.share_select_destination),
-                        fontSize = 13.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(8.dp))
+                    if (text == null) {
+                        Text(
+                            stringResource(R.string.share_select_destination),
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    val textKind = if (text?.startsWith("http://") == true ||
+                        text?.startsWith("https://") == true
+                    ) {
+                        "url"
+                    } else {
+                        "text"
+                    }
                     otherPeers.forEach { peer ->
                         PeerRow(
                             peer = peer,
+                            actionLabel = if (text != null) "Send" else "Send Files",
                             onSendClick = {
-                                RelayManager.sendFiles(context, peer, uris)
+                                if (text != null) {
+                                    scope.launch {
+                                        RelayManager.sendSealedText(context, peer.id, text, textKind)
+                                    }
+                                } else {
+                                    RelayManager.sendFilesV3(
+                                        context,
+                                        listOf(peer),
+                                        uris,
+                                        offline = false,
+                                    )
+                                }
+                                onDismiss()
+                            },
+                        )
+                    }
+                    if (otherPeers.size > 1) {
+                        Spacer(Modifier.height(4.dp))
+                        TextButton(
+                            onClick = {
+                                if (text != null) {
+                                    otherPeers.forEach { peer ->
+                                        scope.launch {
+                                            RelayManager.sendSealedText(context, peer.id, text, textKind)
+                                        }
+                                    }
+                                } else {
+                                    // One upload, many recipients: the v3 path
+                                    // stages the ciphertext once and sends a
+                                    // sealed offer to each device.
+                                    RelayManager.sendFilesV3(context, otherPeers, uris, offline = false)
+                                }
+                                onDismiss()
+                            },
+                        ) {
+                            Text("Send to all ${otherPeers.size} devices", fontSize = 12.sp)
+                        }
+                    }
+                }
+
+                if (isVpnConnected && offlineTrusted.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "Offline — queued until they reconnect",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(6.dp))
+                    offlineTrusted.forEach { device ->
+                        PeerRow(
+                            peer = ClusterPeer(device.id, device.name),
+                            actionLabel = "Queue",
+                            onSendClick = {
+                                if (text != null) {
+                                    val kind = if (text.startsWith("http://") ||
+                                        text.startsWith("https://")
+                                    ) {
+                                        "url"
+                                    } else {
+                                        "text"
+                                    }
+                                    scope.launch {
+                                        RelayManager.sendSealedText(context, device.id, text, kind)
+                                    }
+                                } else {
+                                    RelayManager.sendFilesV3(
+                                        context,
+                                        listOf(ClusterPeer(device.id, device.name)),
+                                        uris,
+                                        offline = true,
+                                    )
+                                }
                                 onDismiss()
                             },
                         )
@@ -358,6 +472,7 @@ fun ShareTargetDialog(
 @Composable
 private fun PeerRow(
     peer: ClusterPeer,
+    actionLabel: String = "Send Files",
     onSendClick: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
@@ -393,7 +508,7 @@ private fun PeerRow(
                 contentColor = Color(0xFF04231A),
             ),
         ) {
-            Text("Send Files", fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            Text(actionLabel, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -561,8 +676,13 @@ private fun TransferDialog(
                     }
                 }
                 else -> {
-                    TextButton(onClick = onDismiss) {
-                        Text("Dismiss")
+                    TextButton(
+                        onClick = {
+                            RelayManager.cancelActiveTransfers()
+                            onDismiss()
+                        }
+                    ) {
+                        Text("Cancel")
                     }
                 }
             }

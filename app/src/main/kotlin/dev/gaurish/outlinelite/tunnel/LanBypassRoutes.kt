@@ -15,6 +15,17 @@ import android.net.VpnService
  */
 object LanBypassRoutes {
 
+    /**
+     * IPv6 global-unicast space. Routing only 2000::/3 (plus the NAT64
+     * prefixes) keeps link-local (fe80::/10), unique-local (fc00::/7), and
+     * multicast (ff00::/8) on the physical network when LAN access is on.
+     */
+    val IPV6_GLOBAL_ROUTES = listOf(
+        "2000::" to 3,
+        "64:ff9b::" to 96,
+        "64:ff9b:1::" to 48,
+    )
+
     val EXCLUDE_LAN_IPV4_ROUTES = listOf(
         "1.0.0.0" to 8,
         "2.0.0.0" to 7,
@@ -64,14 +75,31 @@ object LanBypassRoutes {
         "208.0.0.0" to 4
     )
 
-    fun applyRoutes(builder: VpnService.Builder, allowLanAccess: Boolean) {
+    fun applyRoutes(
+        builder: VpnService.Builder,
+        allowLanAccess: Boolean,
+        dnsServers: List<String> = emptyList(),
+    ) {
         if (!allowLanAccess) {
             builder.addRoute("0.0.0.0", 0)
+            builder.addRoute("::", 0)
         } else {
             for ((prefix, length) in EXCLUDE_LAN_IPV4_ROUTES) {
                 builder.addRoute(prefix, length)
             }
+            for ((prefix, length) in IPV6_GLOBAL_ROUTES) {
+                builder.addRoute(prefix, length)
+            }
         }
-        builder.addRoute("::", 0)
+
+        // A /32 (or /128) host route is more specific than the LAN-bypass
+        // excludes, so the resolver stays reachable through the tunnel even
+        // when it lives on a private address such as AdGuard on the VPS.
+        for (server in dnsServers) {
+            val clean = server.trim()
+            if (clean.isEmpty()) continue
+            val prefix = if (clean.contains(":")) 128 else 32
+            runCatching { builder.addRoute(clean, prefix) }
+        }
     }
 }

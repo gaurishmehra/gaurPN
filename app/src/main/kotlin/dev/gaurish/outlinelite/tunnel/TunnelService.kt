@@ -23,6 +23,7 @@ import androidx.core.content.ContextCompat
 import dev.gaurish.outlinelite.MainActivity
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.AccessKey
+import dev.gaurish.outlinelite.data.DnsMode
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.SplitTunnelRepository
 import dev.gaurish.outlinelite.outlinev.Outlinev
@@ -55,6 +56,13 @@ class TunnelService : VpnService() {
     private var goTunnel: dev.gaurish.outlinelite.tun2socks.Tunnel? = null
     private var tunPfd: ParcelFileDescriptor? = null
     private var activeConfig: Pair<String, String>? = null
+
+    /**
+     * Cached for [fail], which is not a suspend function. Refreshed on every
+     * connect, so a settings change applies on the next reconnect.
+     */
+    @Volatile
+    private var blockOnReconnect = true
     private val tunnelDispatcher = Dispatchers.IO.limitedParallelism(1)
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var watchdog: Job? = null
@@ -144,27 +152,40 @@ class TunnelService : VpnService() {
 
     private suspend fun connectTunnel(configJson: String, gen: Int) {
         Log.i(TAG, "connect start (gen $gen, lan=${TunnelState.status.allowLanAccess})")
-        val builder = Builder()
-            .setSession("gaurPN")
-            .setMtu(MTU)
-            .addAddress("26.26.26.1", 32)
-            .addAddress("fd00::1", 128)
-            .addDnsServer("8.8.8.8")
-            .addDnsServer("1.1.1.1")
-            .addDnsServer("2001:4860:4860::8888")
-            .addDnsServer("2606:4700:4700::1111")
+        blockOnReconnect = runCatching {
+            KeyRepository.blockOnReconnect(this@TunnelService)
+        }.getOrDefault(true)
+        val dnsServers = resolveDnsServers()
 
-        LanBypassRoutes.applyRoutes(builder, TunnelState.status.allowLanAccess)
+        // Reuse the interface kept alive by the kill switch. Rebuilding it on
+        // every retry would open a leak window between close and establish.
+        val pfd = tunPfd ?: run {
+            val builder = Builder()
+                .setSession("gaurPN")
+                .setMtu(MTU)
+                .addAddress("26.26.26.1", 32)
+                .addAddress("fd00::1", 128)
 
-        // Per-app split tunneling
-        val excluded = runCatching {
-            SplitTunnelRepository.getExcludedPackages(this@TunnelService)
-        }.getOrDefault(emptySet())
-        for (pkg in excluded) {
-            runCatching { builder.addDisallowedApplication(pkg) }
+            for (dns in dnsServers) {
+                runCatching { builder.addDnsServer(dns) }
+            }
+
+            LanBypassRoutes.applyRoutes(
+                builder,
+                TunnelState.status.allowLanAccess,
+                dnsServers,
+            )
+
+            // Per-app split tunneling
+            val excluded = runCatching {
+                SplitTunnelRepository.getExcludedPackages(this@TunnelService)
+            }.getOrDefault(emptySet())
+            for (pkg in excluded) {
+                runCatching { builder.addDisallowedApplication(pkg) }
+            }
+
+            builder.establish()
         }
-
-        val pfd = builder.establish()
         if (pfd == null) {
             userStopped = true // consent not granted; retrying would be futile
             fail("VPN permission was denied")
@@ -176,6 +197,7 @@ class TunnelService : VpnService() {
         if (gen != generation || userStopped) {
             Log.i(TAG, "connect superseded (gen $gen) — releasing, current gen $generation")
             runCatching { tunnel.disconnect() }
+            tunPfd = null
             runCatching { pfd.close() }
             return
         }
@@ -235,7 +257,7 @@ class TunnelService : VpnService() {
         stopNetworkMonitoring()
         generation += 1
         val gen = generation
-        cleanupTunnel()
+        cleanupTunnel(keepInterface = blockOnReconnect)
         val cfg = activeConfig
         if (userStopped || cfg == null) {
             giveUp(message)
@@ -408,6 +430,9 @@ class TunnelService : VpnService() {
 
     /** Final disconnect: clears state and removes the service surface. */
     private fun giveUp(message: String) {
+        // A recoverable failure may have left the interface up as a kill
+        // switch; a final disconnect must release it so traffic flows again.
+        cleanupTunnel(keepInterface = false)
         TunnelState.update {
             it.copy(
                 phase = TunnelPhase.DISCONNECTED,
@@ -421,13 +446,20 @@ class TunnelService : VpnService() {
         notifyExternal(this)
     }
 
-    /** Closes the Go tunnel and the TUN file descriptor. */
-    private fun cleanupTunnel() {
+    /**
+     * Closes the Go tunnel. When [keepInterface] is true the TUN fd stays
+     * open with its routes intact, so packets are written into a tunnel that
+     * has no reader and are dropped. That is the kill switch: no traffic
+     * escapes directly while the reconnect backoff runs.
+     */
+    private fun cleanupTunnel(keepInterface: Boolean = false) {
         updateUnderlyingNetworks(null)
         runCatching { goTunnel?.disconnect() }
         goTunnel = null
-        tunPfd?.let { fd -> runCatching { fd.close() } }
-        tunPfd = null
+        if (!keepInterface) {
+            tunPfd?.let { fd -> runCatching { fd.close() } }
+            tunPfd = null
+        }
         dev.gaurish.outlinelite.transfer.RelayManager.stop()
     }
 
@@ -454,6 +486,31 @@ class TunnelService : VpnService() {
     }
 
     // ---------- protection helpers ----------
+
+    /**
+     * Resolves the DNS servers handed to VpnService. ADGUARD is the default:
+     * every query is routed through the tunnel to AdGuard Home on the VPS,
+     * so filtering and query logs stay on infrastructure the user controls.
+     */
+    private suspend fun resolveDnsServers(): List<String> {
+        val mode = runCatching { KeyRepository.getDnsMode(this) }
+            .getOrDefault(DnsMode.ADGUARD)
+        val configured = runCatching { KeyRepository.getDnsServers(this) }
+            .getOrDefault(KeyRepository.DEFAULT_DNS_SERVERS)
+        return when (mode) {
+            DnsMode.ADGUARD -> listOf(
+                configured.ifBlank { KeyRepository.DEFAULT_DNS_SERVERS }
+            )
+            DnsMode.SYSTEM -> systemResolverCsv()
+                .split(",")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+            DnsMode.CUSTOM -> configured
+                .split(",")
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+        }
+    }
 
     /** Comma-separated system DNS list for the Go resolver (excluding VPN virtual interface). */
     private fun systemResolverCsv(): String {

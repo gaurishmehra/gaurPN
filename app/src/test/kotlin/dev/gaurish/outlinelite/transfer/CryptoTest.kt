@@ -139,4 +139,42 @@ class CryptoTest {
             tempDir.deleteRecursively()
         }
     }
+
+    @Test
+    fun testTextKeyIsDomainSeparatedAndAuthenticated() {
+        val (_, peerKey) = Crypto.deriveSubKeys("test-cluster-token")
+        val textKey = Crypto.deriveTextKey(peerKey)
+        val clipboardKey = Crypto.deriveClipboardKey(peerKey)
+
+        assertEquals(32, textKey.size)
+        org.junit.Assert.assertFalse(textKey.contentEquals(clipboardKey))
+
+        val plaintext = "https://example.com/recipe".toByteArray(Charsets.UTF_8)
+        val nonce = ByteArray(12) { 7 }
+        val aad = "text:android-a:msg-1:123:url".toByteArray(Charsets.UTF_8)
+        val ciphertext = Crypto.encryptGcm(textKey, nonce, plaintext, aad)
+        assertArrayEquals(plaintext, Crypto.decryptGcm(textKey, nonce, ciphertext, aad))
+
+        val wrongAad = "clipboard:android-a:msg-1:123:text:text/plain".toByteArray(Charsets.UTF_8)
+        var rejected = false
+        try {
+            Crypto.decryptGcm(textKey, nonce, ciphertext, wrongAad)
+        } catch (_: Exception) {
+            rejected = true
+        }
+        org.junit.Assert.assertTrue("text payload must not authenticate under clipboard AAD", rejected)
+    }
+
+    @Test
+    fun testFileAndSealKeysAreDomainSeparated() {
+        val (_, peerKey) = Crypto.deriveSubKeys("test-cluster-token")
+        val fileKey = Crypto.deriveFileKey(peerKey, "tx-1")
+        val sealKey = Crypto.deriveSealKey(peerKey, "offer")
+
+        assertEquals(32, fileKey.size)
+        assertEquals(32, sealKey.size)
+        org.junit.Assert.assertFalse(fileKey.contentEquals(sealKey))
+        org.junit.Assert.assertFalse(fileKey.contentEquals(Crypto.deriveFileKey(peerKey, "tx-2")))
+        org.junit.Assert.assertTrue(fileKey.contentEquals(Crypto.deriveFileKey(peerKey, "tx-1")))
+    }
 }

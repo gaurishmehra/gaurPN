@@ -3,11 +3,13 @@ package dev.gaurish.outlinelite.transfer
 import java.io.File
 import java.math.BigInteger
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.MessageDigest
 import java.security.PublicKey
+import java.security.SecureRandom
 import java.security.interfaces.ECPublicKey
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.ECParameterSpec
@@ -127,6 +129,146 @@ object Crypto {
 
         return Pair(relayToken, peerCryptoKey)
     }
+
+    /**
+     * Domain-separated key for clipboard messages. The peer key is already
+     * derived from the cluster token, so clipboard payloads never use the
+     * token directly and cannot be confused with file-transfer keys.
+     */
+    fun deriveClipboardKey(peerCryptoKey: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        return mac.doFinal("gaur-clipboard-v1".toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * Domain-separated key for one-shot text/link shares. Kept separate from
+     * the clipboard key so a text message can never be replayed as a
+     * clipboard update or vice versa.
+     */
+    fun deriveTextKey(peerCryptoKey: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        return mac.doFinal("gaur-text-v1".toByteArray(Charsets.UTF_8))
+    }
+
+    /** Domain-separated key for mirrored notification payloads. */
+    fun deriveNotificationKey(peerCryptoKey: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        return mac.doFinal("gaur-notification-v1".toByteArray(Charsets.UTF_8))
+    }
+
+    /**
+     * Shared content key for v3 transfers. One uploaded ciphertext can be
+     * fetched by every recipient; the relay never sees the key.
+     */
+    fun deriveFileKey(peerCryptoKey: ByteArray, transferId: String): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        return mac.doFinal("gaur-shared-file-v1:$transferId".toByteArray(Charsets.UTF_8))
+    }
+
+    /** Key for a sealed v3 envelope, domain-separated by message kind. */
+    fun deriveSealKey(peerCryptoKey: ByteArray, kind: String): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        return mac.doFinal("gaur-seal-v3:$kind".toByteArray(Charsets.UTF_8))
+    }
+
+    fun randomBytes(size: Int): ByteArray {
+        val bytes = ByteArray(size)
+        SecureRandom().nextBytes(bytes)
+        return bytes
+    }
+
+    fun encryptGcm(
+        key: ByteArray,
+        nonce: ByteArray,
+        plaintext: ByteArray,
+        aad: ByteArray,
+    ): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(aad)
+        return cipher.doFinal(plaintext)
+    }
+
+    fun decryptGcm(
+        key: ByteArray,
+        nonce: ByteArray,
+        ciphertext: ByteArray,
+        aad: ByteArray,
+    ): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(aad)
+        return cipher.doFinal(ciphertext)
+    }
+
+    fun sha256Hex(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+    }
+
+    fun hmacSha256(key: ByteArray, message: ByteArray): ByteArray {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(key, "HmacSHA256"))
+        return mac.doFinal(message)
+    }
+
+    /**
+     * Content-addressed transfer id. The relay sees only this HMAC, never the
+     * raw file hash, and the same bytes always resume the same transfer.
+     */
+    fun deriveTransferId(peerCryptoKey: ByteArray, fileHash: String): String {
+        val digest = hmacSha256(
+            peerCryptoKey,
+            "gaur-transfer-id-v1".toByteArray(Charsets.UTF_8) + fileHash.toByteArray(Charsets.UTF_8),
+        )
+        return "tx-" + digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }.take(32)
+    }
+
+    /** 96-bit GCM nonce: four zero bytes followed by the big-endian chunk index. */
+    fun chunkNonce(index: Int): ByteArray {
+        val nonce = ByteArray(12)
+        ByteBuffer.wrap(nonce).order(ByteOrder.BIG_ENDIAN).putLong(4, index.toLong())
+        return nonce
+    }
+
+    /**
+     * Binds a chunk to its transfer, session, index, count, and file size. A
+     * relay cannot reorder chunks or move them between transfers without
+     * failing authentication.
+     */
+    fun chunkAad(
+        transferId: String,
+        sessionId: String,
+        index: Int,
+        chunkCount: Int,
+        fileSize: Long,
+    ): ByteArray = "chunk:v2:$transferId:$sessionId:$index:$chunkCount:$fileSize".toByteArray(Charsets.UTF_8)
+
+    fun encryptChunkAad(key: ByteArray, nonce: ByteArray, plaintext: ByteArray, aad: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(aad)
+        return cipher.doFinal(plaintext)
+    }
+
+    fun decryptChunkAad(key: ByteArray, nonce: ByteArray, ciphertext: ByteArray, aad: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
+        cipher.updateAAD(aad)
+        return cipher.doFinal(ciphertext)
+    }
+
+    /** Commits to the receiver's resume bitmap so a relay cannot strip chunks. */
+    fun haveHash(have: Collection<Int>): String =
+        sha256Hex(have.sorted().joinToString(",").toByteArray(Charsets.UTF_8))
+
+    fun randomHex(size: Int): String =
+        randomBytes(size).joinToString("") { "%02x".format(it.toInt() and 0xFF) }
 
     fun computeAuthTag(peerCryptoKey: ByteArray, message: String): String {
         val mac = Mac.getInstance("HmacSHA256")

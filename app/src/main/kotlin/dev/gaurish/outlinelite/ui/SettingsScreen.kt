@@ -2,6 +2,7 @@ package dev.gaurish.outlinelite.ui
 
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
@@ -54,14 +55,23 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationManagerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.R
+import dev.gaurish.outlinelite.data.DnsMode
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.SplitTunnelRepository
 import dev.gaurish.outlinelite.data.ThemeMode
+import dev.gaurish.outlinelite.data.TransferSettingsRepository
+import dev.gaurish.outlinelite.transfer.ClipboardSyncManager
+import dev.gaurish.outlinelite.transfer.ClipboardSyncPhase
+import dev.gaurish.outlinelite.transfer.MIRROR_CHANNEL_ID
+import dev.gaurish.outlinelite.transfer.MediaSessionBridge
+import dev.gaurish.outlinelite.transfer.NotificationMirrorManager
+import dev.gaurish.outlinelite.transfer.RelayManager
 import kotlinx.coroutines.launch
 
 /**
@@ -71,6 +81,8 @@ import kotlinx.coroutines.launch
 fun SettingsScreen(
     onBack: () -> Unit,
     onOpenSplitTunnel: () -> Unit,
+    onOpenHistory: () -> Unit,
+    onOpenTrustedDevices: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -90,6 +102,34 @@ fun SettingsScreen(
         .collectAsStateWithLifecycle(initialValue = "")
     val relayAddress by KeyRepository.observeRelayAddress(context)
         .collectAsStateWithLifecycle(initialValue = KeyRepository.DEFAULT_RELAY_ADDR)
+    val dnsMode by KeyRepository.observeDnsMode(context)
+        .collectAsStateWithLifecycle(initialValue = DnsMode.ADGUARD)
+    val dnsServers by KeyRepository.observeDnsServers(context)
+        .collectAsStateWithLifecycle(initialValue = KeyRepository.DEFAULT_DNS_SERVERS)
+    val blockOnReconnect by KeyRepository.observeBlockOnReconnect(context)
+        .collectAsStateWithLifecycle(initialValue = true)
+    val clipboardSync by KeyRepository.observeClipboardSync(context)
+        .collectAsStateWithLifecycle(initialValue = false)
+    val clipboardSensitive by KeyRepository.observeClipboardSensitive(context)
+        .collectAsStateWithLifecycle(initialValue = false)
+    val clipboardState by ClipboardSyncManager.state.collectAsStateWithLifecycle()
+    val peers by RelayManager.peers.collectAsStateWithLifecycle()
+    val clipboardExcluded by KeyRepository.observeClipboardExcludedPeers(context)
+        .collectAsStateWithLifecycle(initialValue = emptySet())
+    val notificationSync by KeyRepository.observeNotificationSync(context)
+        .collectAsStateWithLifecycle(initialValue = false)
+    val mediaSync by KeyRepository.observeMediaSync(context)
+        .collectAsStateWithLifecycle(initialValue = false)
+    val mediaState by MediaSessionBridge.state.collectAsStateWithLifecycle()
+    var notificationAccess by remember {
+        mutableStateOf(
+            NotificationManagerCompat.getEnabledListenerPackages(context)
+                .contains(context.packageName)
+        )
+    }
+    val autoOpenReceived by TransferSettingsRepository.observeAutoOpen(context)
+        .collectAsStateWithLifecycle(initialValue = true)
+    var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
 
     var showThemeDialog by remember { mutableStateOf(false) }
     var showDeviceNameDialog by remember { mutableStateOf(false) }
@@ -98,6 +138,20 @@ fun SettingsScreen(
     var draftToken by remember { mutableStateOf("") }
     var showRelayDialog by remember { mutableStateOf(false) }
     var draftRelay by remember { mutableStateOf("") }
+    var showDnsDialog by remember { mutableStateOf(false) }
+    var draftDnsMode by remember { mutableStateOf(DnsMode.ADGUARD) }
+    var draftDnsServers by remember { mutableStateOf("") }
+
+    val clipboardSummary = when {
+        !clipboardSync -> "Off — copy on one device, paste on another"
+        !overlayGranted ->
+            "Grant \"Display over other apps\" to read the clipboard in the background"
+        clipboardState.phase == ClipboardSyncPhase.WAITING_FOR_VPN ->
+            "Waiting for the VPN connection"
+        clipboardState.phase == ClipboardSyncPhase.ERROR ->
+            clipboardState.lastMessage ?: "Clipboard sync error"
+        else -> clipboardState.lastMessage ?: "On — text and images sync across your cluster"
+    }
 
     // Battery-optimization state lives in the OS, so re-check after returning
     // from the system dialog (every ON_RESUME).
@@ -109,6 +163,12 @@ fun SettingsScreen(
             if (event == Lifecycle.Event.ON_RESUME) {
                 batteryExempt =
                     powerManager?.isIgnoringBatteryOptimizations(context.packageName) ?: false
+                overlayGranted = Settings.canDrawOverlays(context)
+                notificationAccess = NotificationManagerCompat.getEnabledListenerPackages(context)
+                    .contains(context.packageName)
+                ClipboardSyncManager.refresh(context)
+                NotificationMirrorManager.refresh(context)
+                MediaSessionBridge.refresh(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -184,6 +244,46 @@ fun SettingsScreen(
                     )
                 },
             )
+
+            SectionLabel("DNS")
+            SettingsRow(
+                title = "DNS resolver",
+                summary = when (dnsMode) {
+                    DnsMode.ADGUARD ->
+                        "AdGuard Home through the tunnel (${dnsServers.ifBlank { KeyRepository.DEFAULT_DNS_SERVERS }})"
+                    DnsMode.SYSTEM -> "System resolvers through the tunnel"
+                    DnsMode.CUSTOM -> dnsServers.ifBlank { "No custom servers set" }
+                },
+                onClick = {
+                    draftDnsMode = dnsMode
+                    draftDnsServers = dnsServers
+                    showDnsDialog = true
+                },
+                trailing = {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_chevron_right),
+                        contentDescription = "Configure DNS",
+                        tint = resources.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                },
+            )
+
+            SettingsRow(
+                title = "Block traffic while reconnecting",
+                summary = "Drop packets instead of leaking direct when the tunnel drops",
+            ) {
+                Switch(
+                    checked = blockOnReconnect,
+                    onCheckedChange = { enabled ->
+                        scope.launch { KeyRepository.setBlockOnReconnect(context, enabled) }
+                    },
+                    colors = SwitchDefaults.colors(
+                        checkedTrackColor = MaterialTheme.colorScheme.primary,
+                        checkedThumbColor = Color(0xFF0B111B),
+                    ),
+                )
+            }
 
             SectionLabel("Background")
             SettingsRow(
@@ -290,7 +390,7 @@ fun SettingsScreen(
 
             SettingsRow(
                 title = "Cluster Secret Key",
-                summary = if (clusterToken.isNotBlank()) "Configured (512-character secure token)" else "Not set — tap to paste 512-character token",
+                summary = if (clusterToken.isNotBlank()) "Configured" else "Not set — tap to paste the cluster token",
                 onClick = {
                     draftToken = clusterToken
                     showTokenDialog = true
@@ -304,6 +404,333 @@ fun SettingsScreen(
                     draftRelay = relayAddress
                     showRelayDialog = true
                 },
+            )
+
+            SettingsRow(
+                title = "Trusted devices",
+                summary = "Choose which cluster devices can send files without approval",
+                onClick = onOpenTrustedDevices,
+                trailing = {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_chevron_right),
+                        contentDescription = "Open trusted devices",
+                        tint = resources.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                },
+            )
+
+            SettingsRow(
+                title = "Open received files automatically",
+                summary = "Launch the viewer as soon as a file shared with \"Open in...\" finishes arriving",
+            ) {
+                Switch(
+                    checked = autoOpenReceived,
+                    onCheckedChange = { enabled ->
+                        scope.launch { TransferSettingsRepository.setAutoOpen(context, enabled) }
+                    },
+                    colors = SwitchDefaults.colors(
+                        checkedTrackColor = MaterialTheme.colorScheme.primary,
+                        checkedThumbColor = Color(0xFF0B111B),
+                    ),
+                )
+            }
+
+            SettingsRow(
+                title = "Transfer history",
+                summary = "Reopen received files, retry failed sends, and resend links",
+                onClick = onOpenHistory,
+                trailing = {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_chevron_right),
+                        contentDescription = "Open transfer history",
+                        tint = resources.onSurfaceVariant,
+                        modifier = Modifier.size(20.dp),
+                    )
+                },
+            )
+
+            Spacer(Modifier.height(20.dp))
+            SectionLabel("Clipboard Sync")
+
+            SettingsRow(
+                title = "Sync clipboard",
+                summary = clipboardSummary,
+            ) {
+                Switch(
+                    checked = clipboardSync,
+                    onCheckedChange = { enabled ->
+                        scope.launch { KeyRepository.setClipboardSync(context, enabled) }
+                        if (enabled && !Settings.canDrawOverlays(context)) {
+                            Toast.makeText(
+                                context,
+                                "Grant overlay permission so gaurPN can read the clipboard in the background",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:${context.packageName}"),
+                            )
+                            runCatching { context.startActivity(intent) }
+                        } else {
+                            ClipboardSyncManager.refresh(context)
+                        }
+                    },
+                    colors = SwitchDefaults.colors(
+                        checkedTrackColor = MaterialTheme.colorScheme.primary,
+                        checkedThumbColor = Color(0xFF0B111B),
+                    ),
+                )
+            }
+
+            if (clipboardSync && !overlayGranted) {
+                SettingsRow(
+                    title = "Overlay permission",
+                    summary = "Required for background clipboard reads on Android 10+",
+                    onClick = {
+                        val intent = Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:${context.packageName}"),
+                        )
+                        runCatching { context.startActivity(intent) }
+                    },
+                )
+            }
+
+            if (clipboardSync) {
+                SettingsRow(
+                    title = "Include sensitive clips",
+                    summary = "Also sync passwords and OTP codes. Not recommended.",
+                ) {
+                    Switch(
+                        checked = clipboardSensitive,
+                        onCheckedChange = { enabled ->
+                            scope.launch { KeyRepository.setClipboardSensitive(context, enabled) }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedTrackColor = MaterialTheme.colorScheme.primary,
+                            checkedThumbColor = Color(0xFF0B111B),
+                        ),
+                    )
+                }
+
+                val otherPeers = peers.filter { !it.isSelf }
+                if (otherPeers.isNotEmpty()) {
+                    Text(
+                        "Per-device clipboard",
+                        fontSize = 11.sp,
+                        letterSpacing = 1.4.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = resources.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp, bottom = 6.dp),
+                    )
+                    otherPeers.forEach { peer ->
+                        SettingsRow(
+                            title = peer.name,
+                            summary = if (peer.id in clipboardExcluded) {
+                                "Clipboard sync off for this device"
+                            } else {
+                                "Clipboard sync on for this device"
+                            },
+                        ) {
+                            Switch(
+                                checked = peer.id !in clipboardExcluded,
+                                onCheckedChange = { enabled ->
+                                    scope.launch {
+                                        KeyRepository.setClipboardExcluded(
+                                            context,
+                                            peer.id,
+                                            !enabled,
+                                        )
+                                    }
+                                },
+                                colors = SwitchDefaults.colors(
+                                    checkedTrackColor = MaterialTheme.colorScheme.primary,
+                                    checkedThumbColor = Color(0xFF0B111B),
+                                ),
+                            )
+                        }
+                    }
+                }
+
+                SettingsRow(
+                    title = "Last clipboard activity",
+                    summary = clipboardState.lastMessage ?: "No clipboard synced yet",
+                )
+
+                Text(
+                    "Android 10+ blocks background clipboard reads. gaurPN briefly takes focus to check for new clips; Android may show its paste toast.",
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+                )
+            }
+
+            Spacer(Modifier.height(20.dp))
+            SectionLabel("Notifications")
+            SettingsRow(
+                title = "Share notifications",
+                summary = when {
+                    !notificationSync -> "Off — mirror notifications to other cluster devices"
+                    !notificationAccess -> "Grant notification access to start mirroring"
+                    else -> "On — notifications from this device appear on every cluster device"
+                },
+            ) {
+                Switch(
+                    checked = notificationSync,
+                    onCheckedChange = { enabled ->
+                        scope.launch { KeyRepository.setNotificationSync(context, enabled) }
+                        NotificationMirrorManager.refresh(context)
+                        if (enabled && !notificationAccess) {
+                            Toast.makeText(
+                                context,
+                                "Grant notification access to mirror notifications",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                                )
+                            }
+                        }
+                    },
+                    colors = SwitchDefaults.colors(
+                        checkedTrackColor = MaterialTheme.colorScheme.primary,
+                        checkedThumbColor = Color(0xFF0B111B),
+                    ),
+                )
+            }
+
+            if (notificationSync && !notificationAccess) {
+                SettingsRow(
+                    title = "Notification access",
+                    summary = "Required to read notifications from other apps",
+                    onClick = {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                            )
+                        }
+                    },
+                )
+            }
+
+            if (notificationSync) {
+                val appNotificationsEnabled =
+                    NotificationManagerCompat.from(context).areNotificationsEnabled()
+                if (!appNotificationsEnabled) {
+                    SettingsRow(
+                        title = "Allow gaurPN notifications",
+                        summary = "Android is blocking mirrored notifications",
+                        onClick = {
+                            val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                                    putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                                }
+                            } else {
+                                Intent(
+                                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                    Uri.parse("package:${context.packageName}"),
+                                )
+                            }
+                            runCatching { context.startActivity(intent) }
+                        },
+                    )
+                }
+                SettingsRow(
+                    title = "Mirrored notification channel",
+                    summary = "Android may mute this channel independently",
+                    onClick = {
+                        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                                putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                                putExtra(Settings.EXTRA_CHANNEL_ID, MIRROR_CHANNEL_ID)
+                            }
+                        } else {
+                            Intent(
+                                Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                Uri.parse("package:${context.packageName}"),
+                            )
+                        }
+                        runCatching { context.startActivity(intent) }
+                    },
+                )
+            }
+
+            Text(
+                "Mirrored notifications are end-to-end encrypted. gaurPN ignores its own " +
+                    "notifications, so mirrored copies are never re-broadcast.",
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+            )
+
+            Spacer(Modifier.height(20.dp))
+            SectionLabel("Media")
+            SettingsRow(
+                title = "Share media controls",
+                summary = when {
+                    !mediaSync -> "Off — control this device's media from other cluster devices"
+                    !notificationAccess -> "Grant notification access to read media sessions"
+                    else -> "On — now-playing and transport controls are shared"
+                },
+            ) {
+                Switch(
+                    checked = mediaSync,
+                    onCheckedChange = { enabled ->
+                        scope.launch { KeyRepository.setMediaSync(context, enabled) }
+                        MediaSessionBridge.refresh(context)
+                        if (enabled && !notificationAccess) {
+                            Toast.makeText(
+                                context,
+                                "Grant notification access to share media controls",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                                )
+                            }
+                        }
+                    },
+                    colors = SwitchDefaults.colors(
+                        checkedTrackColor = MaterialTheme.colorScheme.primary,
+                        checkedThumbColor = Color(0xFF0B111B),
+                    ),
+                )
+            }
+            SettingsRow(
+                title = "Media session",
+                summary = when {
+                    !mediaSync -> "Off"
+                    mediaState.active -> "${mediaState.title ?: "Unknown"} — ${mediaState.app ?: ""}"
+                    mediaState.error != null -> mediaState.error!!
+                    else -> "No active media session"
+                },
+                onClick = { MediaSessionBridge.refresh(context) },
+            )
+            if (mediaSync && !notificationAccess) {
+                SettingsRow(
+                    title = "Notification access",
+                    summary = "Required to read media sessions",
+                    onClick = {
+                        runCatching {
+                            context.startActivity(
+                                Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+                            )
+                        }
+                    },
+                )
+            }
+            Text(
+                "Media metadata and commands are sealed end-to-end. Position is sent on " +
+                    "state changes only; the desktop interpolates it locally.",
+                fontSize = 11.sp,
+                lineHeight = 16.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
             )
 
             Spacer(Modifier.height(20.dp))
@@ -366,7 +793,7 @@ fun SettingsScreen(
                 text = {
                     Column {
                         Text(
-                            "Enter the 512-character secret key shared with your server relay and other devices. Key is obscured for security.",
+                            "Enter the cluster secret shared with your server relay and other devices. The key is obscured for security.",
                             fontSize = 12.sp,
                             color = resources.onSurfaceVariant,
                         )
@@ -378,7 +805,7 @@ fun SettingsScreen(
                             singleLine = false,
                             maxLines = 4,
                             modifier = Modifier.fillMaxWidth(),
-                            placeholder = { Text("Paste 512-char token...", fontSize = 12.sp) },
+                            placeholder = { Text("Paste cluster token...", fontSize = 12.sp) },
                         )
                         Spacer(Modifier.height(8.dp))
                         TextButton(
@@ -420,7 +847,7 @@ fun SettingsScreen(
                 text = {
                     Column {
                         Text(
-                            "In-tunnel file sharing relay endpoint (host:port). Defaults to 127.0.0.1:9876.",
+                            "In-tunnel file sharing relay endpoint (host:port). Defaults to the loopback alias 198.51.100.1:9876.",
                             fontSize = 12.sp,
                             color = resources.onSurfaceVariant,
                         )
@@ -430,7 +857,7 @@ fun SettingsScreen(
                             onValueChange = { draftRelay = it },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
-                            placeholder = { Text("127.0.0.1:9876", fontSize = 12.sp) },
+                            placeholder = { Text("198.51.100.1:9876", fontSize = 12.sp) },
                         )
                     }
                 },
@@ -448,6 +875,93 @@ fun SettingsScreen(
                 },
                 dismissButton = {
                     TextButton(onClick = { showRelayDialog = false }) {
+                        Text("Cancel")
+                    }
+                },
+            )
+        }
+
+        // DNS Selection Dialog
+        if (showDnsDialog) {
+            AlertDialog(
+                onDismissRequest = { showDnsDialog = false },
+                title = { Text("DNS resolver", fontWeight = FontWeight.SemiBold) },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        listOf(
+                            DnsMode.ADGUARD to "AdGuard Home (through tunnel)",
+                            DnsMode.SYSTEM to "System resolvers (through tunnel)",
+                            DnsMode.CUSTOM to "Custom servers",
+                        ).forEach { (mode, label) ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(12.dp))
+                                    .clickable { draftDnsMode = mode }
+                                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                            ) {
+                                RadioButton(
+                                    selected = draftDnsMode == mode,
+                                    onClick = { draftDnsMode = mode },
+                                    colors = RadioButtonDefaults.colors(
+                                        selectedColor = resources.primary
+                                    ),
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Text(label, fontSize = 14.sp, color = resources.onSurface)
+                            }
+                        }
+                        if (draftDnsMode != DnsMode.SYSTEM) {
+                            Spacer(Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = draftDnsServers,
+                                onValueChange = { draftDnsServers = it },
+                                singleLine = true,
+                                modifier = Modifier.fillMaxWidth(),
+                                label = {
+                                    Text(
+                                        if (draftDnsMode == DnsMode.ADGUARD) {
+                                            "AdGuard address"
+                                        } else {
+                                            "Servers (comma-separated)"
+                                        },
+                                        fontSize = 12.sp,
+                                    )
+                                },
+                                placeholder = { Text("10.0.0.182", fontSize = 12.sp) },
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            "AdGuard queries travel inside the Shadowsocks tunnel and are " +
+                                "answered on the VPS. They never reach the local network or a " +
+                                "public resolver.",
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp,
+                            color = resources.onSurfaceVariant,
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(
+                        enabled = draftDnsMode == DnsMode.SYSTEM ||
+                            draftDnsServers.isNotBlank(),
+                        onClick = {
+                            scope.launch {
+                                KeyRepository.setDnsMode(context, draftDnsMode)
+                                if (draftDnsMode != DnsMode.SYSTEM) {
+                                    KeyRepository.setDnsServers(context, draftDnsServers)
+                                }
+                            }
+                            showDnsDialog = false
+                        },
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showDnsDialog = false }) {
                         Text("Cancel")
                     }
                 },
@@ -508,7 +1022,7 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun SectionLabel(text: String) {
+internal fun SectionLabel(text: String) {
     Text(
         text.uppercase(),
         fontSize = 11.sp,

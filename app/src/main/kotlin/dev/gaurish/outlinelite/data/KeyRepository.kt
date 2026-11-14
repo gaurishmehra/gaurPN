@@ -15,6 +15,15 @@ private val Context.dataStore by preferencesDataStore(name = "outline_lite")
 
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
 
+/**
+ * Where DNS queries go while the tunnel is up.
+ *
+ * ADGUARD sends every query through the Shadowsocks tunnel to the AdGuard Home
+ * instance running on the VPS. SYSTEM reuses the underlying network's resolvers
+ * (still through the tunnel). CUSTOM accepts a comma-separated list.
+ */
+enum class DnsMode { ADGUARD, SYSTEM, CUSTOM }
+
 /** Persists access keys (added manually or via ss:// links) plus the active selection. */
 object KeyRepository {
 
@@ -26,7 +35,23 @@ object KeyRepository {
     private val DEVICE_NAME = stringPreferencesKey("cluster_device_name")
     private val CLUSTER_TOKEN = stringPreferencesKey("cluster_token")
     private val RELAY_ADDR = stringPreferencesKey("cluster_relay_addr_v1")
+    private val CLIPBOARD_SYNC = booleanPreferencesKey("clipboard_sync_enabled")
+    private val CLIPBOARD_SENSITIVE = booleanPreferencesKey("clipboard_include_sensitive")
+    private val NOTIFICATION_SYNC = booleanPreferencesKey("notification_sync_enabled")
+    private val MEDIA_SYNC = booleanPreferencesKey("media_sync_enabled")
+    private val DNS_MODE = stringPreferencesKey("dns_mode_v1")
+    private val DNS_SERVERS = stringPreferencesKey("dns_servers_v1")
+    private val BLOCK_ON_RECONNECT = booleanPreferencesKey("block_on_reconnect")
+    private val DEVICE_ID = stringPreferencesKey("cluster_device_id_v1")
+    private val CLIPBOARD_EXCLUDED = stringPreferencesKey("clipboard_excluded_peers_v1")
     const val DEFAULT_RELAY_ADDR = "198.51.100.1:9876"
+
+    /**
+     * AdGuard Home on the VPS, reached through the Shadowsocks tunnel.
+     * The VPS private address is stable and is forced into the tunnel with a
+     * /32 route, so LAN bypass cannot steal it.
+     */
+    const val DEFAULT_DNS_SERVERS = "10.0.0.182"
 
     fun observeRelayAddress(context: Context): Flow<String> =
         context.dataStore.data.map { it[RELAY_ADDR] ?: DEFAULT_RELAY_ADDR }
@@ -59,6 +84,43 @@ object KeyRepository {
 
     suspend fun setClusterToken(context: Context, token: String) {
         context.dataStore.edit { it[CLUSTER_TOKEN] = token.trim() }
+    }
+
+    fun observeClipboardSync(context: Context): Flow<Boolean> =
+        context.dataStore.data.map { it[CLIPBOARD_SYNC] ?: false }
+
+    suspend fun clipboardSyncEnabled(context: Context): Boolean =
+        context.dataStore.data.first()[CLIPBOARD_SYNC] ?: false
+
+    suspend fun setClipboardSync(context: Context, enabled: Boolean) {
+        context.dataStore.edit { it[CLIPBOARD_SYNC] = enabled }
+    }
+
+    fun observeNotificationSync(context: Context): Flow<Boolean> =
+        context.dataStore.data.map { it[NOTIFICATION_SYNC] ?: false }
+
+    suspend fun notificationSyncEnabled(context: Context): Boolean =
+        context.dataStore.data.first()[NOTIFICATION_SYNC] ?: false
+
+    suspend fun setNotificationSync(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[NOTIFICATION_SYNC] = enabled }
+    }
+
+    fun observeMediaSync(context: Context): Flow<Boolean> =
+        context.dataStore.data.map { it[MEDIA_SYNC] ?: false }
+
+    suspend fun mediaSyncEnabled(context: Context): Boolean =
+        context.dataStore.data.first()[MEDIA_SYNC] ?: false
+
+    suspend fun setMediaSync(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[MEDIA_SYNC] = enabled }
+    }
+
+    fun observeClipboardSensitive(context: Context): Flow<Boolean> =
+        context.dataStore.data.map { it[CLIPBOARD_SENSITIVE] ?: false }
+
+    suspend fun setClipboardSensitive(context: Context, enabled: Boolean) {
+        context.dataStore.edit { it[CLIPBOARD_SENSITIVE] = enabled }
     }
 
     fun observeKeys(context: Context): Flow<List<AccessKey>> =
@@ -160,6 +222,95 @@ object KeyRepository {
 
     suspend fun setAutoReconnect(context: Context, enabled: Boolean) {
         context.dataStore.edit { prefs -> prefs[AUTO_RECONNECT] = enabled }
+    }
+
+    fun observeDnsMode(context: Context): Flow<DnsMode> =
+        context.dataStore.data.map { dnsModeFrom(it[DNS_MODE]) }
+
+    suspend fun getDnsMode(context: Context): DnsMode =
+        dnsModeFrom(context.dataStore.data.first()[DNS_MODE])
+
+    suspend fun setDnsMode(context: Context, mode: DnsMode) {
+        context.dataStore.edit { prefs ->
+            prefs[DNS_MODE] = when (mode) {
+                DnsMode.ADGUARD -> "adguard"
+                DnsMode.SYSTEM -> "system"
+                DnsMode.CUSTOM -> "custom"
+            }
+        }
+    }
+
+    fun observeDnsServers(context: Context): Flow<String> =
+        context.dataStore.data.map { it[DNS_SERVERS] ?: DEFAULT_DNS_SERVERS }
+
+    suspend fun getDnsServers(context: Context): String =
+        context.dataStore.data.first()[DNS_SERVERS] ?: DEFAULT_DNS_SERVERS
+
+    suspend fun setDnsServers(context: Context, servers: String) {
+        context.dataStore.edit { prefs -> prefs[DNS_SERVERS] = servers.trim() }
+    }
+
+    /** Keep the TUN interface up while reconnecting so traffic is dropped instead of leaking. */
+    fun observeBlockOnReconnect(context: Context): Flow<Boolean> =
+        context.dataStore.data.map { it[BLOCK_ON_RECONNECT] ?: true }
+
+    suspend fun blockOnReconnect(context: Context): Boolean =
+        context.dataStore.data.first()[BLOCK_ON_RECONNECT] ?: true
+
+    suspend fun setBlockOnReconnect(context: Context, enabled: Boolean) {
+        context.dataStore.edit { prefs -> prefs[BLOCK_ON_RECONNECT] = enabled }
+    }
+
+    /**
+     * Stable per-install identity so trust decisions survive process restarts.
+     * The old implementation generated a fresh UUID in RelayManager.start(),
+     * which made every reconnect look like a new device.
+     */
+    suspend fun getOrCreateDeviceId(context: Context): String {
+        val existing = context.dataStore.data.first()[DEVICE_ID]
+        if (!existing.isNullOrBlank()) return existing
+        val generated = "android-" + java.util.UUID.randomUUID().toString().take(8)
+        context.dataStore.edit { prefs ->
+            if (prefs[DEVICE_ID].isNullOrBlank()) prefs[DEVICE_ID] = generated
+        }
+        return context.dataStore.data.first()[DEVICE_ID] ?: generated
+    }
+
+    fun observeClipboardExcludedPeers(context: Context): Flow<Set<String>> =
+        context.dataStore.data.map { prefs ->
+            prefs[CLIPBOARD_EXCLUDED]
+                ?.split(",")
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.toSet()
+                ?: emptySet()
+        }
+
+    suspend fun clipboardExcludedPeers(context: Context): Set<String> =
+        context.dataStore.data.first()[CLIPBOARD_EXCLUDED]
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.toSet()
+            ?: emptySet()
+
+    suspend fun setClipboardExcluded(context: Context, peerId: String, excluded: Boolean) {
+        context.dataStore.edit { prefs ->
+            val current = prefs[CLIPBOARD_EXCLUDED]
+                ?.split(",")
+                ?.map { it.trim() }
+                ?.filter { it.isNotEmpty() }
+                ?.toMutableSet()
+                ?: mutableSetOf()
+            if (excluded) current.add(peerId) else current.remove(peerId)
+            prefs[CLIPBOARD_EXCLUDED] = current.joinToString(",")
+        }
+    }
+
+    private fun dnsModeFrom(raw: String?): DnsMode = when (raw) {
+        "system" -> DnsMode.SYSTEM
+        "custom" -> DnsMode.CUSTOM
+        else -> DnsMode.ADGUARD
     }
 
     /*

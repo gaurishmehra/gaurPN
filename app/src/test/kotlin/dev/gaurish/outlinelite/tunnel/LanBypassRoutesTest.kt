@@ -54,6 +54,35 @@ class LanBypassRoutesTest {
         assertFalse(isRouted("127.0.0.1"))
     }
 
+    private fun matchesRouteV6(ipStr: String, prefixStr: String, prefixLen: Int): Boolean {
+        val ip = InetAddress.getByName(ipStr).address
+        val prefix = InetAddress.getByName(prefixStr).address
+        if (ip.size != 16 || prefix.size != 16) return false
+        var bits = prefixLen
+        for (i in 0 until 16) {
+            val take = minOf(bits, 8)
+            if (take == 0) break
+            val mask = (0xFF shl (8 - take)) and 0xFF
+            if ((ip[i].toInt() and mask) != (prefix[i].toInt() and mask)) return false
+            bits -= take
+        }
+        return true
+    }
+
+    private fun isRoutedV6(ipStr: String): Boolean =
+        LanBypassRoutes.IPV6_GLOBAL_ROUTES.any { (prefix, len) ->
+            matchesRouteV6(ipStr, prefix, len)
+        }
+
+    @Test
+    fun testIpv6GlobalUnicastIsRoutedButLocalIsNot() {
+        assertTrue(isRoutedV6("2606:4700:4700::1111"))
+        assertTrue(isRoutedV6("2001:4860:4860::8888"))
+        assertFalse(isRoutedV6("fd00::1"))   // unique-local
+        assertFalse(isRoutedV6("fe80::1"))   // link-local
+        assertFalse(isRoutedV6("ff02::1"))   // multicast
+    }
+
     @Test
     fun testPublicIpsAreRouted() {
         assertTrue(isRouted("1.1.1.1"))
