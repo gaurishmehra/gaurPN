@@ -24,6 +24,7 @@ import dev.gaurish.outlinelite.data.TransferSettingsRepository
 import dev.gaurish.outlinelite.data.TrustedDeviceRepository
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelState
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -61,6 +62,7 @@ import java.nio.ByteOrder
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 object RelayManager {
@@ -102,8 +104,15 @@ object RelayManager {
 
     private val pendingAccepts = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
     private val pendingCompletes = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
-    private val activeTransfers = ConcurrentHashMap<String, Job>()
+
+    /** In-flight transfers and how to cancel them; drained by [stop]. */
+    private val transferRegistry = TransferRegistry()
     private var sendJob: Job? = null
+
+    /** Single-flight guard so two rapid connects cannot open two sockets. */
+    private val connecting = AtomicBoolean(false)
+    private val backoff = ReconnectBackoff()
+    private var reconnectAttempts = 0
 
     fun start(context: Context) {
         if (monitorJob != null) return
@@ -130,49 +139,61 @@ object RelayManager {
 
     private fun connectRelay(context: Context, token: String) {
         if (ws != null) return
+        // Single-flight: a second call while an attempt is still connecting
+        // must not open a second socket that overwrites `ws`.
+        if (!connecting.compareAndSet(false, true)) return
         scope.launch {
-            val (relayToken, peerCryptoKey) = Crypto.deriveSubKeys(token)
-            val deviceName = KeyRepository.getDeviceName(context)
-            val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
-            if (!RelayHosts.isInTunnelHost(relayHost)) {
-                Log.w(TAG, "Refusing relay '$relayHost': host is not tunnel-only")
-                return@launch
+            try {
+                val (relayToken, peerCryptoKey) = Crypto.deriveSubKeys(token)
+                val deviceName = KeyRepository.getDeviceName(context)
+                val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
+                if (!RelayHosts.isInTunnelHost(relayHost)) {
+                    Log.w(TAG, "Refusing relay '$relayHost': host is not tunnel-only")
+                    return@launch
+                }
+                val url = "ws://$relayHost/ws?device_id=$deviceId&name=${Uri.encode(deviceName)}"
+                val request = Request.Builder()
+                    .url(url)
+                    .header("X-Gaur-Token", relayToken)
+                    .build()
+
+                Log.i(TAG, "Connecting to in-tunnel relay at $relayHost")
+                ws = client.newWebSocket(request, object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) {
+                        Log.i(TAG, "Connected to in-tunnel file relay")
+                        reconnectAttempts = 0
+                        backoff.reset()
+                        connecting.set(false)
+                        requestPeerList(webSocket)
+                        ClipboardSyncManager.onRelayConnected(context)
+                        MediaSessionBridge.onRelayConnected(context)
+                    }
+
+                    override fun onMessage(webSocket: WebSocket, text: String) {
+                        handleWsMessage(context, relayToken, peerCryptoKey, text)
+                    }
+
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                        Log.i(TAG, "Relay WS closed: $code $reason")
+                        ws = null
+                        connecting.set(false)
+                        _peers.value = emptyList()
+                        ClipboardSyncManager.onRelayDisconnected()
+                        scheduleReconnect(context, token)
+                    }
+
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                        Log.w(TAG, "Relay WS failure: ${t.message}")
+                        ws = null
+                        connecting.set(false)
+                        _peers.value = emptyList()
+                        ClipboardSyncManager.onRelayDisconnected()
+                        scheduleReconnect(context, token)
+                    }
+                })
+            } finally {
+                connecting.set(false)
             }
-            val url = "ws://$relayHost/ws?device_id=$deviceId&name=${Uri.encode(deviceName)}"
-            val request = Request.Builder()
-                .url(url)
-                .header("X-Gaur-Token", relayToken)
-                .build()
-
-            Log.i(TAG, "Connecting to in-tunnel relay at $relayHost")
-            ws = client.newWebSocket(request, object : WebSocketListener() {
-                override fun onOpen(webSocket: WebSocket, response: Response) {
-                    Log.i(TAG, "Connected to in-tunnel file relay")
-                    requestPeerList(webSocket)
-                    ClipboardSyncManager.onRelayConnected(context)
-                    MediaSessionBridge.onRelayConnected(context)
-                }
-
-                override fun onMessage(webSocket: WebSocket, text: String) {
-                    handleWsMessage(context, relayToken, peerCryptoKey, text)
-                }
-
-                override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                    Log.i(TAG, "Relay WS closed: $code $reason")
-                    ws = null
-                    _peers.value = emptyList()
-                    ClipboardSyncManager.onRelayDisconnected()
-                    scheduleReconnect(context, token)
-                }
-
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                    Log.w(TAG, "Relay WS failure: ${t.message}")
-                    ws = null
-                    _peers.value = emptyList()
-                    ClipboardSyncManager.onRelayDisconnected()
-                    scheduleReconnect(context, token)
-                }
-            })
         }
     }
 
@@ -182,7 +203,7 @@ object RelayManager {
         if (TunnelState.flow.value.phase != TunnelPhase.CONNECTED) return
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
-            delay(3000)
+            delay(backoff.delayFor(reconnectAttempts++))
             if (TunnelState.flow.value.phase == TunnelPhase.CONNECTED && ws == null) {
                 connectRelay(context, token)
             }
@@ -218,6 +239,10 @@ object RelayManager {
     fun stop() {
         monitorJob?.cancel()
         monitorJob = null
+        sendJob?.cancel()
+        sendJob = null
+        transferRegistry.cancelAll()
+        _transferState.value = TransferState.Idle
         disconnectRelay()
     }
 
@@ -247,21 +272,24 @@ object RelayManager {
             "transfer_offer" -> {
                 val txId = json.optString("transfer_id")
                 if (txId.isNotBlank()) {
-                    activeTransfers.remove(txId)?.cancel()
-                    val holder = arrayOfNulls<Job>(1)
-                    val job = scope.launch {
-                        try {
-                            if (json.optInt("v", 1) >= 2) {
-                                handleIncomingOfferV2(context, relayToken, peerCryptoKey, json)
-                            } else {
-                                handleIncomingOfferV1(context, relayToken, peerCryptoKey, json)
+                    if (json.optInt("v", 1) >= 2) {
+                        scope.launch {
+                            val self = coroutineContext[Job]
+                            val registration = transferRegistry.register(txId) { self?.cancel() }
+                            val notifId = NotificationIds.acquire(txId, sending = false)
+                            try {
+                                handleIncomingOfferV2(context, relayToken, peerCryptoKey, json, notifId)
+                            } finally {
+                                registration.remove()
+                                NotificationIds.release(notifId)
                             }
-                        } finally {
-                            holder[0]?.let { activeTransfers.remove(txId, it) }
                         }
+                    } else {
+                        // v1 streams on an OkHttp callback thread; the receiver
+                        // registers the Call itself so stop() can cancel the pipe.
+                        transferRegistry.cancel(txId) // supersede any previous attempt
+                        scope.launch { handleIncomingOfferV1(context, relayToken, peerCryptoKey, json) }
                     }
-                    holder[0] = job
-                    activeTransfers[txId] = job
                 }
             }
             "transfer_accept", "transfer_reject" -> {
@@ -691,7 +719,9 @@ object RelayManager {
             }
             val batchId = "batch-${UUID.randomUUID()}"
             val totalSize = files.sumOf { it.size }
-            val batchNotifId = notifIdFor(batchId, sending = true)
+            val batchNotifId = NotificationIds.acquire(batchId, sending = true)
+            val self = coroutineContext[Job]
+            val registration = transferRegistry.register(batchId) { self?.cancel() }
             try {
                 var sentBefore = 0L
                 files.forEachIndexed { index, file ->
@@ -714,6 +744,7 @@ object RelayManager {
                         sentBefore = sentBefore,
                         totalSize = totalSize,
                         offline = offline,
+                        notifId = batchNotifId,
                     )
                     sentBefore += file.size
                 }
@@ -736,6 +767,9 @@ object RelayManager {
                     "Transfer Failed",
                     "Failed sending to ${targets.size} device(s)",
                 )
+            } finally {
+                registration.remove()
+                NotificationIds.release(batchNotifId)
             }
         }
     }
@@ -754,8 +788,8 @@ object RelayManager {
         sentBefore: Long,
         totalSize: Long,
         offline: Boolean,
+        notifId: Int,
     ) {
-        val notifId = notifIdFor(batchId, sending = true)
         _transferState.value = TransferState.Sending(targets.first().name, label, 0f, 0f)
         showNotification(context, notifId, "Preparing $label", "Hashing file...", ongoing = true, progress = -2)
 
@@ -766,9 +800,18 @@ object RelayManager {
         }
 
         val transferId = Crypto.deriveTransferId(peerCryptoKey, digest.fileHash)
-        val sessionId = UUID.randomUUID().toString().replace("-", "")
+        // Deterministic session: staged ciphertext from an earlier attempt of
+        // the same file stays addressable, so a retry resumes instead of
+        // re-uploading (the receiver derives the same id from the offer).
+        val sessionId = Crypto.deriveSessionId(peerCryptoKey, transferId)
         val fileKey = Crypto.deriveFileKey(peerCryptoKey, transferId)
-        val missing = (0 until digest.chunkCount).toList()
+        // Sender-side resume: ask the relay what is already staged and upload
+        // only the rest. Fails open to a full upload.
+        val present = ChunkTransport.fetchPresent(
+            client, relayHost, relayToken, deviceId, peerCryptoKey, transferId, sessionId, digest.chunkCount,
+        )
+        val presentBytes = present.sumOf { ChunkTransport.chunkLength(it, digest.size).toLong() }
+        val missing = (0 until digest.chunkCount).filter { it !in present }
         val startTime = System.currentTimeMillis()
         val lastProgress = AtomicLong(0)
 
@@ -789,7 +832,14 @@ object RelayManager {
             val now = System.currentTimeMillis()
             if (now - lastProgress.get() < 200L) return@uploadMissing
             lastProgress.set(now)
-            val fileProgress = if (total > 0) done.toFloat() / total else 0f
+            // Progress reflects the whole file — staged chunks from a previous
+            // attempt count as done — so a resumed send starts where it left
+            // off instead of restarting at 0%.
+            val fileProgress = if (digest.size > 0) {
+                (presentBytes + done).toFloat() / digest.size
+            } else {
+                0f
+            }
             val overall = if (totalSize > 0) {
                 (sentBefore + fileProgress * file.size).toFloat() / totalSize
             } else {
@@ -930,12 +980,12 @@ object RelayManager {
             )
             "complete" -> {
                 val fileName = inner.optString("file_name", "file")
-                showNotification(
+                showOneShotNotification(
                     context,
-                    notifIdFor(msgId, sending = false),
+                    msgId,
+                    sending = false,
                     "Delivered",
                     "$senderName received $fileName",
-                    ongoing = false,
                 )
             }
             "text" -> {
@@ -1012,16 +1062,27 @@ object RelayManager {
 
         val partFile = File(downloadsDir, ".$cleanName.$transferId.part")
         val stateFile = File(downloadsDir, ".$cleanName.$transferId.state")
-        val state = ChunkTransport.ReceiveState(transferId, fileHash, fileSize, chunkSize, chunkCount)
-        partFile.delete()
-        stateFile.delete()
-        ChunkTransport.saveState(state, stateFile)
+        // Resume like v2: reuse the staged .part/.state while it still
+        // matches this transfer; a changed file under the same transfer id
+        // (content hash differs) resets cleanly.
+        var state = ChunkTransport.loadState(stateFile, transferId, fileHash)
+        if (state == null) {
+            partFile.delete()
+            stateFile.delete()
+            state = ChunkTransport.ReceiveState(transferId, fileHash, fileSize, chunkSize, chunkCount)
+            ChunkTransport.saveState(state, stateFile)
+        } else if (!partFile.exists() && fileSize > 0) {
+            state = ChunkTransport.ReceiveState(transferId, fileHash, fileSize, chunkSize, chunkCount)
+            ChunkTransport.saveState(state, stateFile)
+        }
 
         val digest = ChunkTransport.FileDigest(fileHash, chunkHashes, chunkCount, fileSize)
-        val missing = (0 until chunkCount).toList()
+        val missing = (0 until chunkCount).filter { it !in state.have }
         val fileKey = Crypto.deriveFileKey(peerCryptoKey, transferId)
         val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
-        val notifId = notifIdFor(transferId, sending = false)
+        val notifId = NotificationIds.acquire(transferId, sending = false)
+        val self = coroutineContext[Job]
+        val registration = transferRegistry.register(transferId) { self?.cancel() }
 
         try {
             ChunkTransport.downloadMissing(
@@ -1052,6 +1113,8 @@ object RelayManager {
                 )
             }
             if (!ChunkTransport.verifyFileHash(partFile, fileHash)) {
+                partFile.delete()
+                stateFile.delete()
                 throw SecurityException("Integrity check failed")
             }
             val finalFile = Crypto.resolveUniqueFile(downloadsDir, cleanName)
@@ -1087,11 +1150,18 @@ object RelayManager {
                 put("file_name", finalFile.name)
             }
             sendSealed(context, senderId, "complete", completion)
+        } catch (c: CancellationException) {
+            // Keep .part/.state for resume; the tunnel stop or a superseding
+            // offer cancelled the download mid-flight.
+            throw c
         } catch (t: Throwable) {
+            // Keep .part/.state for resume (matching v2); only an integrity
+            // failure above clears them, since that state is poisoned.
             Log.e(TAG, "v3 receive failed: ${t.message}", t)
-            partFile.delete()
-            stateFile.delete()
             showNotification(context, notifId, "Transfer Failed", "Failed to receive $cleanName")
+        } finally {
+            registration.remove()
+            NotificationIds.release(notifId)
         }
     }
 
@@ -1174,9 +1244,10 @@ object RelayManager {
                 put("transfer_id", transferId)
                 put("reason", "untrusted")
             }.toString())
-            showNotification(
+            showOneShotNotification(
                 context,
-                notifIdFor(transferId, sending = false),
+                transferId,
+                sending = false,
                 "Transfer blocked",
                 "Not from a trusted device",
             )
@@ -1223,7 +1294,7 @@ object RelayManager {
         } else {
             cleanName
         }
-        val notifId = notifIdFor(transferId, sending = false)
+        val notifId = NotificationIds.acquire(transferId, sending = false)
 
         _transferState.value = TransferState.Receiving(senderName, label, 0f, 0f)
         showNotification(context, notifId, "Receiving $label", "From $senderName...", ongoing = true, progress = -2)
@@ -1236,8 +1307,15 @@ object RelayManager {
             .header("X-Gaur-Token", relayToken)
             .build()
 
-        client.newCall(request).enqueue(object : Callback {
+        // The pipe outlives this coroutine on an OkHttp callback thread;
+        // registering the Call lets stop() cancel an in-flight v1 receive.
+        val call = client.newCall(request)
+        val registration = transferRegistry.register(transferId) { call.cancel() }
+        call.enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                registration.remove()
+                NotificationIds.release(notifId)
+                if (call.isCanceled()) return // tunnel stop or superseded attempt
                 Log.e(TAG, "Pipe error: ${e.message}")
                 if (partFile.exists()) partFile.delete()
                 _transferState.value = TransferState.Error("Transfer failed: ${e.message}")
@@ -1246,6 +1324,8 @@ object RelayManager {
 
             override fun onResponse(call: Call, response: Response) {
                 if (!response.isSuccessful) {
+                    registration.remove()
+                    NotificationIds.release(notifId)
                     if (partFile.exists()) partFile.delete()
                     _transferState.value = TransferState.Error("Pipe rejected with code ${response.code}")
                     showNotification(context, notifId, "Transfer Failed", "Relay returned code ${response.code}")
@@ -1254,6 +1334,8 @@ object RelayManager {
 
                 val body = response.body
                 if (body == null) {
+                    registration.remove()
+                    NotificationIds.release(notifId)
                     if (partFile.exists()) partFile.delete()
                     return
                 }
@@ -1359,6 +1441,9 @@ object RelayManager {
                     if (partFile.exists()) partFile.delete()
                     _transferState.value = TransferState.Error("Transfer error: ${t.message}")
                     showNotification(context, notifId, "Transfer Failed", "Failed to receive $cleanName")
+                } finally {
+                    registration.remove()
+                    NotificationIds.release(notifId)
                 }
             }
         })
@@ -1369,6 +1454,7 @@ object RelayManager {
         relayToken: String,
         peerCryptoKey: ByteArray,
         offer: JSONObject,
+        notifId: Int,
     ) {
         val transferId = offer.getString("transfer_id")
         val sessionId = offer.optString("session_id")
@@ -1422,9 +1508,10 @@ object RelayManager {
                 put("transfer_id", transferId)
                 put("reason", "untrusted")
             }.toString())
-            showNotification(
+            showOneShotNotification(
                 context,
-                notifIdFor(transferId, sending = false),
+                transferId,
+                sending = false,
                 "Transfer blocked",
                 "Not from a trusted device",
             )
@@ -1485,7 +1572,6 @@ object RelayManager {
         } else {
             cleanName
         }
-        val notifId = notifIdFor(transferId, sending = false)
         _transferState.value = TransferState.Receiving(senderName, label, 0f, 0f)
         showNotification(context, notifId, "Receiving $label", "From $senderName...", ongoing = true, progress = -2)
 
@@ -1635,7 +1721,9 @@ object RelayManager {
             val batchId = "batch-${UUID.randomUUID()}"
             val batchName = if (files.size == 1) files[0].name else "${files.size} files"
             val totalSize = files.sumOf { it.size }
-            val batchNotifId = notifIdFor(batchId, sending = true)
+            val batchNotifId = NotificationIds.acquire(batchId, sending = true)
+            val self = coroutineContext[Job]
+            val registration = transferRegistry.register(batchId) { self?.cancel() }
 
             val historyIds = files.mapIndexed { index, file ->
                 val entryId = "$batchId-$index"
@@ -1680,6 +1768,7 @@ object RelayManager {
                         sentBefore = sentBefore,
                         totalSize = totalSize,
                         openOnArrival = openOnArrival,
+                        notifId = batchNotifId,
                     )
                     sentBefore += file.size
                 }
@@ -1706,6 +1795,9 @@ object RelayManager {
                 historyIds.forEach { id ->
                     runCatching { TransferHistoryRepository.updateStatus(appCtx, id, "failed") }
                 }
+            } finally {
+                registration.remove()
+                NotificationIds.release(batchNotifId)
             }
         }
         if (cancelPrevious) sendJob = job
@@ -1727,13 +1819,13 @@ object RelayManager {
         sentBefore: Long,
         totalSize: Long,
         openOnArrival: Boolean,
+        notifId: Int,
     ) {
-        val preparingNotifId = notifIdFor(batchId, sending = true)
         _transferState.value = TransferState.Sending(target.name, label, 0f, 0f)
-        showNotification(context, preparingNotifId, "Preparing $label", "Hashing file...", ongoing = true, progress = -2)
+        showNotification(context, notifId, "Preparing $label", "Hashing file...", ongoing = true, progress = -2)
 
         val digest = withContext(Dispatchers.IO) { ChunkTransport.hashUri(context, file.uri) }
-        cancelNotification(context, preparingNotifId)
+        cancelNotification(context, notifId)
         if (file.size > 0 && digest.size != file.size) {
             throw IOException("File changed while hashing (expected ${file.size}, read ${digest.size})")
         }
@@ -1847,7 +1939,7 @@ object RelayManager {
         val haveSet = have.toHashSet()
         val missing = (0 until digest.chunkCount).filter { it !in haveSet }
         val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
-        val notifId = notifIdFor(transferId, sending = true)
+        val notifId = NotificationIds.acquire(transferId, sending = true)
         val startTime = System.currentTimeMillis()
         val lastProgress = AtomicLong(0)
 
@@ -1905,6 +1997,7 @@ object RelayManager {
             throw t
         } finally {
             pendingCompletes.remove(transferId)
+            NotificationIds.release(notifId)
         }
 
         ChunkTransport.deleteTransfer(client, relayHost, relayToken, deviceId, peerCryptoKey, transferId, sessionId)
@@ -1987,7 +2080,12 @@ object RelayManager {
                 .setGroup(NOTIF_GROUP)
                 .addAction(0, "Open", openPi)
                 .build()
-            nm.notify(notifIdFor(fileName, sending = false), notification)
+            val notifId = NotificationIds.acquire(fileName, sending = false)
+            try {
+                nm.notify(notifId, notification)
+            } finally {
+                NotificationIds.release(notifId)
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "Open notification error: ${t.message}")
         }
@@ -2000,9 +2098,24 @@ object RelayManager {
             context.contentResolver.openInputStream(uri)
         }
 
-    private fun notifIdFor(key: String, sending: Boolean): Int {
-        val base = if (sending) 10_000 else 20_000
-        return base + (key.hashCode() and 0x0FFF)
+    /**
+     * One-shot informational notification: acquires an id for the post, then
+     * releases it immediately. Concurrent one-shots still never clobber an
+     * in-flight transfer's progress notification.
+     */
+    private fun showOneShotNotification(
+        context: Context,
+        key: String,
+        sending: Boolean,
+        title: String,
+        message: String,
+    ) {
+        val id = NotificationIds.acquire(key, sending)
+        try {
+            showNotification(context, id, title, message)
+        } finally {
+            NotificationIds.release(id)
+        }
     }
 
     private fun showNotification(
@@ -2050,14 +2163,13 @@ object RelayManager {
 
     /**
      * Cancels the active send and every in-flight receive. A later retry
-     * reuses the same transfer ID, so v2 resumes from the receiver's bitmap
-     * instead of restarting the whole file.
+     * reuses the same transfer ID, so v2/v3 resume from the receiver's
+     * bitmap instead of restarting the whole file.
      */
     fun cancelActiveTransfers() {
         sendJob?.cancel()
         sendJob = null
-        activeTransfers.values.forEach { it.cancel() }
-        activeTransfers.clear()
+        transferRegistry.cancelAll()
         pendingAccepts.values.forEach { it.cancel() }
         pendingAccepts.clear()
         pendingCompletes.values.forEach { it.cancel() }

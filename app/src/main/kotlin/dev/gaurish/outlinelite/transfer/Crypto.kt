@@ -170,6 +170,18 @@ object Crypto {
     }
 
     /**
+     * Deterministic v3 session id: the same file always resumes the same
+     * session, so staged ciphertext stays valid across send retries.
+     * 16 hex chars.
+     */
+    fun deriveSessionId(peerCryptoKey: ByteArray, transferId: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        val digest = mac.doFinal("gaur-session-v3:$transferId".toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }.take(16)
+    }
+
+    /**
      * Per-transfer capability tag for the relay's chunk-ownership check.
      * hex(HMAC-SHA256(K_peer, "gaur-cap-v1:<transferId>:<sessionId>")).
      * Identical on sender and receiver because both hold K_peer; the relay

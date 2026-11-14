@@ -99,4 +99,26 @@ class ChunkTransportTest {
             ChunkTransport.chunkLength(2, ChunkTransport.CHUNK_SIZE.toLong() + 1),
         )
     }
+
+    @Test
+    fun testParsePresentIndices() {
+        // Well-formed status body: staged indices, order-independent.
+        assertEquals(
+            setOf(0, 2, 5),
+            ChunkTransport.parsePresentIndices("""{"present":[5,0,2]}""", 10),
+        )
+        assertEquals(
+            emptySet<Int>(),
+            ChunkTransport.parsePresentIndices("""{"present":[]}""", 10),
+        )
+        // Out-of-range and non-numeric entries are dropped, not fatal.
+        assertEquals(
+            setOf(1),
+            ChunkTransport.parsePresentIndices("""{"present":[1,10,-1,"x"]}""", 10),
+        )
+        // Malformed bodies fail open to an empty set (full re-upload).
+        assertEquals(emptySet<Int>(), ChunkTransport.parsePresentIndices("not json", 10))
+        assertEquals(emptySet<Int>(), ChunkTransport.parsePresentIndices("""{"other":[]}""", 10))
+        assertEquals(emptySet<Int>(), ChunkTransport.parsePresentIndices("""{"present":[0]}""", 0))
+    }
 }

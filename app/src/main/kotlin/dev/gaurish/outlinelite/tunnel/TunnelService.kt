@@ -53,8 +53,11 @@ import kotlinx.coroutines.launch
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class TunnelService : VpnService() {
 
+    @Volatile
     private var goTunnel: dev.gaurish.outlinelite.tun2socks.Tunnel? = null
     private var tunPfd: ParcelFileDescriptor? = null
+
+    @Volatile
     private var activeConfig: Pair<String, String>? = null
 
     /**
@@ -69,8 +72,14 @@ class TunnelService : VpnService() {
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var currentNetwork: Network? = null
     private var debounceJob: Job? = null
+
+    @Volatile
     private var userStopped = false
+
+    @Volatile
     private var failedAttempts = 0
+
+    @Volatile
     private var probeFailures = 0
 
     /**
@@ -145,9 +154,14 @@ class TunnelService : VpnService() {
                     runCatching { connectTunnel(configFinal, gen) }
                         .onFailure { t -> fail(t.logMessage()) }
                 }
+                // Redelivering a connect after process death is intentional:
+                // the service comes back up with the same AccessKey.
+                return START_REDELIVER_INTENT
             }
         }
-        return START_REDELIVER_INTENT
+        // Everything else (unknown or null action) must not be redelivered —
+        // a redelivered toggle or stop after process death would be a bug.
+        return START_NOT_STICKY
     }
 
     private suspend fun connectTunnel(configJson: String, gen: Int) {

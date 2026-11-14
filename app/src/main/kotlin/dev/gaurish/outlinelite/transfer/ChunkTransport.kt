@@ -3,6 +3,7 @@ package dev.gaurish.outlinelite.transfer
 import android.content.Context
 import android.net.Uri
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -44,6 +45,8 @@ object ChunkTransport {
     private const val CONCURRENCY = 4
     private const val UPLOAD_ATTEMPTS = 6
     private const val DOWNLOAD_ATTEMPTS = 30
+    private const val STATUS_ATTEMPTS = 3
+    private const val STATUS_BACKOFF_MS = 500L
 
     data class FileDigest(
         val fileHash: String,
@@ -293,6 +296,64 @@ object ChunkTransport {
                 .build()
             client.newCall(request).execute().use { }
         }
+    }
+
+    /**
+     * Parses a `/chunk/status` response body (`{"present":[…]}`) into the set
+     * of staged chunk indices. Indices outside `0 until [count]` and
+     * malformed bodies are dropped; resume then simply re-uploads them.
+     */
+    fun parsePresentIndices(body: String, count: Int): Set<Int> {
+        if (count <= 0) return emptySet()
+        val array = runCatching { JSONObject(body).optJSONArray("present") }.getOrNull() ?: return emptySet()
+        val out = HashSet<Int>(array.length())
+        for (i in 0 until array.length()) {
+            val index = array.optInt(i, -1)
+            if (index in 0 until count) out.add(index)
+        }
+        return out
+    }
+
+    /**
+     * Queries the relay for already-staged chunk indices (sender-side
+     * resume). Fails open: on error the sender re-uploads the whole file.
+     */
+    suspend fun fetchPresent(
+        client: OkHttpClient,
+        relayHost: String,
+        relayToken: String,
+        deviceId: String,
+        peerKey: ByteArray,
+        transferId: String,
+        sessionId: String,
+        count: Int,
+    ): Set<Int> {
+        if (count <= 0) return emptySet()
+        val url = "http://$relayHost/chunk/status?transfer_id=${Uri.encode(transferId)}" +
+            "&session_id=${Uri.encode(sessionId)}&count=$count" +
+            "&device_id=${Uri.encode(deviceId)}" +
+            "&cap=${Crypto.capabilityTag(peerKey, transferId, sessionId)}"
+        repeat(STATUS_ATTEMPTS) { attempt ->
+            if (attempt > 0) delay(STATUS_BACKOFF_MS)
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("X-Gaur-Token", relayToken)
+                    .get()
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val body = response.body ?: return emptySet()
+                        return parsePresentIndices(body.string(), count)
+                    }
+                }
+            } catch (c: CancellationException) {
+                throw c
+            } catch (_: Exception) {
+                // retry; resume fails open to a full upload
+            }
+        }
+        return emptySet()
     }
 
     private fun markHave(state: ReceiveState, stateFile: File, index: Int) {
