@@ -280,6 +280,7 @@ object NotificationDisplay {
             .setSubText(if (subtext.isNotBlank()) subtext else appName)
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .setAutoCancel(true)
 
         val iconB64 = payload.optString("icon")

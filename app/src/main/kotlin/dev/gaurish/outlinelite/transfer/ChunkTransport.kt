@@ -108,6 +108,8 @@ object ChunkTransport {
         client: OkHttpClient,
         relayHost: String,
         relayToken: String,
+        deviceId: String,
+        peerKey: ByteArray,
         transferId: String,
         sessionId: String,
         digest: FileDigest,
@@ -142,7 +144,7 @@ object ChunkTransport {
                             val nonce = Crypto.chunkNonce(index)
                             val aad = Crypto.chunkAad(transferId, sessionId, index, digest.chunkCount, digest.size)
                             val ciphertext = Crypto.encryptChunkAad(aesKey, nonce, plain, aad)
-                            putChunkWithRetry(client, relayHost, relayToken, transferId, sessionId, index, ciphertext)
+                            putChunkWithRetry(client, relayHost, relayToken, deviceId, peerKey, transferId, sessionId, index, ciphertext)
                             val n = done.addAndGet(length.toLong())
                             onProgress(n, total)
                         }
@@ -159,6 +161,8 @@ object ChunkTransport {
         client: OkHttpClient,
         relayHost: String,
         relayToken: String,
+        deviceId: String,
+        peerKey: ByteArray,
         transferId: String,
         sessionId: String,
         digest: FileDigest,
@@ -181,7 +185,7 @@ object ChunkTransport {
                     async(Dispatchers.IO) {
                         semaphore.withPermit {
                             val ciphertext = fetchChunkWithRetry(
-                                client, relayHost, relayToken, transferId, sessionId, index,
+                                client, relayHost, relayToken, deviceId, peerKey, transferId, sessionId, index,
                             )
                             if (ciphertext.size > MAX_CHUNK_SIZE) {
                                 throw IOException("Chunk $index exceeds relay limit")
@@ -274,10 +278,13 @@ object ChunkTransport {
         client: OkHttpClient,
         relayHost: String,
         relayToken: String,
+        deviceId: String,
+        peerKey: ByteArray,
         transferId: String,
         sessionId: String,
     ) {
-        val url = "http://$relayHost/transfer?transfer_id=${Uri.encode(transferId)}&session_id=${Uri.encode(sessionId)}"
+        val url = "http://$relayHost/transfer?transfer_id=${Uri.encode(transferId)}&session_id=${Uri.encode(sessionId)}" +
+            "&device_id=${Uri.encode(deviceId)}&cap=${Crypto.capabilityTag(peerKey, transferId, sessionId)}"
         runCatching {
             val request = Request.Builder()
                 .url(url)
@@ -305,12 +312,15 @@ object ChunkTransport {
         client: OkHttpClient,
         relayHost: String,
         relayToken: String,
+        deviceId: String,
+        peerKey: ByteArray,
         transferId: String,
         sessionId: String,
         index: Int,
         data: ByteArray,
     ) {
-        val url = "http://$relayHost/chunk?transfer_id=${Uri.encode(transferId)}&session_id=${Uri.encode(sessionId)}&index=$index"
+        val url = "http://$relayHost/chunk?transfer_id=${Uri.encode(transferId)}&session_id=${Uri.encode(sessionId)}&index=$index" +
+            "&device_id=${Uri.encode(deviceId)}&cap=${Crypto.capabilityTag(peerKey, transferId, sessionId)}"
         var backoff = 200L
         var lastError: Throwable? = null
         repeat(UPLOAD_ATTEMPTS) {
@@ -337,11 +347,14 @@ object ChunkTransport {
         client: OkHttpClient,
         relayHost: String,
         relayToken: String,
+        deviceId: String,
+        peerKey: ByteArray,
         transferId: String,
         sessionId: String,
         index: Int,
     ): ByteArray {
-        val url = "http://$relayHost/chunk?transfer_id=${Uri.encode(transferId)}&session_id=${Uri.encode(sessionId)}&index=$index"
+        val url = "http://$relayHost/chunk?transfer_id=${Uri.encode(transferId)}&session_id=${Uri.encode(sessionId)}&index=$index" +
+            "&device_id=${Uri.encode(deviceId)}&cap=${Crypto.capabilityTag(peerKey, transferId, sessionId)}"
         var backoff = 100L
         var lastError: Throwable? = null
         repeat(DOWNLOAD_ATTEMPTS) {

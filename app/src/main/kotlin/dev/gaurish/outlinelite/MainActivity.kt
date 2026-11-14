@@ -14,17 +14,28 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSizeClassApi
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -32,8 +43,11 @@ import androidx.lifecycle.lifecycleScope
 import dev.gaurish.outlinelite.data.AccessKey
 import dev.gaurish.outlinelite.data.DnsMode
 import dev.gaurish.outlinelite.data.KeyRepository
+import dev.gaurish.outlinelite.data.PairingRequest
 import dev.gaurish.outlinelite.data.SsKeyParser
 import dev.gaurish.outlinelite.data.ThemeMode
+import dev.gaurish.outlinelite.data.isValid
+import dev.gaurish.outlinelite.data.maskedToken
 import dev.gaurish.outlinelite.transfer.ClipboardSyncManager
 import dev.gaurish.outlinelite.transfer.MediaSessionBridge
 import dev.gaurish.outlinelite.transfer.NotificationMirrorManager
@@ -63,6 +77,7 @@ class MainActivity : ComponentActivity() {
     private var pendingSharedUris by mutableStateOf<List<Uri>>(emptyList())
     private var pendingSharedText by mutableStateOf<String?>(null)
     private var pendingOpenOnArrival by mutableStateOf(false)
+    private var pendingPairing by mutableStateOf<PairingRequest?>(null)
 
     private val consentLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -240,6 +255,17 @@ class MainActivity : ComponentActivity() {
                             },
                         )
                     }
+
+                    pendingPairing?.let { request ->
+                        PairingConfirmDialog(
+                            request = request,
+                            onConfirm = {
+                                pendingPairing = null
+                                applyPairing(request)
+                            },
+                            onCancel = { pendingPairing = null },
+                        )
+                    }
                 }
             }
         }
@@ -326,7 +352,10 @@ class MainActivity : ComponentActivity() {
     /**
      * Handles gaur://pair links produced by `gaur-relay -init`. The QR is
      * scanned with the system camera, so the app never needs camera
-     * permission or an in-app scanner. The token is never logged.
+     * permission or an in-app scanner. The parsed request is only held in
+     * [pendingPairing] until the user confirms it in
+     * [PairingConfirmDialog]; nothing is written up front. The token is
+     * never logged.
      */
     private fun handlePairingIntent(intent: Intent?) {
         val data = intent?.data ?: return
@@ -343,14 +372,28 @@ class MainActivity : ComponentActivity() {
             Toast.makeText(this, "Pairing code is missing the cluster token", Toast.LENGTH_LONG).show()
             return
         }
+        val request = PairingRequest(relay = relay, token = token, dns = dns, name = name)
+        if (!request.isValid()) {
+            Toast.makeText(this, "Pairing code is malformed", Toast.LENGTH_LONG).show()
+            return
+        }
+        pendingPairing = request
+    }
+
+    /** Applies a confirmed pairing request. */
+    private fun applyPairing(request: PairingRequest) {
         lifecycleScope.launch {
-            if (relay.isNotBlank()) KeyRepository.setRelayAddress(this@MainActivity, relay)
-            KeyRepository.setClusterToken(this@MainActivity, token)
-            if (dns.isNotBlank()) {
-                KeyRepository.setDnsMode(this@MainActivity, DnsMode.ADGUARD)
-                KeyRepository.setDnsServers(this@MainActivity, dns)
+            if (request.relay.isNotBlank()) {
+                KeyRepository.setRelayAddress(this@MainActivity, request.relay)
             }
-            if (name.isNotBlank()) KeyRepository.setDeviceName(this@MainActivity, name)
+            KeyRepository.setClusterToken(this@MainActivity, request.token)
+            if (request.dns.isNotBlank()) {
+                KeyRepository.setDnsMode(this@MainActivity, DnsMode.ADGUARD)
+                KeyRepository.setDnsServers(this@MainActivity, request.dns)
+            }
+            if (request.name.isNotBlank()) {
+                KeyRepository.setDeviceName(this@MainActivity, request.name)
+            }
             Toast.makeText(this@MainActivity, "Paired with cluster relay", Toast.LENGTH_SHORT).show()
         }
     }
@@ -432,4 +475,53 @@ class MainActivity : ComponentActivity() {
         const val KEY_PENDING_SHARED_TEXT = "pending_shared_text"
         const val KEY_PENDING_OPEN_ON_ARRIVAL = "pending_open_on_arrival"
     }
+}
+
+/**
+ * Asks the user to confirm a gaur://pair request before it rewrites the
+ * relay address, cluster token, DNS, and device name. Blank fields are
+ * shown as "unchanged" because the confirm step only writes non-blank
+ * values (except the token, which is always present at this point).
+ */
+@Composable
+private fun PairingConfirmDialog(
+    request: PairingRequest,
+    onConfirm: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Pair with cluster?") },
+        text = {
+            Column {
+                PairingRow("Relay", request.relay.ifBlank { "unchanged" })
+                PairingRow("Token", request.maskedToken())
+                PairingRow("DNS", request.dns.ifBlank { "unchanged" })
+                PairingRow("Device name", request.name.ifBlank { "unchanged" })
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    "Only continue if you scanned this QR yourself.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm) { Text("Pair") }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel) { Text("Cancel") }
+        },
+    )
+}
+
+@Composable
+private fun PairingRow(label: String, value: String) {
+    Text(
+        label,
+        fontSize = 12.sp,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Text(value, fontSize = 14.sp)
+    Spacer(Modifier.height(8.dp))
 }

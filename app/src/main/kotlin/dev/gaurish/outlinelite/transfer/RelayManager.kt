@@ -34,6 +34,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -133,8 +134,15 @@ object RelayManager {
             val (relayToken, peerCryptoKey) = Crypto.deriveSubKeys(token)
             val deviceName = KeyRepository.getDeviceName(context)
             val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
-            val url = "ws://$relayHost/ws?device_id=$deviceId&name=${Uri.encode(deviceName)}&token=${Uri.encode(relayToken)}"
-            val request = Request.Builder().url(url).build()
+            if (!RelayHosts.isInTunnelHost(relayHost)) {
+                Log.w(TAG, "Refusing relay '$relayHost': host is not tunnel-only")
+                return@launch
+            }
+            val url = "ws://$relayHost/ws?device_id=$deviceId&name=${Uri.encode(deviceName)}"
+            val request = Request.Builder()
+                .url(url)
+                .header("X-Gaur-Token", relayToken)
+                .build()
 
             Log.i(TAG, "Connecting to in-tunnel relay at $relayHost")
             ws = client.newWebSocket(request, object : WebSocketListener() {
@@ -326,7 +334,7 @@ object RelayManager {
 
     private suspend fun handleClipboardUpdate(context: Context, json: JSONObject) {
         val fromId = json.optString("from_id")
-        if (fromId.isBlank() || fromId == deviceId) return
+        if (!acceptsInbound(context, InboundKind.CLIPBOARD, fromId)) return
 
         val msgId = json.optString("msg_id")
         val ts = json.optLong("ts", 0L)
@@ -431,7 +439,7 @@ object RelayManager {
         val fromId = json.optString("from_id")
         if (fromId.isBlank() || fromId == deviceId) return
         val senderDeviceId = json.optString("sender_id", fromId)
-        if (isUntrustedSender(context, senderDeviceId)) return
+        if (!acceptsInbound(context, InboundKind.TEXT, senderDeviceId)) return
         val fromName = json.optString("from_name", "Remote device")
         val msgId = json.optString("msg_id")
         val ts = json.optLong("ts", 0L)
@@ -511,7 +519,7 @@ object RelayManager {
 
     private suspend fun handleNotificationEvent(context: Context, json: JSONObject) {
         val fromId = json.optString("from_id")
-        if (fromId.isBlank() || fromId == deviceId) return
+        if (!acceptsInbound(context, InboundKind.NOTIFICATION, fromId)) return
         val fromName = json.optString("from_name", "Remote device")
         val msgId = json.optString("msg_id")
         val ts = json.optLong("ts", 0L)
@@ -550,7 +558,7 @@ object RelayManager {
 
     private suspend fun handleNotificationAction(context: Context, json: JSONObject) {
         val fromId = json.optString("from_id")
-        if (fromId.isBlank() || fromId == deviceId) return
+        if (!acceptsInbound(context, InboundKind.NOTIFICATION_ACTION, fromId)) return
         val msgId = json.optString("msg_id")
         val ts = json.optLong("ts", 0L)
         val nonceB64 = json.optString("nonce")
@@ -769,6 +777,8 @@ object RelayManager {
             client = client,
             relayHost = relayHost,
             relayToken = relayToken,
+            deviceId = deviceId,
+            peerKey = peerCryptoKey,
             transferId = transferId,
             sessionId = sessionId,
             digest = digest,
@@ -911,9 +921,8 @@ object RelayManager {
             JSONObject(String(plaintext, Charsets.UTF_8))
         }.getOrNull() ?: return
         val senderId = inner.optString("sender_id")
-        if (senderId.isBlank() || senderId == deviceId) return
+        if (!acceptsInbound(context, sealedInboundKind(kind), senderId)) return
         val senderName = inner.optString("sender_name", "Remote device")
-        if (isUntrustedSender(context, senderId)) return
 
         when (kind) {
             "offer" -> handleSealedOfferV3(
@@ -1020,6 +1029,8 @@ object RelayManager {
                 client = client,
                 relayHost = relayHost,
                 relayToken = relayToken,
+                deviceId = deviceId,
+                peerKey = peerCryptoKey,
                 transferId = transferId,
                 sessionId = sessionId,
                 digest = digest,
@@ -1084,13 +1095,41 @@ object RelayManager {
         }
     }
 
-    private suspend fun isUntrustedSender(context: Context, senderId: String): Boolean {
-        if (senderId == deviceId) return false
+    /**
+     * Central inbound trust gate. Resolves the "only trusted devices"
+     * setting and the trusted-device list, then delegates to
+     * [InboundPolicy]. On rejection, logs a single line with the sender id
+     * and kind — never any payload.
+     */
+    private suspend fun acceptsInbound(context: Context, kind: InboundKind, senderId: String): Boolean {
         val onlyTrusted = runCatching {
             TransferSettingsRepository.onlyTrusted(context)
         }.getOrDefault(false)
-        if (!onlyTrusted) return false
-        return !TrustedDeviceRepository.isTrusted(context, senderId)
+        val trustedIds = if (onlyTrusted) {
+            runCatching {
+                TrustedDeviceRepository.observe(context).first().map { it.id }.toSet()
+            }.getOrDefault(emptySet())
+        } else {
+            emptySet()
+        }
+        val accepted = InboundPolicy.shouldAccept(kind, senderId, deviceId, trustedIds, onlyTrusted)
+        if (!accepted) {
+            Log.i(
+                TAG,
+                "Rejected inbound ${kind.name.lowercase().replace('_', ' ')} " +
+                    "from sender ${senderId.ifBlank { "(no id)" }}",
+            )
+        }
+        return accepted
+    }
+
+    private fun sealedInboundKind(kind: String): InboundKind = when (kind) {
+        "offer", "complete" -> InboundKind.OFFER
+        "text" -> InboundKind.TEXT
+        "notification" -> InboundKind.NOTIFICATION
+        "notification_action" -> InboundKind.NOTIFICATION_ACTION
+        "media_state", "media_command" -> InboundKind.MEDIA
+        else -> InboundKind.TEXT
     }
 
     private suspend fun handleIncomingOfferV1(
@@ -1110,8 +1149,12 @@ object RelayManager {
         val batchTotal = offer.optInt("batch_total", 1).coerceAtLeast(1)
         val batchIndex = offer.optInt("batch_index", 0).coerceIn(0, batchTotal - 1)
 
-        // Zero-knowledge peer-to-peer authentication (MITM defense)
-        val expectedOfferMsg = "offer:$transferId:$deviceId:$senderPubB64"
+        // Zero-knowledge peer-to-peer authentication (MITM defense). The tag
+        // binds the raw envelope fields — including file name and size —
+        // before any sanitization, so a relay cannot swap the payload.
+        val expectedOfferMsg = TransferOfferCodec.v1OfferAuthMessage(
+            transferId, deviceId, senderPubB64, rawFileName, fileSize,
+        )
         if (!Crypto.verifyAuthTag(peerCryptoKey, expectedOfferMsg, offerTag)) {
             Log.e(TAG, "Incoming offer auth tag invalid! Rejecting potential MITM or unauthorized peer.")
             val rejectMsg = JSONObject().apply {
@@ -1124,7 +1167,7 @@ object RelayManager {
             return
         }
 
-        if (isUntrustedSender(context, senderDeviceId)) {
+        if (!acceptsInbound(context, InboundKind.OFFER, senderDeviceId)) {
             ws?.send(JSONObject().apply {
                 put("type", "transfer_reject")
                 put("target_id", senderId)
@@ -1187,8 +1230,11 @@ object RelayManager {
 
         val partFile = File(downloadsDir, ".${cleanName}.${transferId}.part")
         val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST }
-        val pipeUrl = "http://$relayHost/pipe?transfer_id=$transferId&role=receiver&token=${Uri.encode(relayToken)}"
-        val request = Request.Builder().url(pipeUrl).build()
+        val pipeUrl = "http://$relayHost/pipe?transfer_id=$transferId&role=receiver"
+        val request = Request.Builder()
+            .url(pipeUrl)
+            .header("X-Gaur-Token", relayToken)
+            .build()
 
         client.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
@@ -1369,7 +1415,7 @@ object RelayManager {
             return
         }
 
-        if (isUntrustedSender(context, senderDeviceId)) {
+        if (!acceptsInbound(context, InboundKind.OFFER, senderDeviceId)) {
             ws?.send(JSONObject().apply {
                 put("type", "transfer_reject")
                 put("target_id", senderId)
@@ -1454,6 +1500,8 @@ object RelayManager {
                 client = client,
                 relayHost = KeyRepository.getRelayAddress(context).ifBlank { RELAY_HOST },
                 relayToken = relayToken,
+                deviceId = deviceId,
+                peerKey = peerCryptoKey,
                 transferId = transferId,
                 sessionId = sessionId,
                 digest = digest,
@@ -1811,6 +1859,8 @@ object RelayManager {
                 client = client,
                 relayHost = relayHost,
                 relayToken = relayToken,
+                deviceId = deviceId,
+                peerKey = peerCryptoKey,
                 transferId = transferId,
                 sessionId = sessionId,
                 digest = digest,
@@ -1857,7 +1907,7 @@ object RelayManager {
             pendingCompletes.remove(transferId)
         }
 
-        ChunkTransport.deleteTransfer(client, relayHost, relayToken, transferId, sessionId)
+        ChunkTransport.deleteTransfer(client, relayHost, relayToken, deviceId, peerCryptoKey, transferId, sessionId)
     }
 
     private fun completionTimeout(fileSize: Long): Long {

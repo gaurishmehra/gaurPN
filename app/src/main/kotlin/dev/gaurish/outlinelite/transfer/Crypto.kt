@@ -169,6 +169,24 @@ object Crypto {
         return mac.doFinal("gaur-shared-file-v1:$transferId".toByteArray(Charsets.UTF_8))
     }
 
+    /**
+     * Per-transfer capability tag for the relay's chunk-ownership check.
+     * hex(HMAC-SHA256(K_peer, "gaur-cap-v1:<transferId>:<sessionId>")).
+     * Identical on sender and receiver because both hold K_peer; the relay
+     * derives the same value from the master token it already keeps.
+     */
+    fun capabilityTag(peerCryptoKey: ByteArray, transferId: String, sessionId: String): String {
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(peerCryptoKey, "HmacSHA256"))
+        val digest = mac.doFinal("gaur-cap-v1:$transferId:$sessionId".toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(digest.size * 2)
+        for (b in digest) {
+            sb.append("0123456789abcdef"[(b.toInt() shr 4) and 0xF])
+            sb.append("0123456789abcdef"[b.toInt() and 0xF])
+        }
+        return sb.toString()
+    }
+
     /** Key for a sealed v3 envelope, domain-separated by message kind. */
     fun deriveSealKey(peerCryptoKey: ByteArray, kind: String): ByteArray {
         val mac = Mac.getInstance("HmacSHA256")

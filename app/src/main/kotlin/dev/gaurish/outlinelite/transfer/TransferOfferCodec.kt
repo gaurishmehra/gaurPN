@@ -1,7 +1,9 @@
 package dev.gaurish.outlinelite.transfer
 
+import dev.gaurish.outlinelite.util.StdBase64
+
 /**
- * Pure helpers shared by the sender and receiver of v2 transfer offers.
+ * Pure helpers shared by the sender and receiver of transfer offers.
  * Kept free of Android dependencies so JVM unit tests can verify the
  * offer-auth contract directly.
  */
@@ -24,6 +26,26 @@ internal object TransferOfferCodec {
     ): String =
         "offer:v2:$transferId:$receiverDeviceId:$senderPubB64:$fileHash:$chunkCount:$chunkSize:" +
             openBit(openOnArrival)
+
+    /**
+     * Canonical offer verification string for v1 transfers. Binds the file
+     * name and size so a relay cannot strip or swap the payload after the
+     * sender signed the offer. Computed over the RAW envelope fields, before
+     * any sanitization.
+     *
+     * Layout (desktop client mirrors this in Go with base64.StdEncoding):
+     * "offer:v1:" + transferId + ":" + receiverDeviceId + ":" + senderPubB64 +
+     * ":" + base64Std(fileNameUtf8) + ":" + fileSize
+     */
+    fun v1OfferAuthMessage(
+        transferId: String,
+        receiverDeviceId: String,
+        senderPubB64: String,
+        fileName: String,
+        fileSize: Long,
+    ): String =
+        "offer:v1:$transferId:$receiverDeviceId:$senderPubB64:" +
+            StdBase64.encode(fileName.toByteArray(Charsets.UTF_8)) + ":$fileSize"
 
     fun openBit(openOnArrival: Boolean): String = if (openOnArrival) "1" else "0"
 

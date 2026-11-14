@@ -2,6 +2,6 @@
 <paths xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- Received clipboard images are exposed to the pasting app via FileProvider. -->
     <files-path name="clipboard" path="clipboard/" />
-    <!-- Received transfer files land in Downloads and are opened via ACTION_VIEW. -->
-    <external-path name="downloads" path="." />
+    <!-- Received transfer files land in public Downloads and are opened via ACTION_VIEW. -->
+    <external-path name="downloads" path="Download/" />
 </paths>

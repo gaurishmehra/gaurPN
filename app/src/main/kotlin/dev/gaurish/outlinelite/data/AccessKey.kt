@@ -3,6 +3,7 @@ package dev.gaurish.outlinelite.data
 import org.json.JSONObject
 import java.net.URLDecoder
 import java.net.URLEncoder
+import java.security.MessageDigest
 
 data class AccessKey(
     val name: String,
@@ -12,7 +13,7 @@ data class AccessKey(
     val password: String,
 ) {
     /** Stable identity for DataStore keys and active selection. */
-    val id: String get() = "$host:$port|$method|${password.hashCode()}"
+    val id: String get() = computeStableId()
 
     /** Backing config for outlinev.ConnectTunnel / CheckConnectivity. */
     fun configJson(): String = JSONObject().apply {
@@ -33,6 +34,42 @@ data class AccessKey(
         return "ss://$b64@$hostPart:$port#$encodedName"
     }
 }
+
+/**
+ * Stable id for an access key. Java String.hashCode can collide (e.g.
+ * "Aa" and "BB" both hash to 2112), which would let two distinct servers
+ * share an identity in DataStore; this uses a truncated SHA-256 instead.
+ */
+fun AccessKey.computeStableId(): String =
+    "$host:$port|$method|" + sha256Hex("gaur-accesskey-v1:$password").take(16)
+
+/** Legacy pre-migration id formula, kept only to remap stored active selections. */
+fun AccessKey.legacyId(): String = "$host:$port|$method|${password.hashCode()}"
+
+/** Result of the one-time stable-id migration. */
+data class AccessKeyMigration(
+    val keys: List<AccessKey>,
+    val activeId: String?,
+    val changed: Boolean,
+)
+
+/**
+ * Remaps a stored active id that still uses the legacy formula onto the
+ * matching key's stable id. The key list carries no stored ids (they are
+ * derived from the fields), so it is returned unchanged; [changed] tells
+ * the caller the stored selection needs persisting once.
+ */
+fun migrateAccessKeyIds(keys: List<AccessKey>, storedActiveId: String?): AccessKeyMigration {
+    if (storedActiveId == null) return AccessKeyMigration(keys, null, false)
+    if (keys.any { it.id == storedActiveId }) return AccessKeyMigration(keys, storedActiveId, false)
+    val legacyMatch = keys.firstOrNull { it.legacyId() == storedActiveId }
+        ?: return AccessKeyMigration(keys, storedActiveId, false)
+    return AccessKeyMigration(keys, legacyMatch.computeStableId(), true)
+}
+
+private fun sha256Hex(s: String): String =
+    MessageDigest.getInstance("SHA-256").digest(s.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it.toInt() and 0xFF) }
 
 /**
  * Parses Outline access keys (`ss://` URIs).

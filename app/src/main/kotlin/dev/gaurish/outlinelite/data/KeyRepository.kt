@@ -5,9 +5,12 @@ import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -47,6 +50,31 @@ object KeyRepository {
     const val DEFAULT_RELAY_ADDR = "198.51.100.1:9876"
 
     /**
+     * Seals secret values (cluster token, SS keys JSON) before they land in
+     * DataStore. Injectable so JVM tests can swap in a fake box; the real
+     * one is only ever built on an Android runtime via the AndroidKeyStore.
+     */
+    internal var secretBoxProvider: (Context) -> SecretBox = { KeystoreSecretBox(it) }
+
+    private fun box(context: Context): SecretBox = secretBoxProvider(context.applicationContext)
+
+    /** Opens a stored secret; null stays null, legacy plaintext passes through. */
+    private fun openSecret(context: Context, raw: String?): String? {
+        if (raw == null) return null
+        if (!raw.startsWith(SECRET_MARKER)) return raw
+        return unwrapSecret(raw, box(context))
+    }
+
+    private fun sealStored(context: Context, plain: String): String =
+        sealSecret(plain, box(context))
+
+    private fun decodeStoredKeys(context: Context, raw: String?): List<AccessKey> =
+        decodeKeys(openSecret(context, raw) ?: "")
+
+    private fun encodeStoredKeys(context: Context, keys: List<AccessKey>): String =
+        sealStored(context, encodeKeys(keys))
+
+    /**
      * AdGuard Home on the VPS, reached through the Shadowsocks tunnel.
      * The VPS private address is stable and is forced into the tunnel with a
      * /32 route, so LAN bypass cannot steal it.
@@ -77,13 +105,25 @@ object KeyRepository {
     }
 
     fun observeClusterToken(context: Context): Flow<String> =
-        context.dataStore.data.map { it[CLUSTER_TOKEN] ?: "" }
+        context.dataStore.data
+            .map { openSecret(context, it[CLUSTER_TOKEN]) ?: "" }
+            .flowOn(Dispatchers.IO)
 
-    suspend fun getClusterToken(context: Context): String =
-        context.dataStore.data.first()[CLUSTER_TOKEN] ?: ""
+    suspend fun getClusterToken(context: Context): String = withContext(Dispatchers.IO) {
+        val raw = context.dataStore.data.first()[CLUSTER_TOKEN] ?: return@withContext ""
+        if (!raw.startsWith(SECRET_MARKER)) {
+            // Legacy plaintext: best-effort re-seal, then return it as-is.
+            if (raw.isNotEmpty()) runCatching { setClusterToken(context, raw) }
+            return@withContext raw
+        }
+        unwrapSecret(raw, box(context))
+    }
 
     suspend fun setClusterToken(context: Context, token: String) {
-        context.dataStore.edit { it[CLUSTER_TOKEN] = token.trim() }
+        val clean = token.trim()
+        context.dataStore.edit { prefs ->
+            prefs[CLUSTER_TOKEN] = sealStored(context, clean)
+        }
     }
 
     fun observeClipboardSync(context: Context): Flow<Boolean> =
@@ -124,7 +164,9 @@ object KeyRepository {
     }
 
     fun observeKeys(context: Context): Flow<List<AccessKey>> =
-        context.dataStore.data.map { decodeKeys(it[KEYS]) }
+        context.dataStore.data
+            .map { decodeStoredKeys(context, it[KEYS]) }
+            .flowOn(Dispatchers.IO)
 
     fun observeActiveId(context: Context): Flow<String?> =
         context.dataStore.data.map { it[ACTIVE] }
@@ -157,11 +199,24 @@ object KeyRepository {
     suspend fun autoReconnect(context: Context): Boolean =
         context.dataStore.data.first()[AUTO_RECONNECT] ?: true
 
-    suspend fun activeKey(context: Context): AccessKey? {
+    suspend fun activeKey(context: Context): AccessKey? = withContext(Dispatchers.IO) {
         val prefs = context.dataStore.data.first()
-        val keys = decodeKeys(prefs[KEYS])
+        val rawKeys = prefs[KEYS]
+        val keys = decodeStoredKeys(context, rawKeys)
         val active = prefs[ACTIVE]
-        return keys.firstOrNull { it.id == active }
+        val migration = migrateAccessKeyIds(keys, active)
+        // Re-seal a legacy plaintext key list and persist the remapped
+        // selection in one pass ("persist the migrated list once").
+        val needsReseal = !rawKeys.isNullOrEmpty() && !rawKeys.startsWith(SECRET_MARKER)
+        if (migration.changed || needsReseal) {
+            runCatching {
+                context.dataStore.edit { p ->
+                    if (needsReseal) p[KEYS] = encodeStoredKeys(context, keys)
+                    if (migration.changed) p[ACTIVE] = migration.activeId ?: ""
+                }
+            }
+        }
+        keys.firstOrNull { it.id == migration.activeId }
     }
 
     suspend fun autostart(context: Context): Boolean = context.dataStore.data.first()[AUTOSTART] ?: false
@@ -170,11 +225,13 @@ object KeyRepository {
     suspend fun addKey(context: Context, key: AccessKey): Boolean {
         var added = false
         context.dataStore.edit { prefs ->
-            val list = decodeKeys(prefs[KEYS]).toMutableList()
+            val list = decodeStoredKeys(context, prefs[KEYS]).toMutableList()
+            val migration = migrateAccessKeyIds(list, prefs[ACTIVE])
+            if (migration.changed) prefs[ACTIVE] = migration.activeId ?: ""
             if (list.none { it.id == key.id }) {
                 list += key
                 added = true
-                prefs[KEYS] = encodeKeys(list)
+                prefs[KEYS] = encodeStoredKeys(context, list)
                 if (prefs[ACTIVE] == null) {
                     prefs[ACTIVE] = key.id
                 }
@@ -187,31 +244,40 @@ object KeyRepository {
         val cleanName = newName.trim()
         if (cleanName.isBlank()) return
         context.dataStore.edit { prefs ->
-            val list = decodeKeys(prefs[KEYS]).map { key ->
+            val list = decodeStoredKeys(context, prefs[KEYS]).map { key ->
                 if (key.id == id) key.copy(name = cleanName) else key
             }
-            prefs[KEYS] = encodeKeys(list)
+            val migration = migrateAccessKeyIds(list, prefs[ACTIVE])
+            if (migration.changed) prefs[ACTIVE] = migration.activeId ?: ""
+            prefs[KEYS] = encodeStoredKeys(context, list)
         }
     }
 
     suspend fun setActive(context: Context, id: String) {
         context.dataStore.edit { prefs ->
-            val exists = decodeKeys(prefs[KEYS]).any { it.id == id }
-            if (exists) prefs[ACTIVE] = id
+            val keys = decodeStoredKeys(context, prefs[KEYS])
+            val migration = migrateAccessKeyIds(keys, prefs[ACTIVE])
+            if (migration.changed) prefs[ACTIVE] = migration.activeId ?: ""
+            if (keys.any { it.id == id }) prefs[ACTIVE] = id
         }
     }
 
     suspend fun removeKey(context: Context, id: String) {
         context.dataStore.edit { prefs ->
-            val list = decodeKeys(prefs[KEYS]).filterNot { it.id == id }
-            prefs[KEYS] = encodeKeys(list)
-            if (prefs[ACTIVE] == id) {
-                val next = list.firstOrNull()?.id
-                if (next != null) {
-                    prefs[ACTIVE] = next
-                } else {
-                    prefs.remove(ACTIVE)
+            val list = decodeStoredKeys(context, prefs[KEYS]).filterNot { it.id == id }
+            val migration = migrateAccessKeyIds(list, prefs[ACTIVE])
+            val activeStillValid = prefs[ACTIVE] == null || list.any { it.id == migration.activeId }
+            prefs[KEYS] = encodeStoredKeys(context, list)
+            when {
+                !activeStillValid -> {
+                    val next = list.firstOrNull()?.id
+                    if (next != null) {
+                        prefs[ACTIVE] = next
+                    } else {
+                        prefs.remove(ACTIVE)
+                    }
                 }
+                migration.changed -> prefs[ACTIVE] = migration.activeId ?: ""
             }
         }
     }
