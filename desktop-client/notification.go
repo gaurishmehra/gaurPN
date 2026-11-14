@@ -168,6 +168,10 @@ func handleIncomingNotification(cfg Config, peerCryptoKey []byte, client *wsClie
 		nonceB64 == "" || dataB64 == "" {
 		return
 	}
+	if !replayGuard.Allow("notification", msgID, envelopeRelayTs(envelope)) {
+		log.Printf("[NOTIF] Dropped replayed notification from %s (msg_id=%s)", fromID, msgID)
+		return
+	}
 
 	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
 	if err != nil {
@@ -236,25 +240,15 @@ func displayMirroredNotification(
 		}
 	}
 
-	args := []string{"-a", "gaurPN", "-t", "8000"}
-	if iconPath != "" {
-		args = append(args, "-i", iconPath)
-	}
+	actionArgs := make([]string, 0, len(payload.Actions))
 	for _, action := range payload.Actions {
-		args = append(args, "-A", fmt.Sprintf("%d=%s", action.Index, action.Title))
+		actionArgs = append(actionArgs, fmt.Sprintf("%d=%s", action.Index, action.Title))
 	}
-	args = append(args, displayTitle, body)
-
-	out, err := exec.Command("notify-send", args...).Output()
+	out, err := exec.Command("notify-send", notifySendArgs(displayTitle, body, iconPath, actionArgs)...).Output()
 	if err != nil {
 		// Some notification daemons reject action buttons. Fall back to a
 		// plain notification rather than dropping the event.
-		fallback := []string{"-a", "gaurPN", "-t", "8000"}
-		if iconPath != "" {
-			fallback = append(fallback, "-i", iconPath)
-		}
-		fallback = append(fallback, displayTitle, body)
-		_ = exec.Command("notify-send", fallback...).Run()
+		_ = exec.Command("notify-send", notifySendArgs(displayTitle, body, iconPath, nil)...).Run()
 		return
 	}
 
@@ -288,6 +282,30 @@ func displayMirroredNotification(
 	); err != nil {
 		log.Printf("[NOTIF] Could not send action to %s: %v", fromID, err)
 	}
+}
+
+// notifySendArgs assembles the argument vector for notify-send: fixed
+// options, an optional icon, optional "-A" actions, then the "--" sentinel
+// and the positional title and body. "--" ends option parsing, so a title or
+// body beginning with "-" is delivered as text instead of being read as an
+// option.
+func notifySendArgs(title, body, iconPath string, actions []string) []string {
+	args := []string{"-a", "gaurPN", "-t", "8000"}
+	if iconPath != "" {
+		args = append(args, "-i", iconPath)
+	}
+	for _, action := range actions {
+		args = append(args, "-A", action)
+	}
+	return append(args, "--", title, body)
+}
+
+// escapeAppleScriptString makes text safe to embed inside an AppleScript
+// double-quoted string literal: backslash first, then the double quote.
+// Without it a body like `" & quit & "` would break out into live script.
+func escapeAppleScriptString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
 }
 
 func promptReply(title string) string {

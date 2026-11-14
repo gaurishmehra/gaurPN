@@ -205,6 +205,18 @@ func loadToken(path string) (string, error) {
 		}
 		return "", fmt.Errorf("unable to read token from %s and GAURPN_CLUSTER_TOKEN not set: %w", path, err)
 	}
+	// A group- or world-readable cluster key hands the whole cluster to every
+	// other local user, so refuse to start rather than use it.
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return "", fmt.Errorf("cannot verify permissions of token file %s: %w", path, statErr)
+	}
+	if perms := info.Mode().Perm(); perms&0o077 != 0 {
+		return "", fmt.Errorf(
+			"token file %s is exposed to other users (mode %04o); refusing to start. Fix with: chmod 600 %s",
+			path, perms, path,
+		)
+	}
 	return strings.TrimSpace(string(data)), nil
 }
 
@@ -240,9 +252,12 @@ func generateDeviceID() string {
 func notifyUser(title, message string) {
 	switch runtime.GOOS {
 	case "linux":
-		_ = exec.Command("notify-send", "-a", "gaurPN", title, message).Run()
+		// "--" ends option parsing so a title or message beginning with "-"
+		// is delivered as text, never read as a notify-send option.
+		_ = exec.Command("notify-send", "-a", "gaurPN", "--", title, message).Run()
 	case "darwin":
-		script := fmt.Sprintf(`display notification "%s" with title "%s"`, message, title)
+		script := fmt.Sprintf(`display notification "%s" with title "%s"`,
+			escapeAppleScriptString(message), escapeAppleScriptString(title))
 		_ = exec.Command("osascript", "-e", script).Run()
 	}
 }
@@ -286,10 +301,13 @@ func connectWS(cfg Config, token string) (*websocket.Conn, error) {
 	q := u.Query()
 	q.Set("device_id", cfg.DeviceID)
 	q.Set("name", cfg.Name)
-	q.Set("token", token)
 	u.RawQuery = q.Encode()
 
-	conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+	// The relay token travels in a header, not the query string, so it never
+	// lands in URL form (the relay accepts both; the header is the contract).
+	header := http.Header{}
+	header.Set("X-Gaur-Token", token)
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), header)
 	return conn, err
 }
 
@@ -303,6 +321,9 @@ func runDaemon(cfg Config) {
 		log.Fatalf("[FATAL] %v", err)
 	}
 	relayToken, peerCryptoKey := DeriveSubKeys(token)
+
+	// Fresh replay protection for this daemon lifetime.
+	replayGuard = NewReplayGuard()
 
 	sender := &CommandSender{cfg: cfg}
 	mpris, mprisErr := NewMprisManager(sender.Send)
@@ -578,9 +599,19 @@ func runClipboardSocketServer(ctx context.Context, cfg Config, client *wsClient,
 		return
 	}
 	_ = os.Remove(path)
-	ln, err := net.Listen("unix", path)
-	if err != nil {
-		log.Printf("[CLIP] Cannot listen on %s: %v", path, err)
+	// Create the socket under a tightened umask so it is private from the
+	// moment it appears; the explicit chmod below is kept for the contract.
+	var ln net.Listener
+	listenErr := withUmask(func() error {
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			return err
+		}
+		ln = l
+		return nil
+	})
+	if listenErr != nil {
+		log.Printf("[CLIP] Cannot listen on %s: %v", path, listenErr)
 		return
 	}
 	defer ln.Close()
@@ -609,6 +640,12 @@ func runClipboardSocketServer(ctx context.Context, cfg Config, client *wsClient,
 		if err != nil {
 			closeAll()
 			return
+		}
+		// Only processes of the same user may push clipboard events.
+		if credErr := sameUserConn(conn); credErr != nil {
+			log.Printf("[CLIP] Rejected clipboard socket connection: %v", credErr)
+			_ = conn.Close()
+			continue
 		}
 		connMu.Lock()
 		conns[conn] = struct{}{}
@@ -777,6 +814,10 @@ func handleIncomingText(cfg Config, peerCryptoKey []byte, envelope map[string]in
 		log.Printf("[TEXT] Dropped malformed text message from %s", fromID)
 		return
 	}
+	if !replayGuard.Allow("text", msgID, envelopeRelayTs(envelope)) {
+		log.Printf("[TEXT] Dropped replayed text message from %s (msg_id=%s)", fromID, msgID)
+		return
+	}
 
 	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
 	if err != nil {
@@ -792,11 +833,18 @@ func handleIncomingText(cfg Config, peerCryptoKey []byte, envelope map[string]in
 		log.Printf("[TEXT] Authentication failed for text message from %s", fromID)
 		return
 	}
-	if len(plaintext) > 64*1024 {
-		log.Printf("[TEXT] Rejecting oversized text message from %s (%d bytes)", fromID, len(plaintext))
+
+	applyIncomingText(fromID, fromName, kind, plaintext)
+}
+
+// applyIncomingText copies a received text or link to the clipboard and
+// raises a notification. It is shared by the v1 text_message path and the
+// sealed v3 text path; neither persists the text anywhere.
+func applyIncomingText(fromID, fromName, kind string, plaintext []byte) {
+	if len(plaintext) == 0 || len(plaintext) > 64*1024 {
+		log.Printf("[TEXT] Rejecting invalid text message from %s (%d bytes)", fromID, len(plaintext))
 		return
 	}
-
 	text := string(plaintext)
 	// Writing the clipboard makes Quickshell's cliphist watcher fire. Mark the
 	// payload as already-applied so the daemon does not echo it back to the
@@ -849,8 +897,13 @@ func handleIncomingTransferV1(cfg Config, relayToken string, peerCryptoKey []byt
 		return
 	}
 
-	// Finding 3: Zero-knowledge peer authentication (Relay MITM Defense)
-	expectedOfferMsg := fmt.Sprintf("offer:%s:%s:%s", transferID, cfg.DeviceID, senderPubB64)
+	// Finding 3: Zero-knowledge peer authentication (Relay MITM Defense).
+	// The v1 tag binds the raw (pre-sanitization) filename and exact size so a
+	// malicious relay cannot alter offer metadata. Format is pinned in
+	// lockstep with Android's TransferOfferCodec.
+	expectedOfferMsg := fmt.Sprintf("offer:v1:%s:%s:%s:%s:%d",
+		transferID, cfg.DeviceID, senderPubB64,
+		base64.StdEncoding.EncodeToString([]byte(rawFileName)), fileSize)
 	if !VerifyAuthTag(peerCryptoKey, expectedOfferMsg, offerTag) {
 		log.Printf("[RECV] Incoming offer auth tag invalid! Rejecting potential MITM or unauthorized peer: %s", transferID)
 		_ = wsConn.WriteJSON(map[string]interface{}{
@@ -935,9 +988,10 @@ func handleIncomingTransferV1(cfg Config, relayToken string, peerCryptoKey []byt
 	}
 	_ = wsConn.WriteJSON(acceptMsg)
 
-	// Connect to pipe
-	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=receiver&token=%s", cfg.RelayAddr, transferID, url.QueryEscape(relayToken))
+	// Connect to pipe. Token rides in the header, not the URL.
+	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=receiver", cfg.RelayAddr, transferID)
 	req, _ := http.NewRequest("GET", pipeURL, nil)
+	req.Header.Set("X-Gaur-Token", relayToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
 		log.Printf("[RECV] Failed to connect to pipe: %v", err)
@@ -1203,7 +1257,7 @@ func handleIncomingTransferV2(ctx context.Context, cfg Config, relayToken string
 
 	startTime := time.Now()
 	lastPrint := time.Now()
-	err = downloadChunks(ctx, cfg, relayToken, transferID, sessionID, digest, aesKey, missing, partPath, state, statePath, func(done, total int64) {
+	err = downloadChunks(ctx, cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey}, transferID, sessionID, digest, aesKey, missing, partPath, state, statePath, func(done, total int64) {
 		if time.Since(lastPrint) < 250*time.Millisecond {
 			return
 		}
@@ -1808,7 +1862,7 @@ func sendAttempt(cfg Config, conn *websocket.Conn, relayToken string, peerCrypto
 
 	startTime := time.Now()
 	lastPrint := time.Now()
-	err = uploadChunks(cfg, relayToken, transferID, sessionID, digest, aesKey, missing, meta.Path, func(done, total int64) {
+	err = uploadChunks(cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey}, transferID, sessionID, digest, aesKey, missing, meta.Path, func(done, total int64) {
 		if time.Since(lastPrint) < 200*time.Millisecond {
 			return
 		}
@@ -1836,7 +1890,7 @@ func sendAttempt(cfg Config, conn *websocket.Conn, relayToken string, peerCrypto
 	if err := waitForComplete(conn, transferID, peerCryptoKey, cfg.DeviceID, digest); err != nil {
 		return err
 	}
-	deleteTransfer(cfg, relayToken, transferID, sessionID)
+	deleteTransfer(cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey}, transferID, sessionID)
 	return nil
 }
 

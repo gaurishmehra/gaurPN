@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -197,17 +198,43 @@ func chunkLength(index int, fileSize int64) int {
 	return int(remaining)
 }
 
-func chunkEndpoint(cfg Config, transferID, sessionID string, index int) string {
-	return fmt.Sprintf("http://%s/chunk?transfer_id=%s&session_id=%s&index=%d",
-		cfg.RelayAddr, url.QueryEscape(transferID), url.QueryEscape(sessionID), index)
+// ChunkAuth bundles the credentials chunk endpoints need: the derived relay
+// token (sent as X-Gaur-Token) plus the device id and per-transfer capability
+// tag the relay's chunk-ownership check requires. The cap is
+// hex(HMAC-SHA256(K_peer, "gaur-cap-v1:"+transferID+":"+sessionID)) and is
+// identical on sender and receiver because both hold K_peer.
+type ChunkAuth struct {
+	RelayToken string
+	DeviceID   string
+	PeerKey    []byte
 }
 
-func putChunk(cfg Config, relayToken, transferID, sessionID string, index int, data []byte) error {
-	req, err := http.NewRequest(http.MethodPut, chunkEndpoint(cfg, transferID, sessionID, index), bytes.NewReader(data))
+func (a ChunkAuth) capTag(transferID, sessionID string) string {
+	mac := hmac.New(sha256.New, a.PeerKey)
+	mac.Write([]byte("gaur-cap-v1:" + transferID + ":" + sessionID))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
+// authQuery returns the relay ownership params for a chunk endpoint URL.
+func (a ChunkAuth) authQuery(transferID, sessionID string) string {
+	v := url.Values{}
+	v.Set("device_id", a.DeviceID)
+	v.Set("cap", a.capTag(transferID, sessionID))
+	return v.Encode()
+}
+
+func chunkEndpoint(cfg Config, auth ChunkAuth, transferID, sessionID string, index int) string {
+	return fmt.Sprintf("http://%s/chunk?transfer_id=%s&session_id=%s&index=%d&%s",
+		cfg.RelayAddr, url.QueryEscape(transferID), url.QueryEscape(sessionID), index,
+		auth.authQuery(transferID, sessionID))
+}
+
+func putChunk(cfg Config, auth ChunkAuth, transferID, sessionID string, index int, data []byte) error {
+	req, err := http.NewRequest(http.MethodPut, chunkEndpoint(cfg, auth, transferID, sessionID, index), bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Gaur-Token", relayToken)
+	req.Header.Set("X-Gaur-Token", auth.RelayToken)
 	req.Header.Set("Content-Type", "application/octet-stream")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -221,12 +248,12 @@ func putChunk(cfg Config, relayToken, transferID, sessionID string, index int, d
 	return nil
 }
 
-func getChunk(cfg Config, relayToken, transferID, sessionID string, index int) ([]byte, bool, error) {
-	req, err := http.NewRequest(http.MethodGet, chunkEndpoint(cfg, transferID, sessionID, index), nil)
+func getChunk(cfg Config, auth ChunkAuth, transferID, sessionID string, index int) ([]byte, bool, error) {
+	req, err := http.NewRequest(http.MethodGet, chunkEndpoint(cfg, auth, transferID, sessionID, index), nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("X-Gaur-Token", relayToken)
+	req.Header.Set("X-Gaur-Token", auth.RelayToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, false, err
@@ -248,11 +275,11 @@ func getChunk(cfg Config, relayToken, transferID, sessionID string, index int) (
 	return data, true, nil
 }
 
-func fetchChunkWithRetry(ctx context.Context, cfg Config, relayToken, transferID, sessionID string, index int) ([]byte, error) {
+func fetchChunkWithRetry(ctx context.Context, cfg Config, auth ChunkAuth, transferID, sessionID string, index int) ([]byte, error) {
 	backoff := 100 * time.Millisecond
 	var lastErr error
 	for attempt := 0; attempt < downloadRetries; attempt++ {
-		data, ok, err := getChunk(cfg, relayToken, transferID, sessionID, index)
+		data, ok, err := getChunk(cfg, auth, transferID, sessionID, index)
 		if err == nil && ok {
 			return data, nil
 		}
@@ -273,14 +300,15 @@ func fetchChunkWithRetry(ctx context.Context, cfg Config, relayToken, transferID
 	return nil, lastErr
 }
 
-func deleteTransfer(cfg Config, relayToken, transferID, sessionID string) {
-	endpoint := fmt.Sprintf("http://%s/transfer?transfer_id=%s&session_id=%s",
-		cfg.RelayAddr, url.QueryEscape(transferID), url.QueryEscape(sessionID))
+func deleteTransfer(cfg Config, auth ChunkAuth, transferID, sessionID string) {
+	endpoint := fmt.Sprintf("http://%s/transfer?transfer_id=%s&session_id=%s&%s",
+		cfg.RelayAddr, url.QueryEscape(transferID), url.QueryEscape(sessionID),
+		auth.authQuery(transferID, sessionID))
 	req, err := http.NewRequest(http.MethodDelete, endpoint, nil)
 	if err != nil {
 		return
 	}
-	req.Header.Set("X-Gaur-Token", relayToken)
+	req.Header.Set("X-Gaur-Token", auth.RelayToken)
 	resp, err := http.DefaultClient.Do(req)
 	if err == nil {
 		_ = resp.Body.Close()
@@ -290,7 +318,7 @@ func deleteTransfer(cfg Config, relayToken, transferID, sessionID string) {
 // uploadChunks reads the file at arbitrary offsets and pushes only the chunks
 // the receiver does not already have. Positional reads make the worker pool
 // safe without a shared file cursor.
-func uploadChunks(cfg Config, relayToken, transferID, sessionID string, digest *FileDigest, aesKey []byte, missing []int, path string, onProgress func(done, total int64)) error {
+func uploadChunks(cfg Config, auth ChunkAuth, transferID, sessionID string, digest *FileDigest, aesKey []byte, missing []int, path string, onProgress func(done, total int64)) error {
 	if len(missing) == 0 {
 		return nil
 	}
@@ -353,7 +381,7 @@ func uploadChunks(cfg Config, relayToken, transferID, sessionID string, digest *
 				fail(fmt.Errorf("encrypt chunk %d: %w", idx, err))
 				return
 			}
-			if err := putChunk(cfg, relayToken, transferID, sessionID, idx, ciphertext); err != nil {
+			if err := putChunk(cfg, auth, transferID, sessionID, idx, ciphertext); err != nil {
 				fail(fmt.Errorf("upload chunk %d: %w", idx, err))
 				return
 			}
@@ -372,7 +400,7 @@ func uploadChunks(cfg Config, relayToken, transferID, sessionID string, digest *
 	}
 }
 
-func downloadChunks(ctx context.Context, cfg Config, relayToken, transferID, sessionID string, digest *FileDigest, aesKey []byte, missing []int, partPath string, state *ReceiveState, statePath string, onProgress func(done, total int64)) error {
+func downloadChunks(ctx context.Context, cfg Config, auth ChunkAuth, transferID, sessionID string, digest *FileDigest, aesKey []byte, missing []int, partPath string, state *ReceiveState, statePath string, onProgress func(done, total int64)) error {
 	if len(missing) == 0 {
 		return nil
 	}
@@ -413,7 +441,7 @@ func downloadChunks(ctx context.Context, cfg Config, relayToken, transferID, ses
 			}
 			defer func() { <-sem }()
 
-			ciphertext, err := fetchChunkWithRetry(dlCtx, cfg, relayToken, transferID, sessionID, idx)
+			ciphertext, err := fetchChunkWithRetry(dlCtx, cfg, auth, transferID, sessionID, idx)
 			if err != nil {
 				fail(err)
 				return

@@ -17,6 +17,35 @@ import (
 // same binary with the same config, so the UI cannot drift from the CLI's
 // crypto or relay behavior. It binds 127.0.0.1 and never exposes the token.
 func runUI(cfg Config, addr string) {
+	if host, _, err := net.SplitHostPort(addr); err != nil || !isLoopbackHost(host) {
+		fmt.Fprintf(os.Stderr,
+			"[WARNING] The UI is starting on %s, which is NOT a loopback address.\n"+
+				"Anyone else on that network can open this page and send text and files as this machine.\n"+
+				"Press Ctrl-C now if that was not intended.\n", addr)
+	}
+
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[FATAL] Could not start UI: %v\n", err)
+		os.Exit(1)
+	}
+	// Pin every request to the address the listener actually bound; the
+	// default -addr is 127.0.0.1:0, so the port is only known here.
+	bind := ln.Addr().String()
+	handler := newUIHandler(cfg, bind)
+	url := "http://" + bind
+	fmt.Printf("gaur-share UI: %s\n", url)
+	fmt.Println("Local only. Press Ctrl-C to stop.")
+	openFile(url)
+	if err := http.Serve(ln, handler); err != nil {
+		fmt.Fprintf(os.Stderr, "[FATAL] UI stopped: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// newUIHandler builds the UI routes wrapped in a guard that pins requests to
+// the bound address.
+func newUIHandler(cfg Config, bind string) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -83,20 +112,45 @@ func runUI(cfg Config, addr string) {
 		out, err := runCLI(cfg, 30*time.Minute, "send", target, tmpPath)
 		writeResult(w, out, err)
 	})
+	return uiGuard(bind, mux)
+}
 
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[FATAL] Could not start UI: %v\n", err)
-		os.Exit(1)
+// uiGuard rejects requests whose Host header is not the bound address (a
+// DNS-rebinding probe) and, when a browser supplies an Origin header, requests
+// whose Origin is not the UI's own origin (a cross-site form POST or fetch).
+// Non-browser clients such as curl send no Origin and are allowed.
+func uiGuard(bind string, next http.Handler) http.Handler {
+	allowedHosts := map[string]bool{bind: true}
+	allowedOrigins := map[string]bool{"http://" + bind: true}
+	if host, port, err := net.SplitHostPort(bind); err == nil && host != "localhost" {
+		// Courtesy: the same listener is also reachable as localhost:<port>,
+		// and localhost cannot be DNS-rebound.
+		allowedHosts["localhost:"+port] = true
+		allowedOrigins["http://localhost:"+port] = true
 	}
-	url := "http://" + ln.Addr().String()
-	fmt.Printf("gaur-share UI: %s\n", url)
-	fmt.Println("Local only. Press Ctrl-C to stop.")
-	openFile(url)
-	if err := http.Serve(ln, mux); err != nil {
-		fmt.Fprintf(os.Stderr, "[FATAL] UI stopped: %v\n", err)
-		os.Exit(1)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !allowedHosts[r.Host] {
+			http.Error(w, "host not allowed", http.StatusForbidden)
+			return
+		}
+		if origin := r.Header.Get("Origin"); origin != "" && !allowedOrigins[origin] {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// isLoopbackHost reports whether the host part of a listen address is
+// loopback. An empty host means all interfaces and is not loopback.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
 	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func runCLI(cfg Config, timeout time.Duration, args ...string) (string, error) {

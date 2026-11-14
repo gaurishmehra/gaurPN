@@ -175,7 +175,8 @@ func runSendV3(cfg Config, targets []string, filePaths []string, offline, openRe
 
 		fmt.Printf("Uploading %s once for %d device(s)...\n", meta.Name, len(targets))
 		if err := uploadChunks(
-			cfg, relayToken, transferID, sessionID, digest, fileKey, all, meta.Path,
+			cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey},
+			transferID, sessionID, digest, fileKey, all, meta.Path,
 			func(done, total int64) {
 				if total > 0 {
 					fmt.Printf("\r  %5.1f%%", float64(done)/float64(total)*100)
@@ -303,6 +304,22 @@ func handleIncomingSealed(
 	localMedia *LocalMediaWatcher,
 	envelope map[string]interface{},
 ) {
+	// The seal key is shared by the whole cluster per kind, so without this
+	// check a malicious relay could redirect an envelope addressed to another
+	// device here, where it would decrypt and be processed all the same.
+	targetID, _ := envelope["target_id"].(string)
+	if targetID != cfg.DeviceID {
+		log.Printf("[SEALED] Dropped envelope addressed to %s, not this device (%s)", targetID, cfg.DeviceID)
+		return
+	}
+	// Replay protection: a duplicate msg_id is dropped, and command kinds
+	// (media_command) expire after their freshness window.
+	msgID, _ := envelope["msg_id"].(string)
+	kind, _ := envelope["kind"].(string)
+	if !replayGuard.Allow(kind, msgID, envelopeRelayTs(envelope)) {
+		log.Printf("[SEALED] Dropped replayed or expired %s envelope (msg_id=%s)", kind, msgID)
+		return
+	}
 	kind, inner, err := openSealed(peerCryptoKey, envelope)
 	if err != nil {
 		log.Printf("[SEALED] Could not open %v envelope: %v", envelope["kind"], err)
@@ -364,6 +381,10 @@ func handleIncomingSealed(
 			return
 		}
 		displayMirroredNotification(cfg, client, peerCryptoKey, senderID, senderName, payload)
+	case "text":
+		// Sealed v3 text/link share (docs section 6): same clipboard + toast
+		// behavior as the v1 path, minus the wire-visible sender.
+		applyIncomingText(senderID, senderName, stringField(inner, "kind"), []byte(stringField(inner, "text")))
 	}
 }
 
@@ -428,7 +449,8 @@ func handleSealedOffer(
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	if err := downloadChunks(
-		ctx, cfg, relayToken, transferID, sessionID, digest, fileKey,
+		ctx, cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey},
+		transferID, sessionID, digest, fileKey,
 		missing, partPath, state, statePath, nil,
 	); err != nil {
 		log.Printf("[SEALED] Download failed for %s: %v", cleanName, err)
