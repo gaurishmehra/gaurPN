@@ -144,6 +144,15 @@ func DeriveTransferID(peerCryptoKey []byte, fileHash string) string {
 	return "tx-" + hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
+// DeriveSessionID returns the deterministic v3 session id: the same file
+// always resumes the same session, so staged ciphertext stays valid across
+// sender retries. 16 lowercase hex chars.
+func DeriveSessionID(peerKey []byte, transferID string) string {
+	mac := hmac.New(sha256.New, peerKey)
+	mac.Write([]byte("gaur-session-v3:" + transferID))
+	return hex.EncodeToString(mac.Sum(nil))[:16]
+}
+
 // ChunkNonce is the 96-bit GCM nonce for a chunk: four zero bytes followed by
 // the big-endian chunk index. The index is unique per transfer, so the nonce
 // never repeats under the ephemeral session key.

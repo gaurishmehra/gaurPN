@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -313,6 +314,62 @@ func deleteTransfer(cfg Config, auth ChunkAuth, transferID, sessionID string) {
 	if err == nil {
 		_ = resp.Body.Close()
 	}
+}
+
+// chunkStatusBackoff is the delay between fetchChunkStatus retries. Package
+// var so tests can shrink it.
+var chunkStatusBackoff = 500 * time.Millisecond
+
+// fetchChunkStatus asks the relay which chunk indices are already staged
+// (sender-side resume). Returns nil on error → caller uploads everything.
+func fetchChunkStatus(cfg Config, auth ChunkAuth, transferID, sessionID string, count int) []int {
+	endpoint := fmt.Sprintf("http://%s/chunk/status?transfer_id=%s&session_id=%s&count=%d&%s",
+		cfg.RelayAddr, url.QueryEscape(transferID), url.QueryEscape(sessionID), count,
+		auth.authQuery(transferID, sessionID))
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(chunkStatusBackoff)
+		}
+		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil
+		}
+		req.Header.Set("X-Gaur-Token", auth.RelayToken)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("relay returned HTTP %d", resp.StatusCode)
+			continue
+		}
+		if readErr != nil {
+			lastErr = readErr
+			continue
+		}
+		var payload struct {
+			Present []int `json:"present"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			lastErr = err
+			continue
+		}
+		// The reply is metadata, not trust: drop anything out of range.
+		present := make([]int, 0, len(payload.Present))
+		for _, idx := range payload.Present {
+			if idx >= 0 && idx < count {
+				present = append(present, idx)
+			}
+		}
+		sort.Ints(present)
+		return present
+	}
+	log.Printf("[SEND] Chunk status for %s unavailable: %v; uploading all chunks", transferID, lastErr)
+	return nil
 }
 
 // uploadChunks reads the file at arbitrary offsets and pushes only the chunks

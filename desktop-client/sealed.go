@@ -124,22 +124,26 @@ func openSealed(
 	return kind, inner, nil
 }
 
+// v3SendRetryDelay separates upload attempts for one file. Package var so
+// tests can shrink it.
+var v3SendRetryDelay = 1 * time.Second
+
 // runSendV3 uploads each file once and sends a sealed offer to every target.
 // Targets are stable device ids; an offline target is served by the relay's
 // mailbox when it reconnects.
-func runSendV3(cfg Config, targets []string, filePaths []string, offline, openRequested bool) {
+func runSendV3(cfg Config, targets []string, filePaths []string, offline, openRequested bool) error {
 	cfg.SenderID = cfg.DeviceID
 	cfg.DeviceID = cfg.SenderID + "-out"
 
 	token, err := loadToken(cfg.TokenFile)
 	if err != nil {
-		log.Fatalf("[FATAL] %v", err)
+		return err
 	}
 	relayToken, peerCryptoKey := DeriveSubKeys(token)
 
 	conn, err := connectWS(cfg, relayToken)
 	if err != nil {
-		log.Fatalf("[FATAL] Cannot connect to relay at %s: %v", cfg.RelayAddr, err)
+		return fmt.Errorf("cannot connect to relay at %s: %w", cfg.RelayAddr, err)
 	}
 	defer conn.Close()
 	client := &wsClient{conn: conn}
@@ -147,43 +151,33 @@ func runSendV3(cfg Config, targets []string, filePaths []string, offline, openRe
 	if len(targets) == 0 {
 		targets = onlinePeerIDs(conn, cfg.DeviceID, cfg.SenderID)
 		if len(targets) == 0 {
-			log.Fatalf("[FATAL] No other devices are online")
+			return fmt.Errorf("no other devices are online")
 		}
 	}
 
-	metas := collectSendMetas(filePaths, openRequested)
+	metas, err := collectSendMetas(filePaths, openRequested)
+	if err != nil {
+		return err
+	}
 	if len(metas) == 0 {
-		log.Fatalf("[FATAL] No files found to send")
+		return fmt.Errorf("no files found to send")
 	}
 
 	batchID := fmt.Sprintf("batch-%d", time.Now().UnixNano())
 	for index, meta := range metas {
 		digest, err := HashFileChunks(meta.Path, ChunkSize)
 		if err != nil {
-			log.Fatalf("[FATAL] Could not hash %s: %v", meta.Path, err)
+			return fmt.Errorf("could not hash %s: %w", meta.Path, err)
 		}
 		transferID := DeriveTransferID(peerCryptoKey, digest.FileHash)
-		sessionID, err := randomHex(16)
-		if err != nil {
-			log.Fatalf("[FATAL] %v", err)
-		}
+		// Deterministic session id: a retry lands in the same relay session,
+		// so ciphertext staged by a failed attempt is reused, not orphaned.
+		sessionID := DeriveSessionID(peerCryptoKey, transferID)
 		fileKey := DeriveFileKey(peerCryptoKey, transferID)
-		all := make([]int, digest.ChunkCount)
-		for i := range all {
-			all[i] = i
-		}
 
 		fmt.Printf("Uploading %s once for %d device(s)...\n", meta.Name, len(targets))
-		if err := uploadChunks(
-			cfg, ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey},
-			transferID, sessionID, digest, fileKey, all, meta.Path,
-			func(done, total int64) {
-				if total > 0 {
-					fmt.Printf("\r  %5.1f%%", float64(done)/float64(total)*100)
-				}
-			},
-		); err != nil {
-			log.Fatalf("[FATAL] Upload failed for %s: %v", meta.Name, err)
+		if err := uploadV3Chunks(cfg, relayToken, peerCryptoKey, transferID, sessionID, digest, fileKey, meta); err != nil {
+			return err
 		}
 		fmt.Println()
 
@@ -216,14 +210,66 @@ func runSendV3(cfg Config, targets []string, filePaths []string, offline, openRe
 		}
 		fmt.Printf("Queued %s for %d device(s)\n", meta.Name, len(targets))
 	}
+	return nil
 }
 
-func collectSendMetas(filePaths []string, openRequested bool) []sendFileMeta {
+// uploadV3Chunks pushes one file's chunks with sender-side resume. Each
+// attempt asks the relay which indices are already staged and uploads only
+// the missing ones; the session id is deterministic, so ciphertext staged by
+// a failed attempt stays valid for the next one. After three failed attempts
+// the error is returned — the CLI caller reports it and exits non-zero.
+func uploadV3Chunks(cfg Config, relayToken string, peerCryptoKey []byte, transferID, sessionID string, digest *FileDigest, fileKey []byte, meta sendFileMeta) error {
+	auth := ChunkAuth{RelayToken: relayToken, DeviceID: cfg.DeviceID, PeerKey: peerCryptoKey}
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			time.Sleep(v3SendRetryDelay)
+			fmt.Printf("Retrying upload for %s (attempt %d/%d)...\n", meta.Name, attempt, maxAttempts)
+		}
+		present := fetchChunkStatus(cfg, auth, transferID, sessionID, digest.ChunkCount)
+		missing := missingChunkIndices(digest.ChunkCount, present)
+		if len(missing) == 0 {
+			return nil
+		}
+		if attempt > 1 && len(missing) < digest.ChunkCount {
+			fmt.Printf("Resuming %s: %d/%d chunks already staged\n", meta.Name, digest.ChunkCount-len(missing), digest.ChunkCount)
+		}
+		err := uploadChunks(cfg, auth, transferID, sessionID, digest, fileKey, missing, meta.Path, func(done, total int64) {
+			if total > 0 {
+				fmt.Printf("\r  %5.1f%%", float64(done)/float64(total)*100)
+			}
+		})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("[SEND] v3 upload attempt %d/%d for %s failed: %v", attempt, maxAttempts, meta.Name, err)
+	}
+	return fmt.Errorf("upload failed for %s after %d attempts: %w", meta.Name, maxAttempts, lastErr)
+}
+
+// missingChunkIndices returns 0..count-1 minus the present set.
+func missingChunkIndices(count int, present []int) []int {
+	have := make(map[int]bool, len(present))
+	for _, idx := range present {
+		have[idx] = true
+	}
+	missing := make([]int, 0, count)
+	for i := 0; i < count; i++ {
+		if !have[i] {
+			missing = append(missing, i)
+		}
+	}
+	return missing
+}
+
+func collectSendMetas(filePaths []string, openRequested bool) ([]sendFileMeta, error) {
 	var metas []sendFileMeta
 	for _, path := range filePaths {
 		info, err := os.Stat(path)
 		if err != nil {
-			log.Fatalf("[FATAL] Cannot open %s: %v", path, err)
+			return nil, fmt.Errorf("cannot open %s: %w", path, err)
 		}
 		if info.IsDir() {
 			err := filepath.Walk(path, func(p string, fi os.FileInfo, walkErr error) error {
@@ -241,7 +287,7 @@ func collectSendMetas(filePaths []string, openRequested bool) []sendFileMeta {
 				return nil
 			})
 			if err != nil {
-				log.Fatalf("[FATAL] Cannot read folder %s: %v", path, err)
+				return nil, fmt.Errorf("cannot read folder %s: %w", path, err)
 			}
 			continue
 		}
@@ -252,7 +298,7 @@ func collectSendMetas(filePaths []string, openRequested bool) []sendFileMeta {
 			Open: openRequested,
 		})
 	}
-	return metas
+	return metas, nil
 }
 
 func onlinePeerIDs(conn *websocket.Conn, selfIDs ...string) []string {
@@ -430,10 +476,23 @@ func handleSealedOffer(
 
 	partPath := filepath.Join(cfg.InboxDir, fmt.Sprintf(".%s.%s.part", cleanName, transferID))
 	statePath := partPath + ".state"
-	state := NewReceiveState(transferID, fileHash, fileSize, chunkSize, chunkCount)
-	_ = os.Remove(partPath)
-	_ = os.Remove(statePath)
-	state.Save(statePath)
+
+	// Resume like the v2 path: reuse the .part file and chunk bitmap when
+	// they belong to this exact transfer and file, and start over cleanly
+	// when they do not. The v3 session id is deterministic, so ciphertext
+	// staged on the relay is still valid and only missing chunks are
+	// downloaded.
+	state, err := LoadReceiveState(statePath, transferID, fileHash)
+	if err != nil {
+		state = NewReceiveState(transferID, fileHash, fileSize, chunkSize, chunkCount)
+		_ = os.Remove(partPath)
+		_ = os.Remove(statePath)
+		state.Save(statePath)
+	}
+	if _, statErr := os.Stat(partPath); statErr != nil {
+		state = NewReceiveState(transferID, fileHash, fileSize, chunkSize, chunkCount)
+		state.Save(statePath)
+	}
 
 	digest := &FileDigest{
 		FileHash:    fileHash,
@@ -441,9 +500,9 @@ func handleSealedOffer(
 		ChunkCount:  chunkCount,
 		Size:        fileSize,
 	}
-	missing := make([]int, chunkCount)
-	for i := range missing {
-		missing[i] = i
+	missing := state.Missing(chunkCount)
+	if len(missing) > 0 && len(missing) < chunkCount {
+		log.Printf("[SEALED] Resuming %s: %d/%d chunks already present", cleanName, chunkCount-len(missing), chunkCount)
 	}
 	fileKey := DeriveFileKey(peerCryptoKey, transferID)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -453,6 +512,9 @@ func handleSealedOffer(
 		transferID, sessionID, digest, fileKey,
 		missing, partPath, state, statePath, nil,
 	); err != nil {
+		// Keep .part and state: the staged ciphertext is deterministic, so
+		// the next offer for this file resumes instead of restarting from
+		// zero.
 		log.Printf("[SEALED] Download failed for %s: %v", cleanName, err)
 		return
 	}

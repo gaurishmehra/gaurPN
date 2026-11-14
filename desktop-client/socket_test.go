@@ -103,3 +103,43 @@ func TestClipboardSocketServerServesSameUser(t *testing.T) {
 	}
 	log.SetOutput(old)
 }
+
+// TestShutdownCleanupRemovesClipboardSocket pins REL-14: a stale socket file
+// is replaced by the listening socket at startup, and the SIGTERM cleanup
+// unlinks that live socket so Quickshell's next dial does not hit a dead
+// file.
+func TestShutdownCleanupRemovesClipboardSocket(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "clipboard.sock")
+
+	// A stale socket left behind by a previous daemon run.
+	if err := os.WriteFile(sockPath, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{ClipboardSocket: sockPath}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go runClipboardSocketServer(ctx, cfg, nil, nil, &peerStore{})
+
+	// The server removes the stale file and listens on the same path.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if fi, err := os.Lstat(sockPath); err == nil && fi.Mode()&os.ModeSocket != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("socket server did not replace the stale file")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The signal-handler cleanup: unlink the socket the daemon listens on.
+	removeClipboardSocket(cfg)
+	if _, err := os.Lstat(sockPath); !os.IsNotExist(err) {
+		t.Fatalf("clipboard socket must be removed on shutdown, stat err: %v", err)
+	}
+
+	// Removing a socket that is already gone is a no-op, not an error.
+	removeClipboardSocket(cfg)
+}

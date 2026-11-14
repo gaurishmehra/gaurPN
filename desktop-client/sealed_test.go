@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 )
@@ -58,6 +59,34 @@ func TestDeriveFileKeyDomainSeparation(t *testing.T) {
 	}
 	if bytes.Equal(fileKey, DeriveNotificationKey(peer)) {
 		t.Fatal("file and notification keys must be domain-separated")
+	}
+}
+
+func TestDeriveSessionIDDeterministic(t *testing.T) {
+	peer := []byte("peer-key-material")
+	transferID := DeriveTransferID(peer, "deadbeef")
+
+	a := DeriveSessionID(peer, transferID)
+	b := DeriveSessionID(peer, transferID)
+	if a != b {
+		t.Fatalf("session id is not deterministic: %q vs %q", a, b)
+	}
+	if len(a) != 16 {
+		t.Fatalf("session id length = %d, want 16", len(a))
+	}
+	for _, c := range a {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			t.Fatalf("session id %q must be lowercase hex", a)
+		}
+	}
+	if a == DeriveSessionID(peer, DeriveTransferID(peer, "cafebabe")) {
+		t.Fatal("session id must differ across transfers")
+	}
+	if a == DeriveSessionID([]byte("other-peer"), transferID) {
+		t.Fatal("session id must depend on the peer key")
+	}
+	if strings.Contains(transferID, a) || a == "gaur-session-v3" {
+		t.Fatalf("session id %q must be an opaque HMAC, not a derived prefix", a)
 	}
 }
 

@@ -141,6 +141,10 @@ func (s *peerStore) snapshot() []peerFileEntry {
 // writePeersFile publishes the current peer list for desktop shells to watch.
 // It writes in place rather than via rename so QFileSystemWatcher keeps its
 // inode watch and reacts to a single modify event.
+//
+// Failures are logged here rather than returned: the peers file is best-effort
+// state for the desktop shell, the daemon must stay alive when it is
+// unwritable, and every caller would otherwise repeat the same handling.
 func writePeersFile(cfg Config, peers []peerFileEntry) {
 	if cfg.PeersFile == "" {
 		return
@@ -154,17 +158,24 @@ func writePeersFile(cfg Config, peers []peerFileEntry) {
 	}{Updated: time.Now().Unix(), Peers: peers}
 	data, err := json.Marshal(payload)
 	if err != nil {
+		log.Printf("[PEERS] Could not serialize peer list for %s: %v", cfg.PeersFile, err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.PeersFile), 0o755); err != nil {
+		log.Printf("[PEERS] Could not create directory for %s: %v", cfg.PeersFile, err)
 		return
 	}
 	f, err := os.OpenFile(cfg.PeersFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
+		log.Printf("[PEERS] Could not open %s for writing: %v", cfg.PeersFile, err)
 		return
 	}
-	_, _ = f.Write(data)
-	_ = f.Close()
+	if _, err := f.Write(data); err != nil {
+		log.Printf("[PEERS] Could not write %s: %v", cfg.PeersFile, err)
+	}
+	if err := f.Close(); err != nil {
+		log.Printf("[PEERS] Could not close %s: %v", cfg.PeersFile, err)
+	}
 }
 
 func loadSettingsFromConfig() (string, string) {
@@ -315,6 +326,32 @@ type transferRun struct {
 	cancel context.CancelFunc
 }
 
+// daemonReadTimeout bounds how long the read loop waits for any relay
+// traffic — data, pong, or close — before treating the link as dead. Without
+// it a half-open connection (the relay host vanished without a close frame)
+// blocks ReadMessage forever while the ping writes keep succeeding into the
+// void. Package var so tests can shrink the window.
+var daemonReadTimeout = 60 * time.Second
+
+// daemonPingEvery is the heartbeat interval. The relay answers every ping
+// with a pong, which resets the read deadline on a healthy but otherwise
+// idle link. Package var so tests can shrink the interval.
+var daemonPingEvery = 20 * time.Second
+
+// daemonSession carries the daemon state that survives relay reconnects: the
+// peer cache, transfer bookkeeping, and the MPRIS plumbing.
+type daemonSession struct {
+	cfg             Config
+	relayToken      string
+	peerCryptoKey   []byte
+	sender          *CommandSender
+	broadcaster     *MediaBroadcaster
+	store           *peerStore
+	activeTransfers *sync.Map
+	mpris           *MprisManager
+	localMedia      *LocalMediaWatcher
+}
+
 func runDaemon(cfg Config) {
 	token, err := loadToken(cfg.TokenFile)
 	if err != nil {
@@ -341,128 +378,162 @@ func runDaemon(cfg Config) {
 	log.Printf("[DAEMON] Incoming files will be saved to: %s", cfg.InboxDir)
 	writePeersFile(cfg, nil)
 
-	store := &peerStore{}
-	activeTransfers := &sync.Map{}
+	session := &daemonSession{
+		cfg:             cfg,
+		relayToken:      relayToken,
+		peerCryptoKey:   peerCryptoKey,
+		sender:          sender,
+		broadcaster:     broadcaster,
+		store:           &peerStore{},
+		activeTransfers: &sync.Map{},
+		mpris:           mpris,
+		localMedia:      localMedia,
+	}
 	for {
-		conn, err := connectWS(cfg, relayToken)
-		if err != nil {
-			writePeersFile(cfg, nil)
-			log.Printf("[DAEMON] Connecting to in-tunnel relay (%s)... Error: %v. Retrying in 5s...", cfg.RelayAddr, err)
+		connected := session.runOnce()
+		if !connected {
 			time.Sleep(5 * time.Second)
 			continue
 		}
-		client := &wsClient{conn: conn}
-		sender.Set(client, peerCryptoKey)
-		broadcaster.Set(client, peerCryptoKey)
+		time.Sleep(2 * time.Second)
+	}
+}
 
-		log.Printf("[DAEMON] Connected to in-tunnel relay at %s. Standing by for incoming transfers...", cfg.RelayAddr)
+// runOnce runs one relay connection to completion: dial, heartbeat, and the
+// message loop. It returns false when the dial itself failed so the caller
+// applies the longer reconnect delay. The message loop exits on any read
+// error — including the read deadline firing on a half-open link — after
+// which the caller reconnects.
+func (s *daemonSession) runOnce() bool {
+	cfg := s.cfg
+	conn, err := connectWS(cfg, s.relayToken)
+	if err != nil {
+		writePeersFile(cfg, nil)
+		log.Printf("[DAEMON] Connecting to in-tunnel relay (%s)... Error: %v. Retrying in 5s...", cfg.RelayAddr, err)
+		return false
+	}
+	client := &wsClient{conn: conn}
+	s.sender.Set(client, s.peerCryptoKey)
+	s.broadcaster.Set(client, s.peerCryptoKey)
 
-		// Heartbeat ping loop
-		stopPing := make(chan struct{})
-		go func() {
-			ticker := time.NewTicker(20 * time.Second)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ticker.C:
-					if err := client.WriteJSON(map[string]string{"type": "ping"}); err != nil {
-						return
-					}
-				case <-stopPing:
-					return
-				}
-			}
-		}()
+	log.Printf("[DAEMON] Connected to in-tunnel relay at %s. Standing by for incoming transfers...", cfg.RelayAddr)
 
-		// Clipboard sync lives for the duration of this relay connection.
-		clipCtx, clipCancel := context.WithCancel(context.Background())
-		if cfg.Clipboard {
-			switch cfg.ClipboardSource {
-			case "socket":
-				go runClipboardSocketServer(clipCtx, cfg, client, peerCryptoKey, store)
-			case "poll":
-				go runClipboardSync(clipCtx, cfg, client, peerCryptoKey, store)
-			case "off":
-				// Explicitly disabled.
-			default:
-				log.Printf("[CLIP] Unknown clipboard source %q; clipboard sync disabled", cfg.ClipboardSource)
-			}
+	// Heartbeat ping loop
+	stopPing := make(chan struct{})
+	go pingLoop(client, stopPing)
+
+	// Clipboard sync lives for the duration of this relay connection.
+	clipCtx, clipCancel := context.WithCancel(context.Background())
+	if cfg.Clipboard {
+		switch cfg.ClipboardSource {
+		case "socket":
+			go runClipboardSocketServer(clipCtx, cfg, client, s.peerCryptoKey, s.store)
+		case "poll":
+			go runClipboardSync(clipCtx, cfg, client, s.peerCryptoKey, s.store)
+		case "off":
+			// Explicitly disabled.
+		default:
+			log.Printf("[CLIP] Unknown clipboard source %q; clipboard sync disabled", cfg.ClipboardSource)
+		}
+	}
+
+	// Message loop. The deadline bounds every ReadMessage so a link that
+	// stops delivering anything — half-open, relay hung — is detected
+	// instead of blocking the daemon forever.
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(daemonReadTimeout))
+		_, msgBytes, err := client.ReadMessage()
+		if err != nil {
+			close(stopPing)
+			clipCancel()
+			s.sender.Set(nil, nil)
+			s.broadcaster.Set(nil, nil)
+			s.store.set(nil)
+			writePeersFile(cfg, nil)
+			log.Printf("[DAEMON] Relay connection interrupted: %v. Reconnecting...", err)
+			_ = client.Close()
+			break
 		}
 
-		// Message loop
-		for {
-			_, msgBytes, err := client.ReadMessage()
-			if err != nil {
-				close(stopPing)
-				clipCancel()
-				sender.Set(nil, nil)
-				broadcaster.Set(nil, nil)
-				store.set(nil)
-				writePeersFile(cfg, nil)
-				log.Printf("[DAEMON] Relay connection interrupted: %v. Reconnecting...", err)
-				_ = client.Close()
-				break
-			}
+		var envelope map[string]interface{}
+		if err := json.Unmarshal(msgBytes, &envelope); err != nil {
+			continue
+		}
 
-			var envelope map[string]interface{}
-			if err := json.Unmarshal(msgBytes, &envelope); err != nil {
+		msgType, _ := envelope["type"].(string)
+		switch msgType {
+		case "peers":
+			peersRaw, _ := envelope["peers"].([]interface{})
+			entries := make([]peerFileEntry, 0, len(peersRaw))
+			for _, p := range peersRaw {
+				pMap, _ := p.(map[string]interface{})
+				id, _ := pMap["id"].(string)
+				name, _ := pMap["name"].(string)
+				entries = append(entries, peerFileEntry{
+					ID:     id,
+					Name:   name,
+					Status: "online",
+					IsSelf: id == cfg.DeviceID || strings.EqualFold(name, cfg.Name),
+				})
+			}
+			s.store.set(entries)
+			writePeersFile(cfg, entries)
+			s.broadcaster.SetPeers(peerIDs(entries))
+			if s.localMedia != nil {
+				s.localMedia.ForceRefresh()
+			}
+		case "transfer_offer":
+			txID, _ := envelope["transfer_id"].(string)
+			if txID == "" {
 				continue
 			}
-
-			msgType, _ := envelope["type"].(string)
-			switch msgType {
-			case "peers":
-				peersRaw, _ := envelope["peers"].([]interface{})
-				entries := make([]peerFileEntry, 0, len(peersRaw))
-				for _, p := range peersRaw {
-					pMap, _ := p.(map[string]interface{})
-					id, _ := pMap["id"].(string)
-					name, _ := pMap["name"].(string)
-					entries = append(entries, peerFileEntry{
-						ID:     id,
-						Name:   name,
-						Status: "online",
-						IsSelf: id == cfg.DeviceID || strings.EqualFold(name, cfg.Name),
-					})
-				}
-				store.set(entries)
-				writePeersFile(cfg, entries)
-				broadcaster.SetPeers(peerIDs(entries))
-				if localMedia != nil {
-					localMedia.ForceRefresh()
-				}
-			case "transfer_offer":
-				txID, _ := envelope["transfer_id"].(string)
-				if txID == "" {
-					continue
-				}
-				if old, ok := activeTransfers.Load(txID); ok {
-					old.(*transferRun).cancel()
-				}
-				ctx, cancel := context.WithCancel(context.Background())
-				run := &transferRun{cancel: cancel}
-				activeTransfers.Store(txID, run)
-				go func() {
-					defer func() {
-						if cur, ok := activeTransfers.Load(txID); ok && cur.(*transferRun) == run {
-							activeTransfers.Delete(txID)
-						}
-						cancel()
-					}()
-					handleIncomingTransfer(ctx, cfg, relayToken, peerCryptoKey, client, envelope)
-				}()
-			case "clipboard_update":
-				go handleIncomingClipboard(cfg, peerCryptoKey, envelope)
-			case "text_message":
-				go handleIncomingText(cfg, peerCryptoKey, envelope)
-			case "notification_event":
-				go handleIncomingNotification(cfg, peerCryptoKey, client, envelope)
-			case "sealed":
-				go handleIncomingSealed(cfg, relayToken, peerCryptoKey, client, mpris, localMedia, envelope)
+			if old, ok := s.activeTransfers.Load(txID); ok {
+				old.(*transferRun).cancel()
 			}
+			ctx, cancel := context.WithCancel(context.Background())
+			run := &transferRun{cancel: cancel}
+			s.activeTransfers.Store(txID, run)
+			go func() {
+				defer func() {
+					if cur, ok := s.activeTransfers.Load(txID); ok && cur.(*transferRun) == run {
+						s.activeTransfers.Delete(txID)
+					}
+					cancel()
+				}()
+				handleIncomingTransfer(ctx, cfg, s.relayToken, s.peerCryptoKey, client, envelope)
+			}()
+		case "clipboard_update":
+			go handleIncomingClipboard(cfg, s.peerCryptoKey, envelope)
+		case "text_message":
+			go handleIncomingText(cfg, s.peerCryptoKey, envelope)
+		case "notification_event":
+			go handleIncomingNotification(cfg, s.peerCryptoKey, client, envelope)
+		case "sealed":
+			go handleIncomingSealed(cfg, s.relayToken, s.peerCryptoKey, client, s.mpris, s.localMedia, envelope)
 		}
+	}
 
-		time.Sleep(2 * time.Second)
+	return true
+}
+
+// pingLoop sends the heartbeat ping every daemonPingEvery. On a write failure
+// it closes the connection: gorilla's Conn.Close is safe from any goroutine,
+// and the close unblocks the read loop, which drives the normal teardown and
+// reconnect path. Returning without closing would strand the daemon on a
+// dead link whose reads never fail.
+func pingLoop(client *wsClient, stop chan struct{}) {
+	ticker := time.NewTicker(daemonPingEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if err := client.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+				_ = client.Close()
+				return
+			}
+		case <-stop:
+			return
+		}
 	}
 }
 
@@ -586,11 +657,31 @@ type clipboardSocketMessage struct {
 	Data string `json:"data"`
 }
 
+// clipboardSocketPath is the single resolver for the Quickshell clipboard
+// socket path so the server and the shutdown cleanup agree on the same file.
+// Empty means the socket source is disabled.
+func clipboardSocketPath(cfg Config) string {
+	return cfg.ClipboardSocket
+}
+
+// removeClipboardSocket unlinks the clipboard socket on daemon shutdown.
+// Without this the socket file outlives the daemon and Quickshell's next
+// dial fails until a new daemon removes it at startup.
+func removeClipboardSocket(cfg Config) {
+	path := clipboardSocketPath(cfg)
+	if path == "" {
+		return
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		log.Printf("[CLIP] Could not remove clipboard socket %s on shutdown: %v", path, err)
+	}
+}
+
 // runClipboardSocketServer listens on a Unix socket for Quickshell clipboard
 // events. Quickshell watches cliphist's BoltDB with inotify and sends one JSON
 // line per new clip, so the daemon does not poll the clipboard at all.
 func runClipboardSocketServer(ctx context.Context, cfg Config, client *wsClient, peerCryptoKey []byte, store *peerStore) {
-	path := cfg.ClipboardSocket
+	path := clipboardSocketPath(cfg)
 	if path == "" {
 		return
 	}
@@ -1954,6 +2045,12 @@ func main() {
 		fmt.Println("\nShutting down gaur-share...")
 		if args[0] == "daemon" {
 			writePeersFile(cfg, nil)
+			// Unlink the socket the daemon is listening on so Quickshell's
+			// next dial does not hit a stale file. Only the socket source
+			// ever creates it.
+			if cfg.Clipboard && cfg.ClipboardSource == "socket" {
+				removeClipboardSocket(cfg)
+			}
 		}
 		os.Exit(0)
 	}()
@@ -1983,17 +2080,23 @@ func main() {
 			if len(rest) < 1 {
 				log.Fatalf("Usage: gaur-share send --all <file|dir>...")
 			}
-			runSendV3(cfg, nil, rest, false, *openRequested)
+			if err := runSendV3(cfg, nil, rest, false, *openRequested); err != nil {
+				log.Fatalf("[FATAL] %v", err)
+			}
 		case *sendTo != "":
 			if len(rest) < 1 {
 				log.Fatalf("Usage: gaur-share send --to <id,id> <file|dir>...")
 			}
-			runSendV3(cfg, splitTargets(*sendTo), rest, false, *openRequested)
+			if err := runSendV3(cfg, splitTargets(*sendTo), rest, false, *openRequested); err != nil {
+				log.Fatalf("[FATAL] %v", err)
+			}
 		case *sendOffline:
 			if len(rest) < 2 {
 				log.Fatalf("Usage: gaur-share send --offline <device-id> <file|dir>...")
 			}
-			runSendV3(cfg, []string{rest[0]}, rest[1:], true, *openRequested)
+			if err := runSendV3(cfg, []string{rest[0]}, rest[1:], true, *openRequested); err != nil {
+				log.Fatalf("[FATAL] %v", err)
+			}
 		default:
 			if len(rest) < 2 {
 				log.Fatalf("Usage: gaur-share send [-open] <target-device> <file-path> [file-path...]")

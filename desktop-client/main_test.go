@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -79,5 +80,77 @@ func TestLoadTokenEnvVarUnaffected(t *testing.T) {
 	}
 	if token != "env-secret" {
 		t.Fatalf("token = %q, want env-secret", token)
+	}
+}
+
+// TestWritePeersFileSurfacesErrors pins REL-13: an unwritable peers file must
+// produce a [PEERS] log naming the path — never a silent swallow, never a
+// panic — and writePeersFile must return so the daemon stays alive.
+func TestWritePeersFileSurfacesErrors(t *testing.T) {
+	dir := t.TempDir()
+	occupied := filepath.Join(dir, "occupied")
+	if err := os.WriteFile(occupied, []byte("regular file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name      string
+		peersFile string
+	}{
+		{"target path is a directory", filepath.Join(dir, "peers.json-blocker")},
+		{"parent directory cannot be created", filepath.Join(occupied, "peers.json")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "target path is a directory" {
+				if err := os.Mkdir(tc.peersFile, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := Config{PeersFile: tc.peersFile}
+			out := captureLog(func() {
+				writePeersFile(cfg, []peerFileEntry{{ID: "phone-1", Name: "Lavander", Status: "online"}})
+			})
+			if !contains(out, "[PEERS]") {
+				t.Fatalf("expected a [PEERS] failure log, got: %s", out)
+			}
+			if !contains(out, tc.peersFile) {
+				t.Fatalf("log must name the peers file path, got: %s", out)
+			}
+			// Reaching here proves writePeersFile returned normally: the
+			// daemon survives an unwritable peers file.
+		})
+	}
+}
+
+func TestWritePeersFileWritesWatchableSchema(t *testing.T) {
+	peersFile := filepath.Join(t.TempDir(), "peers.json")
+	cfg := Config{PeersFile: peersFile}
+
+	writePeersFile(cfg, nil)
+	data, err := os.ReadFile(peersFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload struct {
+		Updated int64           `json:"updated"`
+		Peers   []peerFileEntry `json:"peers"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatalf("peers file is not valid JSON: %v", err)
+	}
+	if payload.Peers == nil {
+		t.Fatal("empty peer list must serialize as [], not null (Quickshell contract)")
+	}
+
+	writePeersFile(cfg, []peerFileEntry{{ID: "phone-1", Name: "Lavander", Status: "online"}})
+	data, err = os.ReadFile(peersFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Peers) != 1 || payload.Peers[0].ID != "phone-1" {
+		t.Fatalf("unexpected peers payload: %s", data)
 	}
 }

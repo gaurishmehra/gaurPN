@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestTrustDevicePersistsAndRevokes(t *testing.T) {
@@ -81,6 +82,54 @@ func TestSetOnlyTrustedPreservesConfig(t *testing.T) {
 	}
 	if conf["only_trusted"] != true {
 		t.Fatalf("only_trusted = %v", conf["only_trusted"])
+	}
+}
+
+// TestOnlyTrustedCacheKeyedByMtime pins the REL-11 cache: the parsed value is
+// reused while config.json's mtime is unchanged and re-read once it moves.
+func TestOnlyTrustedCacheKeyedByMtime(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	path := defaultConfigFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeConfig := func(enabled bool, mtime time.Time) {
+		t.Helper()
+		data, _ := json.Marshal(map[string]interface{}{"only_trusted": enabled})
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		// Pin the mtime explicitly: filesystem timestamp granularity must
+		// not decide whether the cache invalidates.
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	base := time.Now().Add(-time.Hour).UTC()
+	writeConfig(true, base)
+	if !onlyTrustedEnabled(Config{}) {
+		t.Fatal("first read must see only_trusted=true")
+	}
+
+	// Same mtime, different content: the cache must still serve the old
+	// parsed value without re-reading the file.
+	writeConfig(false, base)
+	if !onlyTrustedEnabled(Config{}) {
+		t.Fatal("same mtime must serve the cached value")
+	}
+
+	// Bumping the mtime must pick up the new content.
+	writeConfig(false, base.Add(2*time.Second))
+	if onlyTrustedEnabled(Config{}) {
+		t.Fatal("a new mtime must invalidate the cache")
+	}
+
+	// The -only-trusted flag short-circuits the config read entirely.
+	if !onlyTrustedEnabled(Config{OnlyTrusted: true}) {
+		t.Fatal("cfg.OnlyTrusted must win over the config file")
 	}
 }
 

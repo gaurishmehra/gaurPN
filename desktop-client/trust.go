@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -148,8 +149,20 @@ func resolveTrustTarget(query string) (string, string) {
 	return query, query
 }
 
-func loadOnlyTrustedFromConfig() bool {
-	data, err := os.ReadFile(defaultConfigFile())
+// onlyTrustedCache caches the parsed only_trusted value keyed by config.json's
+// mtime. The daemon consults it on every incoming message, so re-reading and
+// re-parsing the config per packet is waste; the file is re-read only when its
+// mtime changes (trust-mode flips it via setOnlyTrusted).
+var (
+	onlyTrustedCacheMu    sync.Mutex
+	onlyTrustedCachePath  string
+	onlyTrustedCacheMtime time.Time
+	onlyTrustedCacheValue bool
+)
+
+// readOnlyTrustedFile parses only_trusted from one config file.
+func readOnlyTrustedFile(path string) bool {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
@@ -160,6 +173,28 @@ func loadOnlyTrustedFromConfig() bool {
 		return false
 	}
 	return conf.OnlyTrusted
+}
+
+// loadOnlyTrustedFromConfig returns only_trusted from config.json, served
+// from the mtime-keyed cache when the file has not changed. On a stat error
+// the cache is bypassed and the file is read directly.
+func loadOnlyTrustedFromConfig() bool {
+	path := defaultConfigFile()
+	onlyTrustedCacheMu.Lock()
+	defer onlyTrustedCacheMu.Unlock()
+	if info, err := os.Stat(path); err == nil {
+		if onlyTrustedCachePath == path && info.ModTime().Equal(onlyTrustedCacheMtime) {
+			return onlyTrustedCacheValue
+		}
+		onlyTrustedCachePath = path
+		onlyTrustedCacheMtime = info.ModTime()
+		onlyTrustedCacheValue = readOnlyTrustedFile(path)
+		return onlyTrustedCacheValue
+	}
+	// Stat failed (file removed or mid-rename): fall back to reading.
+	onlyTrustedCachePath = ""
+	onlyTrustedCacheMtime = time.Time{}
+	return readOnlyTrustedFile(path)
 }
 
 // setOnlyTrusted preserves the rest of config.json (including legacy fields)
