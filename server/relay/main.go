@@ -63,6 +63,13 @@ var (
 // the relay to buffer arbitrary payloads.
 const wsMaxMessageBytes = 1 << 20
 
+// statusMinInterval is the minimum spacing between accepted status frames
+// from one device. Every accepted status frame fans out to every connected
+// peer, so without a floor a token holder could amplify one small frame
+// into O(peers) relay writes at line rate. Package var so tests can shrink
+// it; each Peer copies the current value at join time.
+var statusMinInterval = 2 * time.Second
+
 // validDeviceID bounds the join-time device id: opaque, URL-safe, short.
 var validDeviceID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
@@ -81,9 +88,18 @@ type Peer struct {
 	// telemetry (battery/charging) that the relay must never parse, decode,
 	// or log. It is guarded by Hub.mu, not by writeMu: peersSnapshot reads
 	// it under the hub lock and it is written only through
-	// Hub.setPeerStatus, so the connection's read goroutine never touches
-	// the field bare. Empty means "this peer has not sent status yet".
+	// Hub.setPeerStatus or Hub.acceptPeerStatus, so the connection's read
+	// goroutine never touches the field bare. Empty means "this peer has not
+	// sent status yet".
 	status string
+
+	// lastStatusAt is when the hub last accepted a status frame from this
+	// peer; statusDropLogged records whether the current rate-limited burst
+	// has already produced its one log line. Both are guarded by Hub.mu and
+	// touched only by Hub.acceptPeerStatus, so the check-and-set is atomic
+	// with respect to other status frames from the same device.
+	lastStatusAt     time.Time
+	statusDropLogged bool
 
 	writeMu  sync.Mutex `json:"-"`
 	joinedAt time.Time
@@ -92,10 +108,11 @@ type Peer struct {
 	// joins. Capturing them per connection means goroutines serving
 	// older connections never read the vars again, so tests can shrink
 	// the windows between connections without tripping the race
-	// detector.
-	pingInterval time.Duration
-	readWindow   time.Duration
-	writeTimeout time.Duration
+	// detector. statusInterval follows the same rule for statusMinInterval.
+	pingInterval   time.Duration
+	readWindow     time.Duration
+	writeTimeout   time.Duration
+	statusInterval time.Duration
 }
 
 type PeerInfo struct {
@@ -498,13 +515,42 @@ func (h *Hub) peersSnapshot() ([]PeerInfo, []*Peer) {
 // setPeerStatus stores a peer's opaque status blob. The write happens under
 // the hub mutex because peersSnapshot and every peers broadcast read the
 // field under the same lock; a bare write from the connection's read
-// goroutine would be a data race. The blob is never inspected.
+// goroutine would be a data race. The blob is never inspected. This path
+// bypasses the rate limit and exists for direct hub writes; the WebSocket
+// status path goes through acceptPeerStatus.
 func (h *Hub) setPeerStatus(deviceID, status string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if peer, ok := h.peers[deviceID]; ok {
 		peer.status = status
 	}
+}
+
+// acceptPeerStatus stores a peer's opaque status blob if the peer's rate
+// window has elapsed. It returns accepted=false when the frame was dropped
+// as too frequent, and logDrop=true the first time a burst is dropped so a
+// tight loop produces one journal line instead of one per frame. The window
+// check and the write share one hub-lock critical section, so two status
+// frames from the same device can never both pass the window.
+func (h *Hub) acceptPeerStatus(deviceID, status string) (accepted, logDrop bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	peer, ok := h.peers[deviceID]
+	if !ok {
+		return false, false
+	}
+	if peer.statusInterval > 0 && !peer.lastStatusAt.IsZero() &&
+		time.Since(peer.lastStatusAt) < peer.statusInterval {
+		if peer.statusDropLogged {
+			return false, false
+		}
+		peer.statusDropLogged = true
+		return false, true
+	}
+	peer.status = status
+	peer.lastStatusAt = time.Now()
+	peer.statusDropLogged = false
+	return true, false
 }
 
 // validStatusBlob reports whether s is a plausible standard-base64 status
@@ -583,13 +629,14 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(wsMaxMessageBytes)
 
 	peer := &Peer{
-		ID:           deviceID,
-		Name:         deviceName,
-		conn:         conn,
-		joinedAt:     time.Now(),
-		pingInterval: wsPingInterval,
-		readWindow:   wsReadWindow,
-		writeTimeout: wsWriteTimeout,
+		ID:             deviceID,
+		Name:           deviceName,
+		conn:           conn,
+		joinedAt:       time.Now(),
+		pingInterval:   wsPingInterval,
+		readWindow:     wsReadWindow,
+		writeTimeout:   wsWriteTimeout,
+		statusInterval: statusMinInterval,
 	}
 
 	// Liveness: the read loop runs under a rolling deadline. Any inbound
@@ -669,14 +716,24 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		// (battery/charging). The relay validates the shape, stores it, and
 		// rebroadcasts the peer list; it never parses or logs the contents.
 		// A malformed frame is a client bug, not a security event, so it is
-		// dropped without disconnecting.
+		// dropped without disconnecting. Accepted frames are rate-limited
+		// per device: each one fans out to every peer, so a member looping
+		// status frames must not be able to amplify them into relay-wide
+		// write traffic. Dropped frames get no reply and no disconnect, and
+		// only the first drop of a burst is logged.
 		if msgType == "status" {
 			status, _ := envelope["status"].(string)
 			if !validStatusBlob(status) {
 				log.Printf("[STATUS] invalid status frame from %s (len %d)", deviceID, len(status))
 				continue
 			}
-			h.setPeerStatus(deviceID, status)
+			accepted, logDrop := h.acceptPeerStatus(deviceID, status)
+			if !accepted {
+				if logDrop {
+					log.Printf("[STATUS] rate-limited %s", deviceID)
+				}
+				continue
+			}
 			h.broadcastPeerList()
 			continue
 		}
