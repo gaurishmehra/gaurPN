@@ -72,8 +72,12 @@ also arrive as a `token` query parameter from pre-v3.1 clients; current clients
 always send the header so the token never appears in a URL. Chunks are
 ciphertext; the relay cannot read them. The store is a cache, not durable
 storage: it is cleared on relay restart, evicted after `-chunk-ttl` (default
-24h), and bounded by `-chunk-max-bytes` (default 8 GiB). Set
-`-chunk-dir=""` to keep chunks in memory only.
+24h), and bounded by `-chunk-max-bytes` (default 8 GiB) as a hard cap — once
+the store is full, `PUT` for a transfer without staged chunks is refused with
+507, while in-flight transfers may always finish. Set `-chunk-dir=""` to keep
+chunks in memory only. The relay refuses to start when `-chunk-dir` names a
+non-empty directory without its `.gaur-relay-chunks` marker, so a mistyped
+path never wipes unrelated data.
 
 ### Transfer ownership (v3.1)
 
@@ -93,6 +97,9 @@ The relay also enforces: one sender and one receiver per `/pipe` transfer (a
 second connection claiming an occupied role gets 409), `device_id` matching
 `^[A-Za-z0-9._-]{1,64}$` and names ≤128 bytes on `/ws` (400 otherwise), a
 `-max-peers` cap (default 32; a reconnecting device still replaces itself),
+a `-chunk-max-bytes` hard cap (new transfers get 507 once the store is full;
+in-flight transfers may finish), a `-mailbox-max-target-bytes` per-device
+mailbox cap (default 4 MiB; a target's own oldest entries are evicted first),
 a per-IP auth-failure budget (10 failures/minute → 429 with `Retry-After`),
 a startup bind guard that refuses to listen on any address not assigned
 to a loopback interface, and WebSocket liveness deadlines: the relay pings
@@ -140,7 +147,7 @@ Type=simple
 # service as a dedicated user instead.
 User=root
 ExecStartPre=-/usr/sbin/ip addr replace 198.51.100.1/32 dev lo
-ExecStart=/opt/gaur-relay/gaur-relay -bind 198.51.100.1:9876 -token-env GAURPN_CLUSTER_TOKEN -chunk-dir /var/lib/gaur-relay/chunks -chunk-max-bytes 8589934592 -mailbox-ttl 1h -mailbox-max-bytes 16777216
+ExecStart=/opt/gaur-relay/gaur-relay -bind 198.51.100.1:9876 -token-env GAURPN_CLUSTER_TOKEN -chunk-dir /var/lib/gaur-relay/chunks -chunk-max-bytes 8589934592 -mailbox-ttl 1h -mailbox-max-bytes 16777216 -mailbox-max-target-bytes 4194304
 StateDirectory=gaur-relay
 Environment="GAURPN_CLUSTER_TOKEN=YOUR_PRE_SHARED_SECRET_TOKEN"
 Restart=always
@@ -498,7 +505,9 @@ v3 messages use a sealed envelope:
   `msg_id` so a replayed envelope is processed once. `media_command`
   envelopes additionally expire 30 s after their `relay_ts` (§13).
 - If the target is offline, the relay stores the envelope in an in-memory
-  mailbox with a TTL (default 1h) and byte cap (default 16 MiB). On reconnect,
+  mailbox with a TTL (default 1h), a global byte cap (default 16 MiB), and a
+  per-target byte cap (`-mailbox-max-target-bytes`, default 4 MiB) so one
+  device cannot monopolize the queue. On reconnect,
   the mailbox is drained to the device with ack-based delivery: an entry is
   removed only after the relay's write succeeds, so a rejoin that dies
   mid-drain loses nothing, and a sealed envelope whose direct write to a

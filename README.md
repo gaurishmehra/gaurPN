@@ -270,7 +270,7 @@ Type=simple
 # service as a dedicated user instead.
 User=root
 ExecStartPre=-/usr/sbin/ip addr replace 198.51.100.1/32 dev lo
-ExecStart=/opt/gaur-relay/gaur-relay -bind 198.51.100.1:9876 -token-file /etc/gaur-relay/cluster.key -chunk-dir /var/lib/gaur-relay/chunks -chunk-max-bytes 8589934592 -mailbox-ttl 1h -mailbox-max-bytes 16777216
+ExecStart=/opt/gaur-relay/gaur-relay -bind 198.51.100.1:9876 -token-file /etc/gaur-relay/cluster.key -chunk-dir /var/lib/gaur-relay/chunks -chunk-max-bytes 8589934592 -mailbox-ttl 1h -mailbox-max-bytes 16777216 -mailbox-max-target-bytes 4194304
 StateDirectory=gaur-relay
 Restart=always
 RestartSec=3
