@@ -461,11 +461,14 @@ func downloadChunks(ctx context.Context, cfg Config, auth ChunkAuth, transferID,
 	if len(missing) == 0 {
 		return nil
 	}
-	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0o644)
+	f, err := os.OpenFile(partPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
+	// O_CREATE never tightens an existing file: a .part staged 0644 by an
+	// older build must not keep leaking the plaintext while it resumes.
+	_ = os.Chmod(partPath, 0o600)
 
 	var total int64
 	for _, idx := range missing {

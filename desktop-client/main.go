@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -53,6 +54,29 @@ func defaultInboxDir() string {
 		return "./gaur-inbox"
 	}
 	return filepath.Join(home, "Downloads", "gaur-inbox")
+}
+
+// ensureInboxDir creates the inbox directory with owner-only permissions and
+// tightens a pre-existing directory that other local users can read: the
+// inbox holds received plaintext, and it is gaur's own directory. Modes
+// stricter than 0700 are left untouched.
+func ensureInboxDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func defaultTokenFile() string {
@@ -373,7 +397,9 @@ func runDaemon(cfg Config) {
 		log.Printf("[MPRIS] Local watcher disabled: %v", localErr)
 	}
 
-	_ = os.MkdirAll(cfg.InboxDir, 0o755)
+	if err := ensureInboxDir(cfg.InboxDir); err != nil {
+		log.Printf("[DAEMON] Inbox directory unavailable: %v", err)
+	}
 	log.Printf("[DAEMON] Starting gaur-share daemon as '%s' (ID: %s)", cfg.Name, cfg.DeviceID)
 	log.Printf("[DAEMON] Incoming files will be saved to: %s", cfg.InboxDir)
 	writePeersFile(cfg, nil)
@@ -1091,13 +1117,22 @@ func handleIncomingTransferV1(cfg Config, relayToken string, peerCryptoKey []byt
 	defer resp.Body.Close()
 
 	// Finding 2: Safe collision handling & .part temporary staging (auto-accept active)
+	// The inbox holds received plaintext: it must exist and be owner-only.
+	if err := ensureInboxDir(cfg.InboxDir); err != nil {
+		log.Printf("[RECV] Inbox unavailable: %v", err)
+		notifyUser("Transfer Failed", fmt.Sprintf("Cannot save '%s'", cleanFileName))
+		return
+	}
 	partPath := filepath.Join(cfg.InboxDir, fmt.Sprintf(".%s.%s.part", cleanFileName, transferID))
-	outFile, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	// 0600: the staged plaintext is for gaur alone. O_CREATE never tightens
+	// an existing file, so re-pin the mode for a part left by an older build.
+	outFile, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		log.Printf("[RECV] Failed to create temporary part file: %v", err)
 		notifyUser("Transfer Failed", fmt.Sprintf("Cannot save '%s'", cleanFileName))
 		return
 	}
+	_ = os.Chmod(partPath, 0o600)
 
 	var totalRead int64
 	var transferSuccess bool
@@ -1186,10 +1221,12 @@ func handleIncomingTransferV1(cfg Config, relayToken string, peerCryptoKey []byt
 			return
 		}
 		_ = outFile.Close()
-		// Finding 2: Safe collision resolution and atomic rename
-		finalPath := ResolveUniqueFile(cfg.InboxDir, cleanFileName)
-		if err := os.Rename(partPath, finalPath); err != nil {
-			log.Printf("[RECV] Rename failed: %v", err)
+		// Finding 2: Safe collision resolution and atomic commit. The
+		// link-based commit cannot overwrite a concurrent completion of
+		// the same name and leaves the final file 0600.
+		finalPath, err := CommitUniqueFile(partPath, cfg.InboxDir, cleanFileName)
+		if err != nil {
+			log.Printf("[RECV] Could not finalize '%s': %v", cleanFileName, err)
 			return
 		}
 		transferSuccess = true
@@ -1286,6 +1323,16 @@ func handleIncomingTransferV2(ctx context.Context, cfg Config, relayToken string
 		return
 	}
 
+	// The inbox holds received plaintext: it must exist and be owner-only.
+	if err := ensureInboxDir(cfg.InboxDir); err != nil {
+		log.Printf("[RECV] Inbox unavailable: %v", err)
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type": "transfer_error", "target_id": senderID, "transfer_id": transferID, "reason": "save_failed",
+		})
+		notifyUser("Transfer Failed", fmt.Sprintf("Cannot save '%s'", cleanFileName))
+		return
+	}
+
 	partPath := filepath.Join(cfg.InboxDir, fmt.Sprintf(".%s.%s.part", cleanFileName, transferID))
 	statePath := partPath + ".state"
 
@@ -1375,7 +1422,8 @@ func handleIncomingTransferV2(ctx context.Context, cfg Config, relayToken string
 
 	if fileSize == 0 {
 		if _, err := os.Stat(partPath); os.IsNotExist(err) {
-			if f, err := os.Create(partPath); err == nil {
+			// os.Create would land 0644; an empty file is still plaintext.
+			if f, err := os.OpenFile(partPath, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
 				_ = f.Close()
 			}
 		}
@@ -1392,9 +1440,9 @@ func handleIncomingTransferV2(ctx context.Context, cfg Config, relayToken string
 		return
 	}
 
-	finalPath := ResolveUniqueFile(cfg.InboxDir, cleanFileName)
-	if err := os.Rename(partPath, finalPath); err != nil {
-		log.Printf("[RECV] Rename failed for %s: %v", transferID, err)
+	finalPath, err := CommitUniqueFile(partPath, cfg.InboxDir, cleanFileName)
+	if err != nil {
+		log.Printf("[RECV] Could not finalize %s: %v", transferID, err)
 		_ = wsConn.WriteJSON(map[string]interface{}{
 			"type": "transfer_error", "target_id": senderID, "transfer_id": transferID, "reason": "save_failed",
 		})
@@ -1433,14 +1481,14 @@ type JSONPeer struct {
 	IsSelf bool   `json:"is_self"`
 }
 
-func runList(cfg Config, asJSON bool) {
+// runList prints the cluster's online peers, as a table or as JSON. In JSON
+// mode a failure prints a {"error": ...} object on stdout — scripts parse
+// stdout, so an empty array must never mask a failure — and the returned
+// error is the caller's cue to print it to stderr and exit non-zero.
+func runList(cfg Config, asJSON bool) error {
 	token, err := loadToken(cfg.TokenFile)
 	if err != nil {
-		if asJSON {
-			fmt.Println("[]")
-			return
-		}
-		log.Fatalf("[FATAL] %v", err)
+		return listFailure(asJSON, err)
 	}
 	relayToken, _ := DeriveSubKeys(token)
 
@@ -1451,11 +1499,7 @@ func runList(cfg Config, asJSON bool) {
 
 	conn, err := connectWS(listCfg, relayToken)
 	if err != nil {
-		if asJSON {
-			fmt.Println("[]")
-			return
-		}
-		log.Fatalf("[FATAL] Unable to connect to relay at %s: %v", cfg.RelayAddr, err)
+		return listFailure(asJSON, fmt.Errorf("Unable to connect to relay at %s: %w", cfg.RelayAddr, err))
 	}
 	defer conn.Close()
 
@@ -1463,11 +1507,7 @@ func runList(cfg Config, asJSON bool) {
 	for {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
-			if asJSON {
-				fmt.Println("[]")
-				return
-			}
-			log.Fatalf("[FATAL] Timeout or error waiting for peer list: %v", err)
+			return listFailure(asJSON, fmt.Errorf("Timeout or error waiting for peer list: %w", err))
 		}
 
 		var envelope map[string]interface{}
@@ -1496,7 +1536,7 @@ func runList(cfg Config, asJSON bool) {
 				}
 				jsonBytes, _ := json.Marshal(out)
 				fmt.Println(string(jsonBytes))
-				return
+				return nil
 			}
 
 			fmt.Println("\nONLINE CLUSTER DEVICES (IN-TUNNEL)")
@@ -1519,9 +1559,22 @@ func runList(cfg Config, asJSON bool) {
 			}
 			fmt.Println("────────────────────────────────────────────────────────────────────────")
 			fmt.Println()
-			return
+			return nil
 		}
 	}
+}
+
+// listFailure reports a failed list run. JSON mode gets a machine-readable
+// {"error": ...} object on stdout so shell scripts can parse the failure;
+// the returned error still reaches stderr and a non-zero exit via the caller.
+func listFailure(asJSON bool, err error) error {
+	if asJSON {
+		payload, _ := json.Marshal(struct {
+			Error string `json:"error"`
+		}{Error: err.Error()})
+		fmt.Println(string(payload))
+	}
+	return err
 }
 
 type sendFileMeta struct {
@@ -1569,9 +1622,9 @@ func runSendText(cfg Config, targetQuery, text string) {
 	defer conn.Close()
 	client := &wsClient{conn: conn}
 
-	targetID, targetName := discoverTarget(conn, targetQuery)
-	if targetID == "" {
-		log.Fatalf("[FATAL] Target device '%s' is not currently online in the tunnel", targetQuery)
+	targetID, targetName, err := discoverTarget(conn, targetQuery)
+	if err != nil {
+		log.Fatalf("[FATAL] %v", err)
 	}
 
 	kind := "text"
@@ -1670,9 +1723,9 @@ func runSend(cfg Config, targetQuery string, filePaths []string, openRequested b
 	}
 	defer conn.Close()
 
-	targetID, targetName := discoverTarget(conn, targetQuery)
-	if targetID == "" {
-		log.Fatalf("[FATAL] Target device '%s' is not currently online in the tunnel", targetQuery)
+	targetID, targetName, err := discoverTarget(conn, targetQuery)
+	if err != nil {
+		log.Fatalf("[FATAL] %v", err)
 	}
 	fmt.Printf("Target located: %s (%s)\n", targetName, targetID)
 
@@ -1702,15 +1755,96 @@ func runSend(cfg Config, targetQuery string, filePaths []string, openRequested b
 		len(metas), float64(sentTotal)/(1024*1024), duration, mbps)
 }
 
-// discoverTarget waits for the relay peer list and resolves a device by id,
-// exact name, or case-insensitive name substring.
-func discoverTarget(conn *websocket.Conn, targetQuery string) (string, string) {
+// targetPeer is one entry of the relay's peer list for target resolution.
+type targetPeer struct {
+	ID   string
+	Name string
+}
+
+// Sentinel errors for target resolution: callers must distinguish "no such
+// device" (a send fails, a notification falls back to the mailbox) from
+// "several devices match" (always fatal — a sender must never guess).
+var (
+	errTargetNotFound  = errors.New("target not found")
+	errTargetAmbiguous = errors.New("ambiguous target")
+)
+
+// resolveTargetQuery resolves a send target against the relay's peer list.
+// Matching is tiered so a short or overlapping query cannot misroute a send:
+// exact device id first, then case-insensitive exact name, then
+// case-insensitive name prefix. Several matches within a tier are an error
+// naming the candidates; a substring that is not a prefix never matches.
+func resolveTargetQuery(peers []targetPeer, query string) (targetPeer, error) {
+	// Tier 1: exact device id.
+	var idMatches []targetPeer
+	for _, p := range peers {
+		if p.ID == query {
+			idMatches = append(idMatches, p)
+		}
+	}
+	if len(idMatches) == 1 {
+		return idMatches[0], nil
+	}
+	if len(idMatches) > 1 {
+		return targetPeer{}, ambiguousTargetError(query, idMatches)
+	}
+
+	// Tier 2: case-insensitive exact name.
+	var nameMatches []targetPeer
+	for _, p := range peers {
+		if strings.EqualFold(p.Name, query) {
+			nameMatches = append(nameMatches, p)
+		}
+	}
+	if len(nameMatches) == 1 {
+		return nameMatches[0], nil
+	}
+	if len(nameMatches) > 1 {
+		return targetPeer{}, ambiguousTargetError(query, nameMatches)
+	}
+
+	// Tier 3: case-insensitive name prefix.
+	var prefixMatches []targetPeer
+	lower := strings.ToLower(query)
+	for _, p := range peers {
+		if strings.HasPrefix(strings.ToLower(p.Name), lower) {
+			prefixMatches = append(prefixMatches, p)
+		}
+	}
+	if len(prefixMatches) == 1 {
+		return prefixMatches[0], nil
+	}
+	if len(prefixMatches) > 1 {
+		return targetPeer{}, ambiguousTargetError(query, prefixMatches)
+	}
+
+	return targetPeer{}, fmt.Errorf("%w: device %q is not currently online in the tunnel", errTargetNotFound, query)
+}
+
+// ambiguousTargetError lists the matching candidates so the user can pick
+// one instead of the sender routing the file by guesswork.
+func ambiguousTargetError(query string, matches []targetPeer) error {
+	labels := make([]string, 0, len(matches))
+	for _, p := range matches {
+		if p.Name == "" || p.Name == p.ID {
+			labels = append(labels, p.ID)
+		} else {
+			labels = append(labels, fmt.Sprintf("%s (%s)", p.Name, p.ID))
+		}
+	}
+	return fmt.Errorf("%w %q: %s", errTargetAmbiguous, query, strings.Join(labels, ", "))
+}
+
+// discoverTarget waits for the relay peer list and resolves a device by
+// exact id, exact name, or name prefix. It returns an error when no device
+// matches, when several match, or when the relay never delivers a peer list.
+func discoverTarget(conn *websocket.Conn, targetQuery string) (string, string, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 	for {
 		_, msgBytes, err := conn.ReadMessage()
 		if err != nil {
-			return "", ""
+			return "", "", fmt.Errorf("could not read the peer list from the relay: %w", err)
 		}
 		var envelope map[string]interface{}
 		if json.Unmarshal(msgBytes, &envelope) != nil {
@@ -1720,16 +1854,20 @@ func discoverTarget(conn *websocket.Conn, targetQuery string) (string, string) {
 			continue
 		}
 		peersRaw, _ := envelope["peers"].([]interface{})
+		peers := make([]targetPeer, 0, len(peersRaw))
 		for _, p := range peersRaw {
 			pMap, _ := p.(map[string]interface{})
 			id, _ := pMap["id"].(string)
 			name, _ := pMap["name"].(string)
-			if id == targetQuery || strings.EqualFold(name, targetQuery) ||
-				strings.Contains(strings.ToLower(name), strings.ToLower(targetQuery)) {
-				return id, name
+			if id != "" {
+				peers = append(peers, targetPeer{ID: id, Name: name})
 			}
 		}
-		return "", ""
+		match, err := resolveTargetQuery(peers, targetQuery)
+		if err != nil {
+			return "", "", err
+		}
+		return match.ID, match.Name, nil
 	}
 }
 
@@ -2064,7 +2202,12 @@ func main() {
 				jsonOutput = true
 			}
 		}
-		runList(cfg, jsonOutput)
+		if err := runList(cfg, jsonOutput); err != nil {
+			// Straight to stderr, not via log: -log-file must not
+			// swallow the failure a script needs to see.
+			fmt.Fprintln(os.Stderr, "[FATAL] "+err.Error())
+			os.Exit(1)
+		}
 	case "send":
 		sendFlags := flag.NewFlagSet("send", flag.ExitOnError)
 		openRequested := sendFlags.Bool("open", false, "Ask the receiving device to open the file on arrival")

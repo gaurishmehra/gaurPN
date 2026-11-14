@@ -469,7 +469,7 @@ func handleSealedOffer(
 		log.Printf("[SEALED] Path traversal attempt from %s: %q", senderID, fileName)
 		return
 	}
-	if err := os.MkdirAll(cfg.InboxDir, 0o755); err != nil {
+	if err := ensureInboxDir(cfg.InboxDir); err != nil {
 		log.Printf("[SEALED] Inbox unavailable: %v", err)
 		return
 	}
@@ -524,8 +524,8 @@ func handleSealedOffer(
 		_ = os.Remove(partPath)
 		return
 	}
-	finalPath := ResolveUniqueFile(cfg.InboxDir, cleanName)
-	if err := os.Rename(partPath, finalPath); err != nil {
+	finalPath, err := CommitUniqueFile(partPath, cfg.InboxDir, cleanName)
+	if err != nil {
 		log.Printf("[SEALED] Could not finalize %s: %v", cleanName, err)
 		return
 	}

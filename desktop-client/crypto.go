@@ -11,6 +11,7 @@ import (
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"golang.org/x/crypto/hkdf"
@@ -351,4 +353,97 @@ func ResolveUniqueFile(targetDir string, fileName string) string {
 		}
 	}
 	return filepath.Join(targetDir, fmt.Sprintf("%s (%d)%s", stem, time.Now().UnixNano(), ext))
+}
+
+// osLink is os.Link as a package var so tests can simulate filesystems that
+// refuse hard links.
+var osLink = os.Link
+
+// errLinkUnsupported marks a filesystem that refuses hard links (FAT, some
+// network and FUSE mounts); the commit falls back to rename.
+var errLinkUnsupported = errors.New("hard links unsupported")
+
+// CommitUniqueFile moves a fully received .part file to its final,
+// collision-free name without ever overwriting an existing file. The commit
+// is link-based: os.Link fails with EEXIST when a candidate name is taken,
+// so two concurrent completions of the same name each claim a distinct name
+// instead of the second os.Rename silently replacing the first. On a
+// filesystem that refuses hard links it falls back to the stat-then-rename
+// loop, which cannot overwrite on its own but does not defend against that
+// race either.
+//
+// The staged file is tightened to 0600 first: the link shares the inode, so
+// the final file is owner-only even when an older build staged the .part with
+// looser permissions.
+func CommitUniqueFile(partPath, targetDir, fileName string) (string, error) {
+	if _, err := os.Stat(partPath); err != nil {
+		return "", err
+	}
+	_ = os.Chmod(partPath, 0o600)
+	finalPath, err := linkCommit(partPath, targetDir, fileName)
+	if errors.Is(err, errLinkUnsupported) {
+		finalPath, err = renameCommit(partPath, targetDir, fileName)
+	}
+	return finalPath, err
+}
+
+// uniqueFileCandidates yields the base name, then numbered suffixes, then a
+// time-based name — the same ladder ResolveUniqueFile probes.
+func uniqueFileCandidates(targetDir, fileName string) []string {
+	ext := filepath.Ext(fileName)
+	stem := strings.TrimSuffix(fileName, ext)
+	candidates := make([]string, 0, 1002)
+	candidates = append(candidates, filepath.Join(targetDir, fileName))
+	for i := 1; i <= 1000; i++ {
+		candidates = append(candidates, filepath.Join(targetDir, fmt.Sprintf("%s (%d)%s", stem, i, ext)))
+	}
+	candidates = append(candidates, filepath.Join(targetDir, fmt.Sprintf("%s (%d)%s", stem, time.Now().UnixNano(), ext)))
+	return candidates
+}
+
+func linkCommit(partPath, targetDir, fileName string) (string, error) {
+	for _, candidate := range uniqueFileCandidates(targetDir, fileName) {
+		err := osLink(partPath, candidate)
+		if err == nil {
+			// The link shares the staged file's inode, so dropping the
+			// .part name cannot lose the received bytes.
+			_ = os.Remove(partPath)
+			return candidate, nil
+		}
+		if os.IsExist(err) {
+			continue // name already taken, probe the next one
+		}
+		if linkUnsupported(err) {
+			return "", errLinkUnsupported
+		}
+		return "", err
+	}
+	return "", fmt.Errorf("no free target name for %q in %s", fileName, targetDir)
+}
+
+// renameCommit is the fallback for filesystems that refuse hard links. It
+// keeps ResolveUniqueFile's stat-then-rename behavior, which never
+// overwrites on its own but cannot stop a concurrent completion from landing
+// on the same name.
+func renameCommit(partPath, targetDir, fileName string) (string, error) {
+	finalPath := ResolveUniqueFile(targetDir, fileName)
+	if err := os.Rename(partPath, finalPath); err != nil {
+		return "", err
+	}
+	return finalPath, nil
+}
+
+// linkUnsupported reports whether err looks like a filesystem refusing hard
+// links rather than a real failure such as a missing staged file or an
+// unwritable directory.
+func linkUnsupported(err error) bool {
+	// EOPNOTSUPP and ENOSYS map to errors.ErrUnsupported (Go 1.21+).
+	if errors.Is(err, errors.ErrUnsupported) {
+		return true
+	}
+	// Some filesystems report EPERM instead; EMLINK and EXDEV mean a link
+	// is impossible here even though the filesystem supports them.
+	return errors.Is(err, syscall.EPERM) ||
+		errors.Is(err, syscall.EMLINK) ||
+		errors.Is(err, syscall.EXDEV)
 }

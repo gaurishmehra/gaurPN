@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -52,8 +53,16 @@ func runNotify(cfg Config, targetQuery, title, body, iconPath string) {
 	defer conn.Close()
 	client := &wsClient{conn: conn}
 
-	targetID, targetName := discoverTarget(conn, targetQuery)
-	if targetID == "" {
+	targetID, targetName, err := discoverTarget(conn, targetQuery)
+	if err != nil {
+		if errors.Is(err, errTargetAmbiguous) {
+			// Guessing among several online devices would misroute the
+			// notification; make the user pick instead.
+			log.Fatalf("[FATAL] %v", err)
+		}
+		// No match, or the relay never delivered a peer list: the relay
+		// mailboxes sealed notifications for offline devices, so address
+		// the raw query as a device id like the substring matcher did.
 		targetID = targetQuery
 		targetName = targetQuery
 	}

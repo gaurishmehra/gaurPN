@@ -9,6 +9,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -1034,5 +1035,151 @@ func TestFetchChunkStatusRetriesOnError(t *testing.T) {
 	auth := ChunkAuth{RelayToken: relayToken, DeviceID: "desktop-1", PeerKey: peerKey}
 	if got := fetchChunkStatus(cfg, auth, "tx-1", "sess-1", 4); got != nil {
 		t.Fatalf("fetchChunkStatus on a dead relay = %v, want nil", got)
+	}
+}
+
+// --- MED-7: received-file permissions ---
+
+// TestSealedReceiveFilePermissions pins MED-7: receiving into a legacy
+// world-readable inbox must tighten the directory to 0700, the completed
+// file must land 0600, and no .part or .state may linger.
+func TestSealedReceiveFilePermissions(t *testing.T) {
+	f := newFakeRelay(t)
+	relayToken, peerKey := DeriveSubKeys(f.Token)
+
+	dir := t.TempDir()
+	inbox := filepath.Join(dir, "inbox")
+	// A legacy inbox from before the permission fix: world-readable.
+	if err := os.MkdirAll(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(inbox, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := bytes.Repeat([]byte("p"), 4096) // single chunk
+	src := filepath.Join(dir, "notes.bin")
+	if err := os.WriteFile(src, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := HashFileChunks(src, ChunkSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transferID := DeriveTransferID(peerKey, digest.FileHash)
+	sessionID := DeriveSessionID(peerKey, transferID)
+	fileKey := DeriveFileKey(peerKey, transferID)
+
+	cfg := Config{RelayAddr: f.URL, DeviceID: "desktop-1", Name: "Desktop"}
+	auth := ChunkAuth{RelayToken: relayToken, DeviceID: "desktop-1-out", PeerKey: peerKey}
+	for i := 0; i < digest.ChunkCount; i++ {
+		stageV3Chunk(t, f, cfg, auth, payload, digest, fileKey, transferID, sessionID, i)
+	}
+
+	conn, err := connectWS(cfg, relayToken)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close()
+	client := &wsClient{conn: conn}
+
+	inner := map[string]interface{}{
+		"transfer_id":  transferID,
+		"session_id":   sessionID,
+		"file_name":    "notes.bin",
+		"file_size":    float64(digest.Size),
+		"chunk_size":   float64(ChunkSize),
+		"chunk_count":  float64(digest.ChunkCount),
+		"file_hash":    digest.FileHash,
+		"chunk_hashes": ifaceStrings(digest.ChunkHashes),
+	}
+	recvCfg := Config{RelayAddr: f.URL, DeviceID: "desktop-1", Name: "Desktop", InboxDir: inbox}
+	handleSealedOffer(recvCfg, relayToken, peerKey, client, "android-1", "Lavander", inner)
+
+	inboxInfo, err := os.Stat(inbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := inboxInfo.Mode().Perm(); perm != 0o700 {
+		t.Fatalf("inbox mode = %04o, want 0700", perm)
+	}
+
+	finalPath := filepath.Join(inbox, "notes.bin")
+	fileInfo, err := os.Stat(finalPath)
+	if err != nil {
+		t.Fatalf("completed file is missing: %v", err)
+	}
+	if perm := fileInfo.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("received file mode = %04o, want 0600", perm)
+	}
+	got, err := os.ReadFile(finalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("received file does not match the original")
+	}
+
+	partPath := filepath.Join(inbox, fmt.Sprintf(".%s.%s.part", "notes.bin", transferID))
+	statePath := partPath + ".state"
+	if _, err := os.Stat(partPath); !os.IsNotExist(err) {
+		t.Fatalf(".part must be renamed away on success, stat err: %v", err)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("state must be cleaned up on success, stat err: %v", err)
+	}
+}
+
+// TestDownloadChunksStagesPartOwnerOnly pins the chunk-layer half of MED-7:
+// the .part file is created 0600, and a legacy 0644 .part is tightened when
+// a resumed download reopens it.
+func TestDownloadChunksStagesPartOwnerOnly(t *testing.T) {
+	f := newFakeRelay(t)
+	relayToken, peerKey := DeriveSubKeys(f.Token)
+
+	dir := t.TempDir()
+	payload := bytes.Repeat([]byte("q"), 2048)
+	digest := &FileDigest{
+		FileHash:    Sha256Hex(payload),
+		ChunkHashes: []string{Sha256Hex(payload)},
+		ChunkCount:  1,
+		Size:        int64(len(payload)),
+	}
+	transferID := "tx-perm-1"
+	sessionID := "sess-perm-1"
+	fileKey := DeriveFileKey(peerKey, transferID)
+
+	cfg := Config{RelayAddr: f.URL, DeviceID: "desktop-1", Name: "Desktop"}
+	auth := ChunkAuth{RelayToken: relayToken, DeviceID: "desktop-1", PeerKey: peerKey}
+	stageV3Chunk(t, f, cfg, auth, payload, digest, fileKey, transferID, sessionID, 0)
+
+	// Legacy .part from an older build: world-readable.
+	partPath := filepath.Join(dir, ".notes.bin.tx-perm-1.part")
+	if err := os.WriteFile(partPath, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(partPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	statePath := partPath + ".state"
+	state := NewReceiveState(transferID, digest.FileHash, digest.Size, ChunkSize, digest.ChunkCount)
+
+	if err := downloadChunks(context.Background(), cfg, auth, transferID, sessionID, digest, fileKey, []int{0}, partPath, state, statePath, nil); err != nil {
+		t.Fatalf("downloadChunks: %v", err)
+	}
+
+	info, err := os.Stat(partPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf(".part mode = %04o, want 0600", perm)
+	}
+	got, err := os.ReadFile(partPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal(".part does not hold the downloaded payload")
 	}
 }

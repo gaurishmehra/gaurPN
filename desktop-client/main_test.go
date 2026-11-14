@@ -3,11 +3,17 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // captureLog runs f with the standard logger writing to a buffer and returns
@@ -24,6 +30,26 @@ func captureLog(f func()) string {
 
 func contains(haystack, needle string) bool {
 	return strings.Contains(haystack, needle)
+}
+
+// captureStdout runs f with os.Stdout replaced by a pipe and returns what
+// was printed. Tests in this package run sequentially, so swapping the
+// global stdout is safe.
+func captureStdout(f func()) string {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		panic(err)
+	}
+	os.Stdout = w
+	defer func() {
+		os.Stdout = old
+		_ = w.Close()
+	}()
+	f()
+	_ = w.Close()
+	out, _ := io.ReadAll(r)
+	return string(out)
 }
 
 func TestLoadTokenRefusesExposedFile(t *testing.T) {
@@ -152,5 +178,250 @@ func TestWritePeersFileWritesWatchableSchema(t *testing.T) {
 	}
 	if len(payload.Peers) != 1 || payload.Peers[0].ID != "phone-1" {
 		t.Fatalf("unexpected peers payload: %s", data)
+	}
+}
+
+// --- MED-9: tiered target resolution ---
+
+func TestResolveTargetQuery(t *testing.T) {
+	cases := []struct {
+		name     string
+		peers    []targetPeer
+		query    string
+		wantID   string
+		wantName string
+		wantErr  string
+		sentinel error
+	}{
+		{
+			name:     "exact device id wins over an exact name",
+			peers:    []targetPeer{{ID: "lilac-1", Name: "Lilac"}, {ID: "other-1", Name: "lilac-1"}},
+			query:    "lilac-1",
+			wantID:   "lilac-1",
+			wantName: "Lilac",
+		},
+		{
+			name:     "exact name beats a prefix match",
+			peers:    []targetPeer{{ID: "lilac-1", Name: "Lilac"}, {ID: "lilac-2", Name: "Lilac Phone"}},
+			query:    "lilac",
+			wantID:   "lilac-1",
+			wantName: "Lilac",
+		},
+		{
+			name:     "exact name is case-insensitive",
+			peers:    []targetPeer{{ID: "lilac-1", Name: "Lilac"}},
+			query:    "LILAC",
+			wantID:   "lilac-1",
+			wantName: "Lilac",
+		},
+		{
+			name:     "single prefix match resolves",
+			peers:    []targetPeer{{ID: "lilac-1", Name: "Lilac"}, {ID: "desktop-9", Name: "Desktop"}},
+			query:    "lil",
+			wantID:   "lilac-1",
+			wantName: "Lilac",
+		},
+		{
+			name:     "two prefix matches are ambiguous",
+			peers:    []targetPeer{{ID: "lilac-1", Name: "Lilac"}, {ID: "lime-2", Name: "Lime"}},
+			query:    "li",
+			wantErr:  "ambiguous target \"li\": Lilac (lilac-1), Lime (lime-2)",
+			sentinel: errTargetAmbiguous,
+		},
+		{
+			name:     "two exact names are ambiguous",
+			peers:    []targetPeer{{ID: "a-1", Name: "Lilac"}, {ID: "b-2", Name: "Lilac"}},
+			query:    "lilac",
+			wantErr:  "ambiguous target \"lilac\": Lilac (a-1), Lilac (b-2)",
+			sentinel: errTargetAmbiguous,
+		},
+		{
+			name:     "substring that is not a prefix never matches",
+			peers:    []targetPeer{{ID: "slime-1", Name: "Slime"}},
+			query:    "li",
+			wantErr:  "not currently online",
+			sentinel: errTargetNotFound,
+		},
+		{
+			name:     "no match reports not found",
+			peers:    []targetPeer{{ID: "lilac-1", Name: "Lilac"}},
+			query:    "zeta",
+			wantErr:  "not currently online",
+			sentinel: errTargetNotFound,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			match, err := resolveTargetQuery(tc.peers, tc.query)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("resolveTargetQuery(%q) = %+v, want error", tc.query, match)
+				}
+				if !contains(err.Error(), tc.wantErr) {
+					t.Fatalf("error = %q, want it to contain %q", err, tc.wantErr)
+				}
+				if !errors.Is(err, tc.sentinel) {
+					t.Fatalf("error = %q, want sentinel %v", err, tc.sentinel)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveTargetQuery(%q): %v", tc.query, err)
+			}
+			if match.ID != tc.wantID || match.Name != tc.wantName {
+				t.Fatalf("match = %+v, want %s (%s)", match, tc.wantName, tc.wantID)
+			}
+		})
+	}
+}
+
+// TestDiscoverTargetViaRelay wires the full discovery path against the fake
+// relay: an ambiguous prefix lists the candidates, an exact id resolves
+// through the name cloud, and an unknown query reports not found. The fake
+// relay broadcasts the peer list on every connect, so each probe opens one
+// extra connection to trigger a fresh list.
+func TestDiscoverTargetViaRelay(t *testing.T) {
+	f := newFakeRelay(t)
+	relayToken, _ := DeriveSubKeys(f.Token)
+
+	phoneCfg := Config{RelayAddr: f.URL, DeviceID: "lilac-1", Name: "Lilac"}
+	phoneConn, err := connectWS(phoneCfg, relayToken)
+	if err != nil {
+		t.Fatalf("connect phone: %v", err)
+	}
+	defer phoneConn.Close()
+	waitFor(t, 5*time.Second, func() bool { return f.connects() >= 1 })
+
+	tabletCfg := Config{RelayAddr: f.URL, DeviceID: "lime-2", Name: "Lime"}
+	tabletConn, err := connectWS(tabletCfg, relayToken)
+	if err != nil {
+		t.Fatalf("connect tablet: %v", err)
+	}
+	defer tabletConn.Close()
+	waitFor(t, 5*time.Second, func() bool { return f.connects() >= 2 })
+
+	seekerCfg := Config{RelayAddr: f.URL, DeviceID: "desktop-9", Name: "Desktop"}
+	seekerConn, err := connectWS(seekerCfg, relayToken)
+	if err != nil {
+		t.Fatalf("connect seeker: %v", err)
+	}
+	defer seekerConn.Close()
+
+	// The connect broadcast already carries the full peer list.
+	_, _, err = discoverTarget(seekerConn, "li")
+	if !errors.Is(err, errTargetAmbiguous) {
+		t.Fatalf("discoverTarget(\"li\") err = %v, want ambiguity", err)
+	}
+	if !contains(err.Error(), "Lilac") || !contains(err.Error(), "Lime") {
+		t.Fatalf("ambiguity error must list the candidates, got: %v", err)
+	}
+
+	// Trigger a fresh broadcast for each further probe.
+	broadcast := func() *websocket.Conn {
+		t.Helper()
+		conn, err := connectWS(Config{RelayAddr: f.URL, DeviceID: fmt.Sprintf("extra-%d", f.connects())}, relayToken)
+		if err != nil {
+			t.Fatalf("connect extra peer: %v", err)
+		}
+		return conn
+	}
+
+	extra1 := broadcast()
+	defer extra1.Close()
+	id, name, err := discoverTarget(seekerConn, "lilac-1")
+	if err != nil {
+		t.Fatalf("discoverTarget by id: %v", err)
+	}
+	if id != "lilac-1" || name != "Lilac" {
+		t.Fatalf("resolved %s (%s), want Lilac (lilac-1)", name, id)
+	}
+
+	extra2 := broadcast()
+	defer extra2.Close()
+	if _, _, err := discoverTarget(seekerConn, "zeta"); !errors.Is(err, errTargetNotFound) {
+		t.Fatalf("discoverTarget(\"zeta\") err = %v, want not found", err)
+	}
+}
+
+// --- MED-10: list error reporting ---
+
+// TestRunListJSONReportsErrors pins the script contract: a failed -json
+// list prints a {"error": ...} object on stdout and returns a non-nil error
+// so the CLI exits non-zero — an empty array must never mask a failure.
+func TestRunListJSONReportsErrors(t *testing.T) {
+	t.Setenv("GAURPN_CLUSTER_TOKEN", "")
+	cfg := Config{
+		RelayAddr: "127.0.0.1:1",
+		TokenFile: filepath.Join(t.TempDir(), "missing.key"),
+	}
+
+	var listErr error
+	out := captureStdout(func() {
+		listErr = runList(cfg, true)
+	})
+	if listErr == nil {
+		t.Fatal("runList must return an error when the token is missing (the CLI exits non-zero on it)")
+	}
+
+	var payload struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &payload); err != nil {
+		t.Fatalf("stdout is not a JSON error object: %q: %v", out, err)
+	}
+	if payload.Error == "" {
+		t.Fatalf("JSON error object must carry the failure, got: %q", out)
+	}
+	if !contains(payload.Error, "missing.key") {
+		t.Fatalf("error must name the token file, got: %q", payload.Error)
+	}
+	if !contains(listErr.Error(), payload.Error) {
+		t.Fatalf("returned error must match the reported one, got: %v", listErr)
+	}
+}
+
+// TestRunListJSONHappyPathUnchanged pins that a successful -json list still
+// prints the peers array — the Quickshell share picker parses it.
+func TestRunListJSONHappyPathUnchanged(t *testing.T) {
+	f := newFakeRelay(t)
+	relayToken, _ := DeriveSubKeys(f.Token)
+
+	phoneCfg := Config{RelayAddr: f.URL, DeviceID: "phone-1", Name: "Lavander"}
+	phoneConn, err := connectWS(phoneCfg, relayToken)
+	if err != nil {
+		t.Fatalf("connect phone: %v", err)
+	}
+	defer phoneConn.Close()
+	waitFor(t, 5*time.Second, func() bool { return f.connects() >= 1 })
+
+	dir := t.TempDir()
+	cfg := Config{
+		RelayAddr: f.URL,
+		TokenFile: writeClusterToken(t, dir, f.Token),
+		DeviceID:  "desktop-1",
+		Name:      "Desktop",
+	}
+
+	var listErr error
+	out := captureStdout(func() {
+		listErr = runList(cfg, true)
+	})
+	if listErr != nil {
+		t.Fatalf("runList: %v", listErr)
+	}
+
+	var peers []JSONPeer
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &peers); err != nil {
+		t.Fatalf("stdout is not a JSON peers array: %q: %v", out, err)
+	}
+	ids := map[string]bool{}
+	for _, p := range peers {
+		ids[p.ID] = true
+	}
+	if !ids["phone-1"] {
+		t.Fatalf("peers array must contain phone-1, got: %s", out)
+	}
+	if ids[fmt.Sprintf("list-%d", os.Getpid())] {
+		t.Fatalf("the list client must not list itself, got: %s", out)
 	}
 }
