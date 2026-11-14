@@ -39,6 +39,7 @@ import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.TransferSettingsRepository
 import dev.gaurish.outlinelite.data.TrustedDeviceRepository
 import dev.gaurish.outlinelite.transfer.RelayManager
+import dev.gaurish.outlinelite.ui.settings.SectionLabel
 import kotlinx.coroutines.launch
 
 /**

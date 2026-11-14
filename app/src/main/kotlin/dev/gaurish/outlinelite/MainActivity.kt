@@ -44,9 +44,15 @@ import dev.gaurish.outlinelite.ui.HistoryScreen
 import dev.gaurish.outlinelite.ui.HomeScreen
 import dev.gaurish.outlinelite.ui.OutlineTheme
 import dev.gaurish.outlinelite.ui.ShareTargetDialog
-import dev.gaurish.outlinelite.ui.SettingsScreen
+import dev.gaurish.outlinelite.ui.Screens
 import dev.gaurish.outlinelite.ui.SplitTunnelScreen
 import dev.gaurish.outlinelite.ui.TrustedDevicesScreen
+import dev.gaurish.outlinelite.ui.settings.ClipboardSyncScreen
+import dev.gaurish.outlinelite.ui.settings.DnsScreen
+import dev.gaurish.outlinelite.ui.settings.MediaScreen
+import dev.gaurish.outlinelite.ui.settings.NotificationsScreen
+import dev.gaurish.outlinelite.ui.settings.SettingsScreen
+import dev.gaurish.outlinelite.ui.settings.TransfersScreen
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
@@ -121,28 +127,56 @@ class MainActivity : ComponentActivity() {
                         .collectAsStateWithLifecycle(null)
                     val scope = rememberCoroutineScope()
                     val widthClass = calculateWindowSizeClass(this).widthSizeClass
-                    var screen by rememberSaveable { mutableIntStateOf(0) } // 0 = home, 1 = settings, 2 = split tunneling
+                    var screen by rememberSaveable { mutableIntStateOf(Screens.HOME) }
 
                     when (screen) {
-                        4 -> {
-                            BackHandler { screen = 1 }
-                            TrustedDevicesScreen(onBack = { screen = 1 })
+                        Screens.TRANSFERS -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            TransfersScreen(
+                                onBack = { screen = Screens.SETTINGS },
+                                onOpenHistory = { screen = Screens.HISTORY },
+                            )
                         }
-                        3 -> {
-                            BackHandler { screen = 1 }
-                            HistoryScreen(onBack = { screen = 1 })
+                        Screens.MEDIA -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            MediaScreen(onBack = { screen = Screens.SETTINGS })
                         }
-                        2 -> {
-                            BackHandler { screen = 1 }
-                            SplitTunnelScreen(onBack = { screen = 1 })
+                        Screens.NOTIFICATIONS -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            NotificationsScreen(onBack = { screen = Screens.SETTINGS })
                         }
-                        1 -> {
-                            BackHandler { screen = 0 }
+                        Screens.CLIPBOARD_SYNC -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            ClipboardSyncScreen(onBack = { screen = Screens.SETTINGS })
+                        }
+                        Screens.DNS -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            DnsScreen(onBack = { screen = Screens.SETTINGS })
+                        }
+                        Screens.TRUSTED_DEVICES -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            TrustedDevicesScreen(onBack = { screen = Screens.SETTINGS })
+                        }
+                        Screens.HISTORY -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            HistoryScreen(onBack = { screen = Screens.SETTINGS })
+                        }
+                        Screens.SPLIT_TUNNEL -> {
+                            BackHandler { screen = Screens.SETTINGS }
+                            SplitTunnelScreen(onBack = { screen = Screens.SETTINGS })
+                        }
+                        Screens.SETTINGS -> {
+                            BackHandler { screen = Screens.HOME }
                             SettingsScreen(
-                                onBack = { screen = 0 },
-                                onOpenSplitTunnel = { screen = 2 },
-                                onOpenHistory = { screen = 3 },
-                                onOpenTrustedDevices = { screen = 4 },
+                                onBack = { screen = Screens.HOME },
+                                onOpenSplitTunnel = { screen = Screens.SPLIT_TUNNEL },
+                                onOpenHistory = { screen = Screens.HISTORY },
+                                onOpenTrustedDevices = { screen = Screens.TRUSTED_DEVICES },
+                                onOpenDns = { screen = Screens.DNS },
+                                onOpenClipboardSync = { screen = Screens.CLIPBOARD_SYNC },
+                                onOpenNotifications = { screen = Screens.NOTIFICATIONS },
+                                onOpenMedia = { screen = Screens.MEDIA },
+                                onOpenTransfers = { screen = Screens.TRANSFERS },
                             )
                         }
                         else -> {
@@ -178,7 +212,7 @@ class MainActivity : ComponentActivity() {
                                 onDelete = { key ->
                                     scope.launch { KeyRepository.removeKey(applicationContext, key.id) }
                                 },
-                                onOpenSettings = { screen = 1 },
+                                onOpenSettings = { screen = Screens.SETTINGS },
                             )
                         }
                     }
