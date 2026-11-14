@@ -8,7 +8,6 @@ data class ClusterPeer(
 
 sealed interface TransferState {
     data object Idle : TransferState
-    data class Connecting(val peerName: String) : TransferState
     data class Sending(
         val peerName: String,
         val fileName: String,

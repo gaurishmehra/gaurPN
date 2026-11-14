@@ -1,6 +1,5 @@
 package dev.gaurish.outlinelite.transfer
 
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -9,7 +8,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -71,17 +69,12 @@ object TextShareNotifications {
     }
 
     private fun ensureChannel(context: Context) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val nm = context.getSystemService(NotificationManager::class.java) ?: return
-        if (nm.getNotificationChannel(CHANNEL_ID) != null) return
-        nm.createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                "Text and links",
-                NotificationManager.IMPORTANCE_HIGH,
-            ).apply {
-                description = "Text and links shared from other cluster devices"
-            }
+        NotificationChannels.ensureChannel(
+            context,
+            CHANNEL_ID,
+            "Text and links",
+            NotificationManager.IMPORTANCE_HIGH,
+            description = "Text and links shared from other cluster devices",
         )
     }
 }

@@ -529,7 +529,6 @@ private fun TransferDialog(
         title = {
             val titleText = when (state) {
                 is TransferState.Idle -> ""
-                is TransferState.Connecting -> "Connecting..."
                 is TransferState.Sending -> "Sending File"
                 is TransferState.Receiving -> "Receiving File"
                 is TransferState.Completed -> "Transfer Complete"
@@ -550,96 +549,16 @@ private fun TransferDialog(
             Column(modifier = Modifier.fillMaxWidth()) {
                 when (state) {
                     is TransferState.Idle -> Unit
-                    is TransferState.Connecting -> {
-                        Text(
-                            "Establishing tunnel connection to ${state.peerName}...",
-                            fontSize = 14.sp,
-                            color = scheme.onSurfaceVariant,
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        LinearProgressIndicator(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(4.dp)
-                                .clip(RoundedCornerShape(2.dp)),
-                            color = scheme.primary,
-                            trackColor = scheme.outlineVariant,
-                        )
-                    }
-                    is TransferState.Sending -> {
-                        Text(
-                            state.fileName,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = scheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                "${(state.progress * 100).toInt()}%",
-                                fontSize = 12.sp,
-                                color = scheme.onSurfaceVariant,
-                            )
-                            Text(
-                                "%.1f MB/s".format(state.speedMbPerSec),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = scheme.primary,
-                            )
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        LinearProgressIndicator(
-                            progress = { state.progress },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(6.dp)
-                                .clip(RoundedCornerShape(3.dp)),
-                            color = scheme.primary,
-                            trackColor = scheme.outlineVariant,
-                        )
-                    }
-                    is TransferState.Receiving -> {
-                        Text(
-                            state.fileName,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = scheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                        ) {
-                            Text(
-                                "${(state.progress * 100).toInt()}%",
-                                fontSize = 12.sp,
-                                color = scheme.onSurfaceVariant,
-                            )
-                            Text(
-                                "%.1f MB/s".format(state.speedMbPerSec),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = scheme.primary,
-                            )
-                        }
-                        Spacer(Modifier.height(10.dp))
-                        LinearProgressIndicator(
-                            progress = { state.progress },
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(6.dp)
-                                .clip(RoundedCornerShape(3.dp)),
-                            color = scheme.primary,
-                            trackColor = scheme.outlineVariant,
-                        )
-                    }
+                    is TransferState.Sending -> TransferFileProgress(
+                        fileName = state.fileName,
+                        progress = state.progress,
+                        speedMbPerSec = state.speedMbPerSec,
+                    )
+                    is TransferState.Receiving -> TransferFileProgress(
+                        fileName = state.fileName,
+                        progress = state.progress,
+                        speedMbPerSec = state.speedMbPerSec,
+                    )
                     is TransferState.Completed -> {
                         Text(
                             state.message,
@@ -687,5 +606,53 @@ private fun TransferDialog(
                 }
             }
         },
+    )
+}
+
+/**
+ * File name, percent, speed, and progress bar shared by the Sending and
+ * Receiving branches of [TransferDialog]; both render identically.
+ */
+@Composable
+private fun TransferFileProgress(
+    fileName: String,
+    progress: Float,
+    speedMbPerSec: Float,
+) {
+    val scheme = MaterialTheme.colorScheme
+    Text(
+        fileName,
+        fontSize = 14.sp,
+        fontWeight = FontWeight.SemiBold,
+        color = scheme.onSurface,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+    Spacer(Modifier.height(4.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            "${(progress * 100).toInt()}%",
+            fontSize = 12.sp,
+            color = scheme.onSurfaceVariant,
+        )
+        Text(
+            "%.1f MB/s".format(speedMbPerSec),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            color = scheme.primary,
+        )
+    }
+    Spacer(Modifier.height(10.dp))
+    LinearProgressIndicator(
+        progress = { progress },
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(6.dp)
+            .clip(RoundedCornerShape(3.dp)),
+        color = scheme.primary,
+        trackColor = scheme.outlineVariant,
     )
 }

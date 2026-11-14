@@ -1,6 +1,5 @@
 package dev.gaurish.outlinelite.transfer
 
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
@@ -12,7 +11,6 @@ import android.media.MediaMetadata
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.support.v4.media.session.MediaSessionCompat
-import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
@@ -300,19 +298,16 @@ object RemoteMediaDisplay {
     }
 
     private fun ensureChannel(context: Context) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val nm = context.getSystemService(NotificationManager::class.java) ?: return
-        if (nm.getNotificationChannel(REMOTE_MEDIA_CHANNEL) != null) return
-        nm.createNotificationChannel(
-            NotificationChannel(
-                REMOTE_MEDIA_CHANNEL,
-                "Desktop media",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "Now playing from another cluster device"
+        NotificationChannels.ensureChannel(
+            context,
+            REMOTE_MEDIA_CHANNEL,
+            "Desktop media",
+            NotificationManager.IMPORTANCE_LOW,
+            description = "Now playing from another cluster device",
+            configure = {
                 setSound(null, null)
                 enableVibration(false)
-            }
+            },
         )
     }
 }

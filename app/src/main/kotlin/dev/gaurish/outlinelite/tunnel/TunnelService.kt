@@ -1,7 +1,6 @@
 package dev.gaurish.outlinelite.tunnel
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.ComponentName
@@ -29,6 +28,7 @@ import dev.gaurish.outlinelite.data.SplitTunnelRepository
 import dev.gaurish.outlinelite.outlinev.Outlinev
 import dev.gaurish.outlinelite.outlinev.Protector
 import dev.gaurish.outlinelite.tile.QsTileService
+import dev.gaurish.outlinelite.transfer.NotificationChannels
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -557,14 +557,12 @@ class TunnelService : VpnService() {
     }
 
     private fun ensureChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val nm = getSystemService(NotificationManager::class.java)
-            if (nm?.getNotificationChannel(CHANNEL) == null) {
-                nm?.createNotificationChannel(
-                    NotificationChannel(CHANNEL, getString(R.string.app_name), NotificationManager.IMPORTANCE_LOW)
-                )
-            }
-        }
+        NotificationChannels.ensureChannel(
+            this,
+            CHANNEL,
+            getString(R.string.app_name),
+            NotificationManager.IMPORTANCE_LOW,
+        )
     }
 
     private fun buildNotification(): Notification {

@@ -1,7 +1,6 @@
 package dev.gaurish.outlinelite.transfer
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.RemoteInput as PlatformRemoteInput
@@ -345,17 +344,12 @@ object NotificationDisplay {
     }
 
     private fun ensureChannel(context: Context) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val nm = context.getSystemService(NotificationManager::class.java) ?: return
-        if (nm.getNotificationChannel(MIRROR_CHANNEL_ID) != null) return
-        nm.createNotificationChannel(
-            NotificationChannel(
-                MIRROR_CHANNEL_ID,
-                "Mirrored notifications",
-                NotificationManager.IMPORTANCE_HIGH,
-            ).apply {
-                description = "Notifications shared from other cluster devices"
-            }
+        NotificationChannels.ensureChannel(
+            context,
+            MIRROR_CHANNEL_ID,
+            "Mirrored notifications",
+            NotificationManager.IMPORTANCE_HIGH,
+            description = "Notifications shared from other cluster devices",
         )
     }
 }

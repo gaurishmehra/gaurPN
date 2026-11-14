@@ -132,6 +132,16 @@ fun HomeScreen(
         keys.firstOrNull { it.id == activeId } ?: keys.firstOrNull()
     }
 
+    val copyKeyToClipboard: (AccessKey) -> Unit = { key ->
+        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+        val clip = ClipData.newPlainText("Shadowsocks Key", key.toSsUri())
+        clip.description.extras = android.os.PersistableBundle().apply {
+            putBoolean("android.content.extra.IS_SENSITIVE", true)
+        }
+        cm?.setPrimaryClip(clip)
+        Toast.makeText(context, "Key copied to clipboard", Toast.LENGTH_SHORT).show()
+    }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -177,15 +187,7 @@ fun HomeScreen(
                         onSelect = onSelect,
                         onRenameRequest = { keyToRename = it },
                         onDeleteRequest = { keyToDelete = it },
-                        onShare = { key ->
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            val clip = ClipData.newPlainText("Shadowsocks Key", key.toSsUri())
-                            clip.description.extras = android.os.PersistableBundle().apply {
-                                putBoolean("android.content.extra.IS_SENSITIVE", true)
-                            }
-                            cm?.setPrimaryClip(clip)
-                            Toast.makeText(context, "Key copied to clipboard", Toast.LENGTH_SHORT).show()
-                        },
+                        onShare = copyKeyToClipboard,
                     )
                     Spacer(Modifier.height(16.dp))
                 }
@@ -212,15 +214,7 @@ fun HomeScreen(
                         onSelect = onSelect,
                         onRenameRequest = { keyToRename = it },
                         onDeleteRequest = { keyToDelete = it },
-                        onShare = { key ->
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            val clip = ClipData.newPlainText("Shadowsocks Key", key.toSsUri())
-                            clip.description.extras = android.os.PersistableBundle().apply {
-                                putBoolean("android.content.extra.IS_SENSITIVE", true)
-                            }
-                            cm?.setPrimaryClip(clip)
-                            Toast.makeText(context, "Key copied to clipboard", Toast.LENGTH_SHORT).show()
-                        },
+                        onShare = copyKeyToClipboard,
                     )
                 }
             }

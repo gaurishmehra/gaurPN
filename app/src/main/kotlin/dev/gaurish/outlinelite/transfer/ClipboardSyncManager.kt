@@ -98,17 +98,6 @@ object ClipboardSyncManager {
         }
     }
 
-    /** Stops everything, e.g. when the tunnel disconnects. */
-    @Synchronized
-    fun stop() {
-        settingsJob?.cancel()
-        settingsJob = null
-        pollJob?.cancel()
-        pollJob = null
-        relayConnected = false
-        updateState(ClipboardSyncPhase.DISABLED, "Off")
-    }
-
     @Synchronized
     fun onRelayConnected(context: Context) {
         appContext = context.applicationContext
