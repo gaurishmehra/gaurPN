@@ -289,11 +289,13 @@ object ClipboardSyncManager {
 
     private fun extractSnapshot(context: Context, clip: ClipData): ClipboardSnapshot? {
         val sensitive = isSensitive(clip)
-        Log.d(TAG, "Clipboard clip: items=${clip.itemCount}, desc=${clip.description}")
+        // Debug logging counts items and mimes only — clip descriptions, URIs,
+        // and text never reach the log (they can carry content hints).
+        Log.d(TAG, "Clipboard clip: items=${clip.itemCount}")
         for (i in 0 until clip.itemCount) {
             val item = clip.getItemAt(i)
             val mime = item.uri?.let { runCatching { context.contentResolver.getType(it) }.getOrNull() }
-            Log.d(TAG, "  item $i: uri=${item.uri} mime=$mime textLen=${item.text?.length ?: 0}")
+            Log.d(TAG, "  item $i: hasUri=${item.uri != null} mime=$mime textLen=${item.text?.length ?: 0}")
         }
 
         // Prefer an actual image when the source app put both a text

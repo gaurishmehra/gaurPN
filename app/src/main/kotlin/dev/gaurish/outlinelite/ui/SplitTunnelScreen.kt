@@ -3,6 +3,7 @@ package dev.gaurish.outlinelite.ui
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.os.Build
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -81,13 +82,23 @@ fun SplitTunnelScreen(onBack: () -> Unit) {
             val intent = Intent(Intent.ACTION_MAIN, null).apply {
                 addCategory(Intent.CATEGORY_LAUNCHER)
             }
-            val resolveInfos = pm.queryIntentActivities(intent, 0)
+            val resolveInfos = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                pm.queryIntentActivities(
+                    intent,
+                    PackageManager.ResolveInfoFlags.of(0),
+                )
+            } else {
+                @Suppress("DEPRECATION")
+                pm.queryIntentActivities(intent, 0)
+            }
             val appList = resolveInfos.mapNotNull { ri ->
                 val pkg = ri.activityInfo.packageName
                 if (pkg == context.packageName) return@mapNotNull null
                 val label = ri.loadLabel(pm)?.toString() ?: pkg
+                // 48 px thumbnails keep the whole-app list light on devices
+                // with hundreds of launchable apps.
                 val icon = runCatching {
-                    ri.loadIcon(pm)?.toBitmap(width = 96, height = 96)
+                    ri.loadIcon(pm)?.toBitmap(width = 48, height = 48)
                 }.getOrNull()
                 InstalledApp(packageName = pkg, appName = label, iconBitmap = icon)
             }.distinctBy { it.packageName }
