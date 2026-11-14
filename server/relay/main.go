@@ -53,6 +53,12 @@ var (
 	wsWriteTimeout = 15 * time.Second
 )
 
+// wsMaxMessageBytes caps one inbound WebSocket frame. Signaling messages
+// are small (offers, accepts, text, clipboard). Chunk bodies travel over
+// HTTP, so 1 MiB is generous and prevents a token holder from forcing
+// the relay to buffer arbitrary payloads.
+const wsMaxMessageBytes = 1 << 20
+
 // validDeviceID bounds the join-time device id: opaque, URL-safe, short.
 var validDeviceID = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
@@ -146,6 +152,30 @@ type Hub struct {
 	closeOnce sync.Once
 }
 
+// Pipe transfer-stream tuning. These bound the resources one transfer
+// may hold: the decoupling buffer, the rendezvous windows, the idle
+// eviction, and the streaming granularity.
+const (
+	// pipeBufferSize is the decoupling buffer per transfer (2 MiB): the
+	// sender can keep the network socket full while the receiver drains
+	// at its own pace.
+	pipeBufferSize = 2 << 20
+	// pipeIdleTimeout is how long a pipe session may move no bytes
+	// before the hub's sweep evicts it.
+	pipeIdleTimeout = 5 * time.Minute
+	// pipeRendezvousTimeout is how long one side of a transfer may wait
+	// for its counterpart to connect before the relay gives up on it.
+	pipeRendezvousTimeout = 60 * time.Second
+	// pipeDrainTimeout is how long a finished sender waits for the
+	// receiver to consume the buffered tail of the stream.
+	pipeDrainTimeout = 60 * time.Second
+	// pipeCopyBufferSize is the io.CopyBuffer granularity when streaming
+	// a transfer through the relay.
+	pipeCopyBufferSize = 256 * 1024
+	// pipeFlushInterval is the receiver's flush cadence; see flushWriter.
+	pipeFlushInterval = 100 * time.Millisecond
+)
+
 type PipeSession struct {
 	transferID        string
 	pipe              *bufferedPipe
@@ -167,7 +197,7 @@ type PipeSession struct {
 func newPipeSession(transferID string) *PipeSession {
 	return &PipeSession{
 		transferID:    transferID,
-		pipe:          newBufferedPipe(2 << 20), // 2 MiB of decoupling per transfer
+		pipe:          newBufferedPipe(pipeBufferSize),
 		receiverReady: make(chan struct{}),
 		senderReady:   make(chan struct{}),
 		done:          make(chan struct{}),
@@ -244,6 +274,11 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 	return
 }
 
+// hubSweepInterval is how often the hub's background sweep evicts idle
+// pipe sessions and drops expired auth-failure counters, so neither
+// table needs per-request cleanup.
+const hubSweepInterval = 30 * time.Second
+
 func NewHub(token []byte, chunks *ChunkStore, mailboxes ...*Mailbox) *Hub {
 	if chunks == nil {
 		// Memory-only fallback. An empty dir performs no disk setup, so
@@ -282,7 +317,7 @@ func NewHub(token []byte, chunks *ChunkStore, mailboxes ...*Mailbox) *Hub {
 	// hub.Close stops the sweeper.
 	h.mailbox.Start()
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(hubSweepInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -292,7 +327,7 @@ func NewHub(token []byte, chunks *ChunkStore, mailboxes ...*Mailbox) *Hub {
 				for id, session := range h.pipes {
 					// Evict on idleness, never on age. A large file on a slow
 					// link must not be killed just because it takes a while.
-					if now.Sub(session.pipe.LastActivity()) > 5*time.Minute {
+					if now.Sub(session.pipe.LastActivity()) > pipeIdleTimeout {
 						_ = session.pipe.CloseWithError(fmt.Errorf("pipe session idle timeout"))
 						delete(h.pipes, id)
 						log.Printf("[PIPE] Evicted idle pipe session %s", id)
@@ -490,9 +525,10 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Signaling messages are small (offers, accepts, text, clipboard). Chunk
-	// bodies travel over HTTP, so a 1 MiB frame cap is generous and prevents a
-	// token holder from forcing the relay to buffer arbitrary payloads.
-	conn.SetReadLimit(1 << 20)
+	// bodies travel over HTTP, so the frame cap in wsMaxMessageBytes is
+	// generous and prevents a token holder from forcing the relay to buffer
+	// arbitrary payloads.
+	conn.SetReadLimit(wsMaxMessageBytes)
 
 	peer := &Peer{
 		ID:           deviceID,
@@ -585,28 +621,14 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 			if targetID == "" {
 				continue
 			}
-			// The sender's map is untrusted input: a buggy or malicious
-			// client could stuff from_id/from_name into a sealed envelope and
-			// leak identity despite the sealed-sender design. Strip them
-			// server-side; the relay only ever adds relay_ts.
-			delete(envelope, "from_id")
-			delete(envelope, "from_name")
-			envelope["relay_ts"] = time.Now().UnixMilli()
-			forwardBytes, _ := json.Marshal(envelope)
-			h.mu.RLock()
-			targetPeer, exists := h.peers[targetID]
-			h.mu.RUnlock()
-			if exists && targetPeer != nil {
-				if err := targetPeer.writeMessage(websocket.TextMessage, forwardBytes); err != nil {
-					// The peer looked present but the write failed: the
-					// device died mid-join or stopped reading. Re-queue
-					// the envelope instead of dropping it. Put enforces
-					// the byte cap and TTL, and the re-queued bytes keep
-					// their original relay_ts, so receiver-side
-					// freshness still applies.
-					h.mailbox.Put(targetID, forwardBytes)
-				}
-			} else {
+			forwardBytes, delivered := h.forwardToTarget(targetID, envelope, "", "", false)
+			if !delivered {
+				// The target was offline, or it looked present but the
+				// write failed: the device died mid-join or stopped
+				// reading. Re-queue the envelope instead of dropping it.
+				// Put enforces the byte cap and TTL, and the re-queued
+				// bytes keep their original relay_ts, so receiver-side
+				// freshness still applies.
 				h.mailbox.Put(targetID, forwardBytes)
 			}
 			continue
@@ -618,21 +640,47 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Ensure sender info is accurate
-		envelope["from_id"] = deviceID
-		envelope["from_name"] = deviceName
-
-		h.mu.RLock()
-		targetPeer, exists := h.peers[targetID]
-		h.mu.RUnlock()
-
-		if exists && targetPeer != nil {
-			// Server receive time gives receivers a common ordering clock for
-			// last-write-wins clipboard updates, independent of device clocks.
-			envelope["relay_ts"] = time.Now().UnixMilli()
-			forwardBytes, _ := json.Marshal(envelope)
-			_ = targetPeer.writeMessage(websocket.TextMessage, forwardBytes)
-		}
+		h.forwardToTarget(targetID, envelope, deviceID, deviceName, true)
 	}
+}
+
+// forwardToTarget routes one envelope from a connected sender to its
+// target peer. Both forwarding paths in handleWS funnel through here;
+// they differ only in identity handling, which injectIdentity selects:
+//
+//   - false (sealed envelopes): the sender's map is untrusted input, so
+//     any from_id/from_name a buggy or hostile client stuffed alongside
+//     the opaque payload are stripped server-side; the relay only ever
+//     adds relay_ts. senderID and senderName are ignored.
+//   - true (legacy messages): the relay stamps the sender's from_id and
+//     from_name so receivers always see accurate sender info.
+//
+// relay_ts is always attached: the server receive time gives receivers a
+// common ordering clock for last-write-wins clipboard updates,
+// independent of device clocks. The marshaled envelope bytes are
+// returned alongside the delivery verdict so the sealed path can
+// re-queue the exact bytes it tried to deliver; a false verdict means
+// the target was offline or the write failed.
+func (h *Hub) forwardToTarget(targetID string, envelope map[string]interface{}, senderID, senderName string, injectIdentity bool) (forwardBytes []byte, delivered bool) {
+	if injectIdentity {
+		envelope["from_id"] = senderID
+		envelope["from_name"] = senderName
+	} else {
+		delete(envelope, "from_id")
+		delete(envelope, "from_name")
+	}
+	envelope["relay_ts"] = time.Now().UnixMilli()
+	forwardBytes, _ = json.Marshal(envelope)
+	h.mu.RLock()
+	targetPeer, exists := h.peers[targetID]
+	h.mu.RUnlock()
+	if exists && targetPeer != nil {
+		if err := targetPeer.writeMessage(websocket.TextMessage, forwardBytes); err != nil {
+			return forwardBytes, false
+		}
+		return forwardBytes, true
+	}
+	return forwardBytes, false
 }
 
 func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
@@ -689,7 +737,7 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			_ = session.pipe.CloseWithError(r.Context().Err())
 			return
-		case <-time.After(60 * time.Second):
+		case <-time.After(pipeRendezvousTimeout):
 			http.Error(w, "Sender connection timeout", http.StatusGatewayTimeout)
 			_ = session.pipe.CloseWithError(fmt.Errorf("sender timed out"))
 			return
@@ -704,8 +752,8 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		fw := &flushWriter{w: w, flusher: flusher, interval: 100 * time.Millisecond}
-		buf := make([]byte, 256*1024)
+		fw := &flushWriter{w: w, flusher: flusher, interval: pipeFlushInterval}
+		buf := make([]byte, pipeCopyBufferSize)
 		_, err := io.CopyBuffer(fw, session.pipe, buf)
 		if isFlusher {
 			flusher.Flush()
@@ -729,13 +777,13 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			_ = session.pipe.CloseWithError(r.Context().Err())
 			return
-		case <-time.After(60 * time.Second):
+		case <-time.After(pipeRendezvousTimeout):
 			http.Error(w, "Receiver connection timeout", http.StatusGatewayTimeout)
 			_ = session.pipe.CloseWithError(fmt.Errorf("receiver timed out"))
 			return
 		}
 
-		buf := make([]byte, 256*1024)
+		buf := make([]byte, pipeCopyBufferSize)
 		_, err := io.CopyBuffer(session.pipe, r.Body, buf)
 		_ = session.pipe.Close()
 
@@ -749,7 +797,7 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-session.done:
 		case <-r.Context().Done():
-		case <-time.After(60 * time.Second):
+		case <-time.After(pipeDrainTimeout):
 		}
 
 		w.WriteHeader(http.StatusOK)
@@ -1062,12 +1110,10 @@ func isLoopbackBind(addr string, ifaces []net.Interface) (bool, error) {
 	return false, nil
 }
 
-// newRelayMux builds the relay's full HTTP surface. Extracted from main
-// so tests boot the identical routing table.
-func newRelayMux(h *Hub) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", h.handleWS)
-	mux.HandleFunc("/pipe", h.handlePipe)
+// registerChunkRoutes wires the chunk and transfer endpoints onto mux.
+// Extracted from newRelayMux so the HTTP-layer tests boot the identical
+// routing table instead of a copy that can drift from the real one.
+func registerChunkRoutes(mux *http.ServeMux, h *Hub) {
 	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPut:
@@ -1080,6 +1126,15 @@ func newRelayMux(h *Hub) *http.ServeMux {
 	})
 	mux.HandleFunc("/chunk/status", h.handleChunkStatus)
 	mux.HandleFunc("/transfer", h.handleTransferDelete)
+}
+
+// newRelayMux builds the relay's full HTTP surface. Extracted from main
+// so tests boot the identical routing table.
+func newRelayMux(h *Hub) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", h.handleWS)
+	mux.HandleFunc("/pipe", h.handlePipe)
+	registerChunkRoutes(mux, h)
 	mux.HandleFunc("/health", h.handleHealth)
 	return mux
 }

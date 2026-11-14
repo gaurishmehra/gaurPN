@@ -432,18 +432,7 @@ func TestChunkHTTPEndpoints(t *testing.T) {
 	defer hub.Close()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/chunk", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPut:
-			hub.handleChunkPut(w, r)
-		case http.MethodGet, http.MethodHead:
-			hub.handleChunkGet(w, r)
-		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		}
-	})
-	mux.HandleFunc("/chunk/status", hub.handleChunkStatus)
-	mux.HandleFunc("/transfer", hub.handleTransferDelete)
+	registerChunkRoutes(mux, hub)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
