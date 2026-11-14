@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,7 +21,9 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,12 +31,20 @@ import (
 )
 
 type Config struct {
-	RelayAddr string
-	TokenFile string
-	DeviceID  string
-	Name      string
-	InboxDir  string
-	PeersFile string
+	RelayAddr       string
+	TokenFile       string
+	DeviceID        string
+	SenderID        string
+	Name            string
+	InboxDir        string
+	PeersFile       string
+	Clipboard       bool
+	ClipboardSource string
+	ClipboardSocket string
+	LogFile         string
+	AutoOpen        bool
+	OnlyTrusted     bool
+	Notifications   bool
 }
 
 func defaultInboxDir() string {
@@ -65,11 +79,63 @@ func defaultPeersFile() string {
 	return filepath.Join(cache, "gaur-share", "peers.json")
 }
 
+func defaultClipboardSocket() string {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return filepath.Join(os.TempDir(), "gaur-share-clipboard.sock")
+	}
+	return filepath.Join(cache, "gaur-share", "clipboard.sock")
+}
+
 type peerFileEntry struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
 	Status string `json:"status"`
 	IsSelf bool   `json:"is_self"`
+}
+
+// wsClient serializes writes. Gorilla WebSocket permits one concurrent writer;
+// the daemon writes from the ping loop, transfer handler, and clipboard poller.
+type wsClient struct {
+	conn *websocket.Conn
+	mu   sync.Mutex
+}
+
+func (c *wsClient) WriteJSON(v interface{}) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteJSON(v)
+}
+
+func (c *wsClient) WriteMessage(messageType int, data []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteMessage(messageType, data)
+}
+
+func (c *wsClient) ReadMessage() (int, []byte, error) {
+	return c.conn.ReadMessage()
+}
+
+func (c *wsClient) Close() error {
+	return c.conn.Close()
+}
+
+type peerStore struct {
+	mu    sync.RWMutex
+	peers []peerFileEntry
+}
+
+func (s *peerStore) set(peers []peerFileEntry) {
+	s.mu.Lock()
+	s.peers = append([]peerFileEntry(nil), peers...)
+	s.mu.Unlock()
+}
+
+func (s *peerStore) snapshot() []peerFileEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]peerFileEntry(nil), s.peers...)
 }
 
 // writePeersFile publishes the current peer list for desktop shells to watch.
@@ -105,7 +171,7 @@ func loadSettingsFromConfig() (string, string) {
 	path := defaultConfigFile()
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "Lilac", "127.0.0.1:9876"
+		return "Lilac", "198.51.100.1:9876"
 	}
 	var conf struct {
 		DeviceName   string `json:"device_name"`
@@ -114,7 +180,7 @@ func loadSettingsFromConfig() (string, string) {
 		RelayAddress string `json:"relay_address"`
 	}
 	name := "Lilac"
-	relay := "127.0.0.1:9876"
+	relay := "198.51.100.1:9876"
 	if err := json.Unmarshal(data, &conf); err == nil {
 		if strings.TrimSpace(conf.DeviceName) != "" {
 			name = strings.TrimSpace(conf.DeviceName)
@@ -174,11 +240,41 @@ func generateDeviceID() string {
 func notifyUser(title, message string) {
 	switch runtime.GOOS {
 	case "linux":
-		_ = exec.Command("notify-send", title, message).Run()
+		_ = exec.Command("notify-send", "-a", "gaurPN", title, message).Run()
 	case "darwin":
 		script := fmt.Sprintf(`display notification "%s" with title "%s"`, message, title)
 		_ = exec.Command("osascript", "-e", script).Run()
 	}
+}
+
+// openCommand builds the platform-specific command that opens a file with its
+// default application. The context bounds the launcher so a hung opener
+// cannot linger; it does not affect the already-completed transfer.
+func openCommand(ctx context.Context, path string) *exec.Cmd {
+	switch runtime.GOOS {
+	case "darwin":
+		return exec.CommandContext(ctx, "open", path)
+	case "windows":
+		return exec.CommandContext(ctx, "cmd", "/c", "start", "", path)
+	default:
+		return exec.CommandContext(ctx, "xdg-open", path)
+	}
+}
+
+// openFile launches the platform file opener without blocking the caller.
+// Failures are logged and never affect the completed transfer.
+func openFile(path string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	cmd := openCommand(ctx, path)
+	go func() {
+		defer cancel()
+		if err := cmd.Start(); err != nil {
+			log.Printf("[RECV] Failed to open '%s': %v", path, err)
+			return
+		}
+		// Reap the launcher so it does not linger as a zombie.
+		_ = cmd.Wait()
+	}()
 }
 
 func connectWS(cfg Config, token string) (*websocket.Conn, error) {
@@ -197,6 +293,10 @@ func connectWS(cfg Config, token string) (*websocket.Conn, error) {
 	return conn, err
 }
 
+type transferRun struct {
+	cancel context.CancelFunc
+}
+
 func runDaemon(cfg Config) {
 	token, err := loadToken(cfg.TokenFile)
 	if err != nil {
@@ -204,11 +304,24 @@ func runDaemon(cfg Config) {
 	}
 	relayToken, peerCryptoKey := DeriveSubKeys(token)
 
+	sender := &CommandSender{cfg: cfg}
+	mpris, mprisErr := NewMprisManager(sender.Send)
+	if mprisErr != nil {
+		log.Printf("[MPRIS] Disabled: %v", mprisErr)
+	}
+	broadcaster := &MediaBroadcaster{cfg: cfg}
+	localMedia, localErr := NewLocalMediaWatcher(cfg, broadcaster)
+	if localErr != nil {
+		log.Printf("[MPRIS] Local watcher disabled: %v", localErr)
+	}
+
 	_ = os.MkdirAll(cfg.InboxDir, 0o755)
 	log.Printf("[DAEMON] Starting gaur-share daemon as '%s' (ID: %s)", cfg.Name, cfg.DeviceID)
 	log.Printf("[DAEMON] Incoming files will be saved to: %s", cfg.InboxDir)
 	writePeersFile(cfg, nil)
 
+	store := &peerStore{}
+	activeTransfers := &sync.Map{}
 	for {
 		conn, err := connectWS(cfg, relayToken)
 		if err != nil {
@@ -217,6 +330,9 @@ func runDaemon(cfg Config) {
 			time.Sleep(5 * time.Second)
 			continue
 		}
+		client := &wsClient{conn: conn}
+		sender.Set(client, peerCryptoKey)
+		broadcaster.Set(client, peerCryptoKey)
 
 		log.Printf("[DAEMON] Connected to in-tunnel relay at %s. Standing by for incoming transfers...", cfg.RelayAddr)
 
@@ -228,7 +344,7 @@ func runDaemon(cfg Config) {
 			for {
 				select {
 				case <-ticker.C:
-					if err := conn.WriteJSON(map[string]string{"type": "ping"}); err != nil {
+					if err := client.WriteJSON(map[string]string{"type": "ping"}); err != nil {
 						return
 					}
 				case <-stopPing:
@@ -237,14 +353,33 @@ func runDaemon(cfg Config) {
 			}
 		}()
 
+		// Clipboard sync lives for the duration of this relay connection.
+		clipCtx, clipCancel := context.WithCancel(context.Background())
+		if cfg.Clipboard {
+			switch cfg.ClipboardSource {
+			case "socket":
+				go runClipboardSocketServer(clipCtx, cfg, client, peerCryptoKey, store)
+			case "poll":
+				go runClipboardSync(clipCtx, cfg, client, peerCryptoKey, store)
+			case "off":
+				// Explicitly disabled.
+			default:
+				log.Printf("[CLIP] Unknown clipboard source %q; clipboard sync disabled", cfg.ClipboardSource)
+			}
+		}
+
 		// Message loop
 		for {
-			_, msgBytes, err := conn.ReadMessage()
+			_, msgBytes, err := client.ReadMessage()
 			if err != nil {
 				close(stopPing)
+				clipCancel()
+				sender.Set(nil, nil)
+				broadcaster.Set(nil, nil)
+				store.set(nil)
 				writePeersFile(cfg, nil)
 				log.Printf("[DAEMON] Relay connection interrupted: %v. Reconnecting...", err)
-				_ = conn.Close()
+				_ = client.Close()
 				break
 			}
 
@@ -269,9 +404,40 @@ func runDaemon(cfg Config) {
 						IsSelf: id == cfg.DeviceID || strings.EqualFold(name, cfg.Name),
 					})
 				}
+				store.set(entries)
 				writePeersFile(cfg, entries)
+				broadcaster.SetPeers(peerIDs(entries))
+				if localMedia != nil {
+					localMedia.ForceRefresh()
+				}
 			case "transfer_offer":
-				go handleIncomingTransfer(cfg, relayToken, peerCryptoKey, conn, envelope)
+				txID, _ := envelope["transfer_id"].(string)
+				if txID == "" {
+					continue
+				}
+				if old, ok := activeTransfers.Load(txID); ok {
+					old.(*transferRun).cancel()
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				run := &transferRun{cancel: cancel}
+				activeTransfers.Store(txID, run)
+				go func() {
+					defer func() {
+						if cur, ok := activeTransfers.Load(txID); ok && cur.(*transferRun) == run {
+							activeTransfers.Delete(txID)
+						}
+						cancel()
+					}()
+					handleIncomingTransfer(ctx, cfg, relayToken, peerCryptoKey, client, envelope)
+				}()
+			case "clipboard_update":
+				go handleIncomingClipboard(cfg, peerCryptoKey, envelope)
+			case "text_message":
+				go handleIncomingText(cfg, peerCryptoKey, envelope)
+			case "notification_event":
+				go handleIncomingNotification(cfg, peerCryptoKey, client, envelope)
+			case "sealed":
+				go handleIncomingSealed(cfg, relayToken, peerCryptoKey, client, mpris, localMedia, envelope)
 			}
 		}
 
@@ -279,7 +445,389 @@ func runDaemon(cfg Config) {
 	}
 }
 
-func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte, wsConn *websocket.Conn, offer map[string]interface{}) {
+// runClipboardSync is the legacy polling source. It is only used when the
+// daemon is started with -clipboard-source=poll. Quickshell uses the socket
+// source so the desktop never wakes up just to check the clipboard.
+func runClipboardSync(ctx context.Context, cfg Config, client *wsClient, peerCryptoKey []byte, store *peerStore) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	warned := false
+
+	// Do not blast whatever happened to be on the clipboard before the daemon
+	// started. Only new copy events after startup are broadcast. On a reconnect
+	// the hash is already set, so a clip copied while offline is still sent.
+	clipboardStateMu.Lock()
+	firstRun := !clipboardInitialized
+	clipboardInitialized = true
+	clipboardStateMu.Unlock()
+	if firstRun {
+		if payload, err := readClipboard(); err == nil && payload.Hash != "" {
+			clipboardStateMu.Lock()
+			clipboardLastHash = payload.Hash
+			clipboardStateMu.Unlock()
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			payload, err := readClipboard()
+			if err != nil {
+				if !warned {
+					log.Printf("[CLIP] Clipboard read unavailable: %v (install wl-clipboard/xclip on Linux)", err)
+					warned = true
+				}
+				continue
+			}
+			warned = false
+			if payload.Hash == "" {
+				continue
+			}
+			sendClipboardPayload(cfg, client, peerCryptoKey, store, payload)
+		}
+	}
+}
+
+// sendClipboardPayload encrypts one clipboard item and fans it out to every
+// other peer. It is shared by the polling source and the Quickshell socket.
+func sendClipboardPayload(cfg Config, client *wsClient, peerCryptoKey []byte, store *peerStore, payload ClipboardPayload) bool {
+	if payload.Hash == "" {
+		payload.Hash = clipboardHash(payload.Kind, payload.Mime, payload.Data)
+	}
+
+	clipboardStateMu.Lock()
+	same := payload.Hash == clipboardLastHash
+	suppressed := time.Now().UnixMilli() < clipboardSuppressUntil && payload.Kind == clipboardSuppressKind
+	clipboardStateMu.Unlock()
+	if same || suppressed {
+		if suppressed && payload.Kind == "image" {
+			log.Printf("[CLIP] Suppressed image echo after applying a remote clip")
+		}
+		return false
+	}
+
+	peers := store.snapshot()
+	if len(peers) == 0 {
+		return false
+	}
+
+	clipboardKey := DeriveClipboardKey(peerCryptoKey)
+	msgID := fmt.Sprintf("clip-%d", time.Now().UnixNano())
+	ts := time.Now().UnixMilli()
+	nonce, err := RandomBytes(12)
+	if err != nil {
+		return false
+	}
+	aad := []byte(fmt.Sprintf("clipboard:%s:%s:%d:%s:%s", cfg.DeviceID, msgID, ts, payload.Kind, payload.Mime))
+	ciphertext, err := EncryptClipboard(clipboardKey, nonce, payload.Data, aad)
+	if err != nil {
+		log.Printf("[CLIP] Encrypt failed: %v", err)
+		return false
+	}
+
+	sent := 0
+	for _, peer := range peers {
+		if peer.IsSelf {
+			continue
+		}
+		msg := map[string]interface{}{
+			"type":      "clipboard_update",
+			"target_id": peer.ID,
+			"msg_id":    msgID,
+			"ts":        ts,
+			"kind":      payload.Kind,
+			"mime":      payload.Mime,
+			"nonce":     base64.StdEncoding.EncodeToString(nonce),
+			"data":      base64.StdEncoding.EncodeToString(ciphertext),
+		}
+		if err := client.WriteJSON(msg); err != nil {
+			log.Printf("[CLIP] Send failed: %v", err)
+			break
+		}
+		sent++
+	}
+	if sent == 0 {
+		return false
+	}
+
+	clipboardStateMu.Lock()
+	clipboardLastHash = payload.Hash
+	clipboardStateMu.Unlock()
+	log.Printf("[CLIP] Sent %s clipboard (%d bytes) to %d peer(s)", payload.Kind, len(payload.Data), sent)
+	return true
+}
+
+type clipboardSocketMessage struct {
+	Kind string `json:"kind"`
+	Mime string `json:"mime"`
+	Data string `json:"data"`
+}
+
+// runClipboardSocketServer listens on a Unix socket for Quickshell clipboard
+// events. Quickshell watches cliphist's BoltDB with inotify and sends one JSON
+// line per new clip, so the daemon does not poll the clipboard at all.
+func runClipboardSocketServer(ctx context.Context, cfg Config, client *wsClient, peerCryptoKey []byte, store *peerStore) {
+	path := cfg.ClipboardSocket
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		log.Printf("[CLIP] Cannot create socket directory: %v", err)
+		return
+	}
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		log.Printf("[CLIP] Cannot listen on %s: %v", path, err)
+		return
+	}
+	defer ln.Close()
+	defer os.Remove(path)
+	_ = os.Chmod(path, 0o600)
+
+	var connMu sync.Mutex
+	conns := make(map[net.Conn]struct{})
+	closeAll := func() {
+		connMu.Lock()
+		for conn := range conns {
+			_ = conn.Close()
+		}
+		conns = make(map[net.Conn]struct{})
+		connMu.Unlock()
+	}
+	go func() {
+		<-ctx.Done()
+		_ = ln.Close()
+		closeAll()
+	}()
+
+	log.Printf("[CLIP] Listening for Quickshell clipboard events on %s", path)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			closeAll()
+			return
+		}
+		connMu.Lock()
+		conns[conn] = struct{}{}
+		connMu.Unlock()
+		go func() {
+			defer func() {
+				connMu.Lock()
+				delete(conns, conn)
+				connMu.Unlock()
+				_ = conn.Close()
+			}()
+			handleClipboardSocketConn(ctx, conn, cfg, client, peerCryptoKey, store)
+		}()
+	}
+}
+
+func handleClipboardSocketConn(ctx context.Context, conn net.Conn, cfg Config, client *wsClient, peerCryptoKey []byte, store *peerStore) {
+	scanner := bufio.NewScanner(conn)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	for scanner.Scan() {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		var msg clipboardSocketMessage
+		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
+			continue
+		}
+		if msg.Kind != "text" && msg.Kind != "image" {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(msg.Data)
+		if err != nil {
+			continue
+		}
+		if msg.Kind == "text" && len(data) > 1024*1024 {
+			log.Printf("[CLIP] Rejecting oversized text from Quickshell (%d bytes)", len(data))
+			continue
+		}
+		if msg.Kind == "image" && len(data) > maxClipboardImageBytes {
+			log.Printf("[CLIP] Rejecting oversized image from Quickshell (%d bytes)", len(data))
+			continue
+		}
+		payload := ClipboardPayload{
+			Kind: msg.Kind,
+			Mime: msg.Mime,
+			Data: data,
+			Hash: clipboardHash(msg.Kind, msg.Mime, data),
+		}
+		sendClipboardPayload(cfg, client, peerCryptoKey, store, payload)
+	}
+}
+
+func handleIncomingClipboard(cfg Config, peerCryptoKey []byte, envelope map[string]interface{}) {
+	clipboardApplyMu.Lock()
+	defer clipboardApplyMu.Unlock()
+
+	fromID, _ := envelope["from_id"].(string)
+	if fromID == "" || fromID == cfg.DeviceID {
+		return
+	}
+	msgID, _ := envelope["msg_id"].(string)
+	tsFloat, _ := envelope["ts"].(float64)
+	ts := int64(tsFloat)
+	relayTs := ts
+	if relayFloat, ok := envelope["relay_ts"].(float64); ok {
+		relayTs = int64(relayFloat)
+	}
+	kind, _ := envelope["kind"].(string)
+	mime, _ := envelope["mime"].(string)
+	nonceB64, _ := envelope["nonce"].(string)
+	dataB64, _ := envelope["data"].(string)
+	if msgID == "" || ts <= 0 || (kind != "text" && kind != "image") || nonceB64 == "" || dataB64 == "" {
+		log.Printf("[CLIP] Dropped malformed clipboard from %s (kind=%q msg=%q)", fromID, kind, msgID)
+		return
+	}
+	log.Printf("[CLIP] Received %s clipboard from %s (relayTs=%d, b64=%d)", kind, fromID, relayTs, len(dataB64))
+
+	clipboardStateMu.Lock()
+	if relayTs <= clipboardLastTs {
+		log.Printf("[CLIP] Dropped stale clipboard from %s (relayTs=%d last=%d)", fromID, relayTs, clipboardLastTs)
+		clipboardStateMu.Unlock()
+		return
+	}
+	clipboardStateMu.Unlock()
+
+	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
+	if err != nil {
+		return
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(dataB64)
+	if err != nil {
+		return
+	}
+	aad := []byte(fmt.Sprintf("clipboard:%s:%s:%d:%s:%s", fromID, msgID, ts, kind, mime))
+	plaintext, err := DecryptClipboard(DeriveClipboardKey(peerCryptoKey), nonce, ciphertext, aad)
+	if err != nil {
+		log.Printf("[CLIP] Authentication failed for clipboard from %s", fromID)
+		return
+	}
+	if kind == "text" && len(plaintext) > 1024*1024 {
+		log.Printf("[CLIP] Rejecting oversized text clipboard from %s (%d bytes)", fromID, len(plaintext))
+		return
+	}
+	if kind == "image" && len(plaintext) > maxClipboardImageBytes {
+		log.Printf("[CLIP] Rejecting oversized image clipboard from %s (%d bytes)", fromID, len(plaintext))
+		return
+	}
+
+	payload := ClipboardPayload{
+		Kind: kind,
+		Mime: mime,
+		Data: plaintext,
+		Hash: clipboardHash(kind, mime, plaintext),
+	}
+	clipboardStateMu.Lock()
+	clipboardLastHash = payload.Hash
+	clipboardLastTs = relayTs
+	// cliphist re-encodes images, so the decoded hash will not match the
+	// received hash. Suppress the echo by kind long enough for cliphist to
+	// record the write and Quickshell to send it back.
+	suppressMs := int64(2000)
+	if kind == "image" {
+		suppressMs = 8000
+	}
+	clipboardSuppressUntil = time.Now().Add(time.Duration(suppressMs) * time.Millisecond).UnixMilli()
+	clipboardSuppressKind = kind
+	clipboardStateMu.Unlock()
+
+	if err := writeClipboard(payload); err != nil {
+		log.Printf("[CLIP] Could not apply clipboard from %s: %v", fromID, err)
+		return
+	}
+	log.Printf("[CLIP] Applied %s clipboard from %s (%d bytes)", kind, fromID, len(plaintext))
+}
+
+// handleIncomingText decrypts a one-shot text/link share, copies it to the
+// desktop clipboard, and raises a notification. It is intentionally not
+// persisted: the relay never stores text, and the daemon keeps no history.
+func handleIncomingText(cfg Config, peerCryptoKey []byte, envelope map[string]interface{}) {
+	if v, ok := envelope["v"].(float64); ok && int(v) > 1 {
+		return
+	}
+	senderIdentity := offerSenderID(envelope)
+	if onlyTrustedEnabled(cfg) && senderIdentity != cfg.DeviceID &&
+		!isTrustedDevice(senderIdentity) {
+		log.Printf("[TEXT] Dropped text from untrusted %s", senderIdentity)
+		return
+	}
+	fromID, _ := envelope["from_id"].(string)
+	if fromID == "" || fromID == cfg.DeviceID {
+		return
+	}
+	fromName, _ := envelope["from_name"].(string)
+	if fromName == "" {
+		fromName = fromID
+	}
+	msgID, _ := envelope["msg_id"].(string)
+	tsFloat, _ := envelope["ts"].(float64)
+	ts := int64(tsFloat)
+	kind, _ := envelope["kind"].(string)
+	nonceB64, _ := envelope["nonce"].(string)
+	dataB64, _ := envelope["data"].(string)
+	if msgID == "" || ts <= 0 || (kind != "text" && kind != "url") || nonceB64 == "" || dataB64 == "" {
+		log.Printf("[TEXT] Dropped malformed text message from %s", fromID)
+		return
+	}
+
+	nonce, err := base64.StdEncoding.DecodeString(nonceB64)
+	if err != nil {
+		return
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(dataB64)
+	if err != nil {
+		return
+	}
+	aad := []byte(fmt.Sprintf("text:%s:%s:%d:%s", fromID, msgID, ts, kind))
+	plaintext, err := DecryptClipboard(DeriveTextKey(peerCryptoKey), nonce, ciphertext, aad)
+	if err != nil {
+		log.Printf("[TEXT] Authentication failed for text message from %s", fromID)
+		return
+	}
+	if len(plaintext) > 64*1024 {
+		log.Printf("[TEXT] Rejecting oversized text message from %s (%d bytes)", fromID, len(plaintext))
+		return
+	}
+
+	text := string(plaintext)
+	// Writing the clipboard makes Quickshell's cliphist watcher fire. Mark the
+	// payload as already-applied so the daemon does not echo it back to the
+	// cluster as a clipboard update.
+	clipboardStateMu.Lock()
+	clipboardLastHash = clipboardHash("text", "text/plain", plaintext)
+	clipboardLastTs = time.Now().UnixMilli()
+	clipboardSuppressUntil = time.Now().Add(2 * time.Second).UnixMilli()
+	clipboardSuppressKind = "text"
+	clipboardStateMu.Unlock()
+	if err := writeClipboard(ClipboardPayload{Kind: "text", Mime: "text/plain", Data: plaintext}); err != nil {
+		log.Printf("[TEXT] Could not apply text from %s to clipboard: %v", fromID, err)
+	}
+	title := "Text from " + fromName
+	if kind == "url" {
+		title = "Link from " + fromName
+	}
+	notifyUser(title, text)
+	log.Printf("[TEXT] Received %s from %s (%d bytes)", kind, fromID, len(plaintext))
+}
+
+func handleIncomingTransfer(ctx context.Context, cfg Config, relayToken string, peerCryptoKey []byte, wsConn *wsClient, offer map[string]interface{}) {
+	version, _ := offer["v"].(float64)
+	if int(version) >= 2 {
+		handleIncomingTransferV2(ctx, cfg, relayToken, peerCryptoKey, wsConn, offer)
+		return
+	}
+	handleIncomingTransferV1(cfg, relayToken, peerCryptoKey, wsConn, offer)
+}
+
+func handleIncomingTransferV1(cfg Config, relayToken string, peerCryptoKey []byte, wsConn *wsClient, offer map[string]interface{}) {
 	transferID, _ := offer["transfer_id"].(string)
 	senderID, _ := offer["from_id"].(string)
 	senderName, _ := offer["from_name"].(string)
@@ -312,6 +860,21 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 			"reason":      "auth_failed",
 		})
 		return
+	}
+
+	if onlyTrustedEnabled(cfg) {
+		senderIdentity := offerSenderID(offer)
+		if senderIdentity != cfg.DeviceID && !isTrustedDevice(senderIdentity) {
+			_ = wsConn.WriteJSON(map[string]interface{}{
+				"type":        "transfer_reject",
+				"target_id":   senderID,
+				"transfer_id": transferID,
+				"reason":      "untrusted",
+			})
+			notifyUser("Transfer blocked", "Not from a trusted device")
+			log.Printf("[RECV] Blocked %s from untrusted %s", transferID, senderIdentity)
+			return
+		}
 	}
 
 	// Finding 1: Path Traversal Protection
@@ -495,6 +1058,229 @@ func handleIncomingTransfer(cfg Config, relayToken string, peerCryptoKey []byte,
 	}
 }
 
+// offerTagPayload builds the canonical v2 offer string covered by the offer
+// auth tag. The trailing open bit is "1" when the sender asked the receiver
+// to open the file on arrival, "0" otherwise. Senders and receivers must
+// construct the string identically or verification fails.
+func offerTagPayload(transferID, deviceID, senderPubB64, fileHash string, chunkCount, chunkSize int, openRequested bool) string {
+	openBit := "0"
+	if openRequested {
+		openBit = "1"
+	}
+	return fmt.Sprintf("offer:v2:%s:%s:%s:%s:%d:%d:%s",
+		transferID, deviceID, senderPubB64, fileHash, chunkCount, chunkSize, openBit)
+}
+
+func handleIncomingTransferV2(ctx context.Context, cfg Config, relayToken string, peerCryptoKey []byte, wsConn *wsClient, offer map[string]interface{}) {
+	transferID, _ := offer["transfer_id"].(string)
+	sessionID, _ := offer["session_id"].(string)
+	senderID, _ := offer["from_id"].(string)
+	senderName, _ := offer["from_name"].(string)
+	rawFileName, _ := offer["file_name"].(string)
+	fileHash, _ := offer["file_hash"].(string)
+	senderPubB64, _ := offer["pub_key"].(string)
+	offerTag, _ := offer["auth_tag"].(string)
+	chunkSizeFloat, _ := offer["chunk_size"].(float64)
+	chunkCountFloat, _ := offer["chunk_count"].(float64)
+	fileSizeFloat, _ := offer["file_size"].(float64)
+	chunkSize := int(chunkSizeFloat)
+	chunkCount := int(chunkCountFloat)
+	fileSize := int64(fileSizeFloat)
+	batchID, _ := offer["batch_id"].(string)
+	batchIndexFloat, _ := offer["batch_index"].(float64)
+	batchTotalFloat, _ := offer["batch_total"].(float64)
+	batchIndex := int(batchIndexFloat)
+	batchTotal := int(batchTotalFloat)
+	if batchTotal < 1 {
+		batchTotal = 1
+	}
+	openRequested, _ := offer["open"].(bool)
+	mimeType, _ := offer["mime_type"].(string)
+
+	if transferID == "" || sessionID == "" || rawFileName == "" || fileHash == "" || senderPubB64 == "" || senderID == "" {
+		return
+	}
+	validEmpty := fileSize == 0 && chunkCount == 0
+	validNonEmpty := fileSize > 0 && chunkCount > 0
+	if chunkSize <= 0 || chunkSize > MaxChunkSize || chunkCount > 65536 || (!validEmpty && !validNonEmpty) {
+		return
+	}
+	chunkHashes := parseStringArray(offer["chunk_hashes"])
+	if len(chunkHashes) != chunkCount {
+		log.Printf("[RECV] Rejecting %s: manifest has %d hashes for %d chunks", transferID, len(chunkHashes), chunkCount)
+		return
+	}
+
+	expectedOffer := offerTagPayload(transferID, cfg.DeviceID, senderPubB64, fileHash, chunkCount, chunkSize, openRequested)
+	if !VerifyAuthTag(peerCryptoKey, expectedOffer, offerTag) {
+		log.Printf("[RECV] Incoming offer auth tag invalid: %s", transferID)
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type": "transfer_reject", "target_id": senderID, "transfer_id": transferID, "reason": "auth_failed",
+		})
+		return
+	}
+
+	if onlyTrustedEnabled(cfg) {
+		senderIdentity := offerSenderID(offer)
+		if senderIdentity != cfg.DeviceID && !isTrustedDevice(senderIdentity) {
+			_ = wsConn.WriteJSON(map[string]interface{}{
+				"type": "transfer_reject", "target_id": senderID, "transfer_id": transferID, "reason": "untrusted",
+			})
+			notifyUser("Transfer blocked", "Not from a trusted device")
+			log.Printf("[RECV] Blocked %s from untrusted %s", transferID, senderIdentity)
+			return
+		}
+	}
+
+	cleanFileName := SanitizeFileName(rawFileName)
+	destPath := filepath.Join(cfg.InboxDir, cleanFileName)
+	if !IsPathInsideDirectory(destPath, cfg.InboxDir) {
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type": "transfer_reject", "target_id": senderID, "transfer_id": transferID, "reason": "invalid_path",
+		})
+		return
+	}
+
+	partPath := filepath.Join(cfg.InboxDir, fmt.Sprintf(".%s.%s.part", cleanFileName, transferID))
+	statePath := partPath + ".state"
+
+	state, err := LoadReceiveState(statePath, transferID, fileHash)
+	if err != nil {
+		state = NewReceiveState(transferID, fileHash, fileSize, chunkSize, chunkCount)
+		_ = os.Remove(partPath)
+		_ = os.Remove(statePath)
+		state.Save(statePath)
+	}
+	if _, statErr := os.Stat(partPath); statErr != nil {
+		state = NewReceiveState(transferID, fileHash, fileSize, chunkSize, chunkCount)
+		state.Save(statePath)
+	}
+
+	senderPubBytes, err := base64.StdEncoding.DecodeString(senderPubB64)
+	if err != nil {
+		return
+	}
+	keyPair, err := GenerateKeyPair()
+	if err != nil {
+		return
+	}
+	aesKey, err := DeriveSharedSecret(keyPair.Private, senderPubBytes)
+	if err != nil {
+		return
+	}
+
+	myPubB64 := base64.StdEncoding.EncodeToString(keyPair.Public)
+	have := state.Snapshot()
+	acceptTag := ComputeAuthTag(peerCryptoKey, fmt.Sprintf("accept:v2:%s:%s:%s:%s", transferID, senderID, myPubB64, HaveHash(have)))
+	if err := wsConn.WriteJSON(map[string]interface{}{
+		"type": "transfer_accept", "v": 2, "target_id": senderID,
+		"transfer_id": transferID, "pub_key": myPubB64, "auth_tag": acceptTag, "have": have,
+	}); err != nil {
+		return
+	}
+
+	safetyNumber := ComputeSafetyNumber(senderPubBytes, keyPair.Public, transferID)
+	log.Printf("[RECV] Transfer %s safety number: %s", transferID, safetyNumber)
+
+	if batchTotal > 1 {
+		log.Printf("[RECV] Incoming batch %s file %d/%d from %s (%s): %s (%d bytes)",
+			batchID, batchIndex+1, batchTotal, senderName, senderID, cleanFileName, fileSize)
+	} else {
+		log.Printf("[RECV] Incoming file from %s (%s): %s (%d bytes)", senderName, senderID, cleanFileName, fileSize)
+	}
+	notifyUser("Incoming File Transfer", fmt.Sprintf("%s is sending %s (%.1f MB)", senderName, cleanFileName, float64(fileSize)/(1024*1024)))
+
+	digest := &FileDigest{
+		FileHash:    fileHash,
+		ChunkHashes: chunkHashes,
+		ChunkCount:  chunkCount,
+		Size:        fileSize,
+	}
+	missing := state.Missing(chunkCount)
+	if len(missing) > 0 {
+		log.Printf("[RECV] Resuming %s: %d/%d chunks already present", transferID, chunkCount-len(missing), chunkCount)
+	}
+
+	startTime := time.Now()
+	lastPrint := time.Now()
+	err = downloadChunks(ctx, cfg, relayToken, transferID, sessionID, digest, aesKey, missing, partPath, state, statePath, func(done, total int64) {
+		if time.Since(lastPrint) < 250*time.Millisecond {
+			return
+		}
+		lastPrint = time.Now()
+		pct := 0.0
+		if total > 0 {
+			pct = float64(done) / float64(total) * 100
+		}
+		log.Printf("[RECV] %s: %.1f%% (%.1f/%.1f MB)", cleanFileName, pct, float64(done)/(1024*1024), float64(total)/(1024*1024))
+	})
+	if err != nil {
+		if ctx.Err() == context.Canceled {
+			log.Printf("[RECV] Transfer %s superseded by a newer attempt", transferID)
+			return
+		}
+		log.Printf("[RECV] Download failed for %s: %v", transferID, err)
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type": "transfer_error", "target_id": senderID, "transfer_id": transferID, "reason": err.Error(),
+		})
+		notifyUser("Transfer Failed", fmt.Sprintf("Failed receiving '%s' from %s", cleanFileName, senderName))
+		return
+	}
+	state.Save(statePath)
+
+	if fileSize == 0 {
+		if _, err := os.Stat(partPath); os.IsNotExist(err) {
+			if f, err := os.Create(partPath); err == nil {
+				_ = f.Close()
+			}
+		}
+	}
+	ok, err := VerifyFileHash(partPath, fileHash)
+	if err != nil || !ok {
+		log.Printf("[RECV] Integrity check failed for %s: %v", transferID, err)
+		_ = os.Remove(partPath)
+		_ = os.Remove(statePath)
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type": "transfer_error", "target_id": senderID, "transfer_id": transferID, "reason": "integrity_failed",
+		})
+		notifyUser("Transfer Failed", fmt.Sprintf("'%s' failed integrity verification", cleanFileName))
+		return
+	}
+
+	finalPath := ResolveUniqueFile(cfg.InboxDir, cleanFileName)
+	if err := os.Rename(partPath, finalPath); err != nil {
+		log.Printf("[RECV] Rename failed for %s: %v", transferID, err)
+		_ = wsConn.WriteJSON(map[string]interface{}{
+			"type": "transfer_error", "target_id": senderID, "transfer_id": transferID, "reason": "save_failed",
+		})
+		return
+	}
+	_ = os.Remove(statePath)
+
+	receipt := ComputeAuthTag(peerCryptoKey, fmt.Sprintf("complete:v2:%s:%s", transferID, fileHash))
+	_ = wsConn.WriteJSON(map[string]interface{}{
+		"type": "transfer_complete", "v": 2, "target_id": senderID,
+		"transfer_id": transferID, "file_hash": fileHash, "auth_tag": receipt,
+	})
+
+	if openRequested {
+		if cfg.AutoOpen {
+			log.Printf("[RECV] Opening '%s' (mime: %s) as requested by sender", filepath.Base(finalPath), mimeType)
+			openFile(finalPath)
+		} else {
+			log.Printf("[RECV] Sender requested open for '%s' but auto-open is disabled", filepath.Base(finalPath))
+		}
+	}
+
+	duration := time.Since(startTime).Seconds()
+	if duration <= 0 {
+		duration = 0.001
+	}
+	mbps := (float64(fileSize) / (1024 * 1024)) / duration
+	log.Printf("[RECV] SUCCESS: Saved '%s' (%.2f MB at %.1f MB/s)", filepath.Base(finalPath), float64(fileSize)/(1024*1024), mbps)
+	notifyUser("Transfer Complete", fmt.Sprintf("Saved '%s' (%.1f MB)", filepath.Base(finalPath), float64(fileSize)/(1024*1024)))
+}
+
 type JSONPeer struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
@@ -597,9 +1383,97 @@ type sendFileMeta struct {
 	Path string
 	Name string
 	Size int64
+	Open bool
 }
 
-func runSend(cfg Config, targetQuery string, filePaths []string) {
+// runSendText sends a one-shot text or link to a peer. The payload is
+// encrypted with a key domain-separated from file transfers and clipboard
+// sync; the relay only sees ciphertext and routing metadata.
+func runSendText(cfg Config, targetQuery, text string) {
+	// Do not reuse the daemon's device ID: the relay replaces an existing
+	// peer with the same ID, which would evict the receiver mid-session.
+	// Keep the stable identity in SenderID so the receiver can apply trust.
+	cfg.SenderID = cfg.DeviceID
+	cfg.DeviceID = fmt.Sprintf("send-%d", os.Getpid())
+
+	if text == "-" {
+		data, err := io.ReadAll(io.LimitReader(os.Stdin, 64*1024+1))
+		if err != nil {
+			log.Fatalf("[FATAL] Could not read text from stdin: %v", err)
+		}
+		text = string(data)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		log.Fatalf("[FATAL] Refusing to send empty text")
+	}
+	if len(text) > 64*1024 {
+		log.Fatalf("[FATAL] Text is too large (max 64 KiB)")
+	}
+
+	token, err := loadToken(cfg.TokenFile)
+	if err != nil {
+		log.Fatalf("[FATAL] %v", err)
+	}
+	relayToken, peerCryptoKey := DeriveSubKeys(token)
+
+	conn, err := connectWS(cfg, relayToken)
+	if err != nil {
+		log.Fatalf("[FATAL] Could not connect to relay: %v", err)
+	}
+	defer conn.Close()
+	client := &wsClient{conn: conn}
+
+	targetID, targetName := discoverTarget(conn, targetQuery)
+	if targetID == "" {
+		log.Fatalf("[FATAL] Target device '%s' is not currently online in the tunnel", targetQuery)
+	}
+
+	kind := "text"
+	if strings.HasPrefix(text, "http://") || strings.HasPrefix(text, "https://") {
+		kind = "url"
+	}
+	msgID, err := randomHex(16)
+	if err != nil {
+		log.Fatalf("[FATAL] %v", err)
+	}
+	msgID = "text-" + msgID
+	ts := time.Now().UnixMilli()
+	nonce, err := RandomBytes(12)
+	if err != nil {
+		log.Fatalf("[FATAL] %v", err)
+	}
+	aad := fmt.Sprintf("text:%s:%s:%d:%s", cfg.DeviceID, msgID, ts, kind)
+	ciphertext, err := EncryptClipboard(DeriveTextKey(peerCryptoKey), nonce, []byte(text), []byte(aad))
+	if err != nil {
+		log.Fatalf("[FATAL] Could not encrypt text: %v", err)
+	}
+
+	msg := map[string]interface{}{
+		"type":      "text_message",
+		"v":         1,
+		"target_id": targetID,
+		"sender_id": cfg.SenderID,
+		"msg_id":    msgID,
+		"ts":        ts,
+		"kind":      kind,
+		"nonce":     base64.StdEncoding.EncodeToString(nonce),
+		"data":      base64.StdEncoding.EncodeToString(ciphertext),
+	}
+	if err := client.WriteJSON(msg); err != nil {
+		log.Fatalf("[FATAL] Could not send text: %v", err)
+	}
+	fmt.Printf("Sent %s to %s (%s)\n", kind, targetName, targetID)
+}
+
+func runSend(cfg Config, targetQuery string, filePaths []string, openRequested bool) {
+	// A send must not reuse the daemon's device ID: the relay replaces an
+	// existing peer with the same ID, so the daemon's reconnect would evict
+	// the sender mid-transfer. Keep the stable ID in SenderID so receivers
+	// can pin trust to the machine rather than the connection.
+	cfg.SenderID = cfg.DeviceID
+	cfg.DeviceID = fmt.Sprintf("send-%d", os.Getpid())
+
 	if len(filePaths) == 0 {
 		log.Fatalf("[FATAL] No files specified")
 	}
@@ -611,9 +1485,32 @@ func runSend(cfg Config, targetQuery string, filePaths []string) {
 			log.Fatalf("[FATAL] Cannot open file %s: %v", path, err)
 		}
 		if info.IsDir() {
-			log.Fatalf("[FATAL] %s is a directory; only files are supported", path)
+			// Folder sends are a flat batch: every regular file is sent, and
+			// the receiver resolves duplicate base names. Relative paths are
+			// not preserved yet.
+			err := filepath.Walk(path, func(p string, fi os.FileInfo, walkErr error) error {
+				if walkErr != nil {
+					return walkErr
+				}
+				if fi.Mode().IsRegular() {
+					metas = append(metas, sendFileMeta{
+						Path: p,
+						Name: filepath.Base(p),
+						Size: fi.Size(),
+						Open: openRequested,
+					})
+				}
+				return nil
+			})
+			if err != nil {
+				log.Fatalf("[FATAL] Cannot read folder %s: %v", path, err)
+			}
+			continue
 		}
-		metas = append(metas, sendFileMeta{Path: path, Name: filepath.Base(path), Size: info.Size()})
+		metas = append(metas, sendFileMeta{Path: path, Name: filepath.Base(path), Size: info.Size(), Open: openRequested})
+	}
+	if len(metas) == 0 {
+		log.Fatalf("[FATAL] No files found to send")
 	}
 
 	token, err := loadToken(cfg.TokenFile)
@@ -691,9 +1588,14 @@ func discoverTarget(conn *websocket.Conn, targetQuery string) (string, string) {
 	}
 }
 
+type acceptResult struct {
+	PubKey []byte
+	Have   []int
+}
+
 // waitForAccept reads the signaling socket until the matching accept or reject
 // arrives, ignoring unrelated peer-list traffic.
-func waitForAccept(conn *websocket.Conn, transferID string, peerCryptoKey []byte, deviceID string) ([]byte, error) {
+func waitForAccept(conn *websocket.Conn, transferID string, peerCryptoKey []byte, deviceID string) (*acceptResult, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
 	for {
@@ -708,11 +1610,16 @@ func waitForAccept(conn *websocket.Conn, transferID string, peerCryptoKey []byte
 		if envelope["type"] == "transfer_accept" && envelope["transfer_id"] == transferID {
 			receiverPubB64, _ := envelope["pub_key"].(string)
 			acceptTag, _ := envelope["auth_tag"].(string)
-			expected := fmt.Sprintf("accept:%s:%s:%s", transferID, deviceID, receiverPubB64)
+			have := parseHave(envelope["have"])
+			expected := fmt.Sprintf("accept:v2:%s:%s:%s:%s", transferID, deviceID, receiverPubB64, HaveHash(have))
 			if !VerifyAuthTag(peerCryptoKey, expected, acceptTag) {
 				return nil, fmt.Errorf("accept auth tag verification failed")
 			}
-			return base64.StdEncoding.DecodeString(receiverPubB64)
+			pub, err := base64.StdEncoding.DecodeString(receiverPubB64)
+			if err != nil {
+				return nil, fmt.Errorf("invalid receiver public key: %w", err)
+			}
+			return &acceptResult{PubKey: pub, Have: have}, nil
 		}
 		if envelope["type"] == "transfer_reject" && envelope["transfer_id"] == transferID {
 			reason, _ := envelope["reason"].(string)
@@ -721,129 +1628,215 @@ func waitForAccept(conn *websocket.Conn, transferID string, peerCryptoKey []byte
 	}
 }
 
-func sendOne(cfg Config, conn *websocket.Conn, relayToken string, peerCryptoKey []byte, targetID, targetName string, meta sendFileMeta, batchID string, batchIndex, batchTotal int) error {
-	transferID := fmt.Sprintf("tx-%d", time.Now().UnixNano())
+func parseHave(raw interface{}) []int {
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]int, 0, len(arr))
+	for _, v := range arr {
+		switch n := v.(type) {
+		case float64:
+			if n >= 0 {
+				out = append(out, int(n))
+			}
+		case int:
+			if n >= 0 {
+				out = append(out, n)
+			}
+		}
+	}
+	sort.Ints(out)
+	return out
+}
 
+func parseStringArray(raw interface{}) []string {
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, v := range arr {
+		if s, ok := v.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func randomHex(n int) (string, error) {
+	b, err := RandomBytes(n)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func waitForComplete(conn *websocket.Conn, transferID string, peerCryptoKey []byte, deviceID string, digest *FileDigest) error {
+	timeout := time.Duration(digest.Size/(512*1024)+120) * time.Second
+	if timeout < 2*time.Minute {
+		timeout = 2 * time.Minute
+	}
+	if timeout > 2*time.Hour {
+		timeout = 2 * time.Hour
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	defer conn.SetReadDeadline(time.Time{})
+	for {
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			return fmt.Errorf("no completion receipt: %w", err)
+		}
+		var envelope map[string]interface{}
+		if json.Unmarshal(msgBytes, &envelope) != nil {
+			continue
+		}
+		if envelope["transfer_id"] != transferID {
+			continue
+		}
+		switch envelope["type"] {
+		case "transfer_complete":
+			fileHash, _ := envelope["file_hash"].(string)
+			tag, _ := envelope["auth_tag"].(string)
+			expected := fmt.Sprintf("complete:v2:%s:%s", transferID, fileHash)
+			if fileHash != digest.FileHash || !VerifyAuthTag(peerCryptoKey, expected, tag) {
+				return fmt.Errorf("completion receipt failed verification")
+			}
+			return nil
+		case "transfer_error":
+			reason, _ := envelope["reason"].(string)
+			return fmt.Errorf("receiver reported: %s", reason)
+		}
+	}
+}
+
+func sendOne(cfg Config, conn *websocket.Conn, relayToken string, peerCryptoKey []byte, targetID, targetName string, meta sendFileMeta, batchID string, batchIndex, batchTotal int) error {
+	digest, err := HashFileChunks(meta.Path, ChunkSize)
+	if err != nil {
+		return fmt.Errorf("hash file: %w", err)
+	}
+	if digest.Size != meta.Size {
+		return fmt.Errorf("file changed while hashing (expected %d bytes, read %d)", meta.Size, digest.Size)
+	}
+	transferID := DeriveTransferID(peerCryptoKey, digest.FileHash)
+
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if attempt > 1 {
+			fmt.Printf("Retrying %s (attempt %d/%d)...\n", meta.Name, attempt, maxAttempts)
+			time.Sleep(time.Duration(attempt-1) * time.Second)
+		}
+		sessionID, err := randomHex(16)
+		if err != nil {
+			return fmt.Errorf("session id: %w", err)
+		}
+		err = sendAttempt(cfg, conn, relayToken, peerCryptoKey, targetID, targetName, meta, digest, transferID, sessionID, batchID, batchIndex, batchTotal)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("[SEND] Attempt %d for %s failed: %v", attempt, meta.Name, err)
+	}
+	return fmt.Errorf("transfer failed after %d attempts: %w", maxAttempts, lastErr)
+}
+
+func sendAttempt(cfg Config, conn *websocket.Conn, relayToken string, peerCryptoKey []byte, targetID, targetName string, meta sendFileMeta, digest *FileDigest, transferID, sessionID, batchID string, batchIndex, batchTotal int) error {
 	keyPair, err := GenerateKeyPair()
 	if err != nil {
 		return fmt.Errorf("keypair generation failed: %w", err)
 	}
 	myPubB64 := base64.StdEncoding.EncodeToString(keyPair.Public)
-	offerTag := ComputeAuthTag(peerCryptoKey, fmt.Sprintf("offer:%s:%s:%s", transferID, targetID, myPubB64))
+	offerTag := ComputeAuthTag(peerCryptoKey, offerTagPayload(
+		transferID, targetID, myPubB64, digest.FileHash, digest.ChunkCount, ChunkSize, meta.Open))
 
+	senderID := cfg.SenderID
+	if senderID == "" {
+		senderID = cfg.DeviceID
+	}
 	offerMsg := map[string]interface{}{
-		"type":        "transfer_offer",
-		"target_id":   targetID,
-		"transfer_id": transferID,
-		"file_name":   meta.Name,
-		"file_size":   meta.Size,
-		"pub_key":     myPubB64,
-		"auth_tag":    offerTag,
-		"batch_id":    batchID,
-		"batch_index": batchIndex,
-		"batch_total": batchTotal,
+		"type":         "transfer_offer",
+		"v":            2,
+		"target_id":    targetID,
+		"sender_id":    senderID,
+		"transfer_id":  transferID,
+		"session_id":   sessionID,
+		"file_name":    meta.Name,
+		"file_size":    digest.Size,
+		"chunk_size":   ChunkSize,
+		"chunk_count":  digest.ChunkCount,
+		"file_hash":    digest.FileHash,
+		"chunk_hashes": digest.ChunkHashes,
+		"pub_key":      myPubB64,
+		"auth_tag":     offerTag,
+		"batch_id":     batchID,
+		"batch_index":  batchIndex,
+		"batch_total":  batchTotal,
+	}
+	if meta.Open {
+		offerMsg["open"] = true
+		offerMsg["mime_type"] = mime.TypeByExtension(filepath.Ext(meta.Path))
 	}
 	if err := conn.WriteJSON(offerMsg); err != nil {
 		return fmt.Errorf("send offer failed: %w", err)
 	}
 
-	receiverPubBytes, err := waitForAccept(conn, transferID, peerCryptoKey, cfg.DeviceID)
+	accept, err := waitForAccept(conn, transferID, peerCryptoKey, cfg.DeviceID)
 	if err != nil {
 		return err
 	}
-	aesKey, err := DeriveSharedSecret(keyPair.Private, receiverPubBytes)
+	aesKey, err := DeriveSharedSecret(keyPair.Private, accept.PubKey)
 	if err != nil {
 		return fmt.Errorf("key derivation failed: %w", err)
 	}
-	safetyNumber := ComputeSafetyNumber(keyPair.Public, receiverPubBytes, transferID)
+	safetyNumber := ComputeSafetyNumber(keyPair.Public, accept.PubKey, transferID)
 	fmt.Printf("Accepted by %s. Safety number: %s\n", targetName, safetyNumber)
 
-	pipeURL := fmt.Sprintf("http://%s/pipe?transfer_id=%s&role=sender&token=%s", cfg.RelayAddr, transferID, url.QueryEscape(relayToken))
-	pipeReader, pipeWriter := io.Pipe()
+	have := make(map[int]bool, len(accept.Have))
+	for _, idx := range accept.Have {
+		have[idx] = true
+	}
+	missing := make([]int, 0, digest.ChunkCount)
+	for i := 0; i < digest.ChunkCount; i++ {
+		if !have[i] {
+			missing = append(missing, i)
+		}
+	}
+	if len(missing) > 0 {
+		fmt.Printf("Uploading %d/%d chunks for %s...\n", len(missing), digest.ChunkCount, meta.Name)
+	}
 
-	uploadDone := make(chan error, 1)
-	req, _ := http.NewRequest("POST", pipeURL, pipeReader)
-	go func() {
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			uploadDone <- err
+	startTime := time.Now()
+	lastPrint := time.Now()
+	err = uploadChunks(cfg, relayToken, transferID, sessionID, digest, aesKey, missing, meta.Path, func(done, total int64) {
+		if time.Since(lastPrint) < 200*time.Millisecond {
 			return
 		}
-		if resp != nil {
-			_ = resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				uploadDone <- fmt.Errorf("relay returned HTTP %d", resp.StatusCode)
-				return
-			}
+		lastPrint = time.Now()
+		pct := 0.0
+		if total > 0 {
+			pct = float64(done) / float64(total) * 100
 		}
-		uploadDone <- nil
-	}()
-
-	inFile, err := os.Open(meta.Path)
+		speed := 0.0
+		if elapsed := time.Since(startTime).Seconds(); elapsed > 0 {
+			speed = (float64(done) / (1024 * 1024)) / elapsed
+		}
+		fmt.Printf("\rUploading %s: %.1f%% (%.1f/%.1f MB) %.1f MB/s",
+			meta.Name, pct, float64(done)/(1024*1024), float64(total)/(1024*1024), speed)
+	})
+	if len(missing) > 0 {
+		fmt.Println()
+	}
 	if err != nil {
-		return fmt.Errorf("cannot read input file: %w", err)
-	}
-	defer inFile.Close()
-
-	aead, err := NewAEAD(aesKey)
-	if err != nil {
-		return fmt.Errorf("aead init failed: %w", err)
-	}
-	bw := bufio.NewWriterSize(pipeWriter, 1<<20)
-	chunkBuf := make([]byte, 256*1024)
-	cipherBuf := make([]byte, 0, len(chunkBuf)+aead.Overhead())
-	nonce := make([]byte, 12)
-	var nonceCounter uint64
-	var sentBytes int64
-	startTime := time.Now()
-
-	for {
-		n, readErr := inFile.Read(chunkBuf)
-		if n > 0 {
-			binary.BigEndian.PutUint32(nonce[:4], 0)
-			binary.BigEndian.PutUint64(nonce[4:], nonceCounter)
-			nonceCounter++
-
-			cipherChunk := aead.Seal(cipherBuf[:0], nonce, chunkBuf[:n], nil)
-			var lenHeader [4]byte
-			binary.BigEndian.PutUint32(lenHeader[:], uint32(len(cipherChunk)))
-			if _, err := bw.Write(lenHeader[:]); err != nil {
-				return fmt.Errorf("stream write failed: %w", err)
-			}
-			if _, err := bw.Write(nonce); err != nil {
-				return fmt.Errorf("stream write failed: %w", err)
-			}
-			if _, err := bw.Write(cipherChunk); err != nil {
-				return fmt.Errorf("stream write failed: %w", err)
-			}
-
-			sentBytes += int64(n)
-			pct := float64(sentBytes) / float64(meta.Size) * 100.0
-			speed := (float64(sentBytes) / (1024 * 1024)) / time.Since(startTime).Seconds()
-			fmt.Printf("\rStreaming %s: %.1f%% (%.1f/%.1f MB) %.1f MB/s",
-				meta.Name, pct, float64(sentBytes)/(1024*1024), float64(meta.Size)/(1024*1024), speed)
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return fmt.Errorf("read error: %w", readErr)
-		}
+		return err
 	}
 
-	var zeroHeader [4]byte
-	if _, err := bw.Write(zeroHeader[:]); err != nil {
-		return fmt.Errorf("stream write failed: %w", err)
+	// A relay 200 only proves the chunk was staged. Wait for the receiver's
+	// signed receipt before calling the transfer done.
+	if err := waitForComplete(conn, transferID, peerCryptoKey, cfg.DeviceID, digest); err != nil {
+		return err
 	}
-	if err := bw.Flush(); err != nil {
-		return fmt.Errorf("stream flush failed: %w", err)
-	}
-	_ = pipeWriter.Close()
-	fmt.Println()
-
-	if err := <-uploadDone; err != nil {
-		return fmt.Errorf("pipe upload failed: %w", err)
-	}
+	deleteTransfer(cfg, relayToken, transferID, sessionID)
 	return nil
 }
 
@@ -857,8 +1850,24 @@ func main() {
 	flag.StringVar(&cfg.Name, "name", defaultName, "Human readable device name")
 	flag.StringVar(&cfg.InboxDir, "inbox", defaultInboxDir(), "Directory where incoming files are saved")
 	flag.StringVar(&cfg.PeersFile, "peers-file", defaultPeersFile(), "Path to the peer state file watched by desktop shells")
+	flag.BoolVar(&cfg.Clipboard, "clipboard", true, "Sync the desktop clipboard with cluster devices")
+	flag.StringVar(&cfg.ClipboardSource, "clipboard-source", "poll", "Clipboard source: poll, socket, or off")
+	flag.StringVar(&cfg.ClipboardSocket, "clipboard-socket", defaultClipboardSocket(), "Unix socket for Quickshell clipboard events")
+	flag.StringVar(&cfg.LogFile, "log-file", "", "Append daemon logs to this file instead of stderr")
 	flag.BoolVar(&jsonOutput, "json", false, "Output results as JSON")
+	noOpen := false
+	flag.BoolVar(&noOpen, "no-open", false, "Disable opening received files automatically")
+	flag.BoolVar(&cfg.OnlyTrusted, "only-trusted", loadOnlyTrustedFromConfig(), "Reject offers from devices not in the trust list")
+	flag.BoolVar(&cfg.Notifications, "notifications", true, "Display notifications mirrored from other devices")
 	flag.Parse()
+
+	cfg.AutoOpen = !noOpen
+
+	if cfg.LogFile != "" {
+		if f, err := os.OpenFile(cfg.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			log.SetOutput(f)
+		}
+	}
 
 	args := flag.Args()
 	if len(args) == 0 {
@@ -866,7 +1875,19 @@ func main() {
 		fmt.Println("\nUsage:")
 		fmt.Println("  gaur-share daemon                   Run background receiver daemon")
 		fmt.Println("  gaur-share list [-json]             List all active cluster devices")
-		fmt.Println("  gaur-share send <device> <file>...  Send one or more files to a device")
+		fmt.Println("  gaur-share send [-open] <device> <file|dir>...  Send files or a folder (flat batch)")
+		fmt.Println("  gaur-share send --all <file|dir>...          Upload once, send to every online device")
+		fmt.Println("  gaur-share send --offline <device> <file>... Queue for a device that may be offline")
+		fmt.Println("  gaur-share send --to <id,id> <file>...       Send to specific device IDs")
+		fmt.Println("  gaur-share send-text <device> <text|->       Send a text or link (use - for stdin)")
+		fmt.Println("  gaur-share pair <gaur://pair?...>           Pair using the QR URI from gaur-relay -init")
+		fmt.Println("  gaur-share ui [-addr 127.0.0.1:0]           Local browser UI for peers, text, and files")
+		fmt.Println("  gaur-share notify <device> <title> [body]   Send a notification to a device")
+		fmt.Println("  gaur-share notify --all <title> [body]      Send a notification to every online device")
+		fmt.Println("  gaur-share trust <device>                   Trust a device by id or name")
+		fmt.Println("  gaur-share untrust <device>                 Revoke a trusted device")
+		fmt.Println("  gaur-share trusted                          List trusted devices and mode")
+		fmt.Println("  gaur-share trust-mode on|off                Only accept from trusted devices")
 		fmt.Println("\nFlags:")
 		flag.PrintDefaults()
 		return
@@ -894,11 +1915,131 @@ func main() {
 		}
 		runList(cfg, jsonOutput)
 	case "send":
-		if len(args) < 3 {
-			log.Fatalf("Usage: gaur-share send <target-device> <file-path> [file-path...]")
+		sendFlags := flag.NewFlagSet("send", flag.ExitOnError)
+		openRequested := sendFlags.Bool("open", false, "Ask the receiving device to open the file on arrival")
+		sendAll := sendFlags.Bool("all", false, "Send to every online device (v3, one upload)")
+		sendOffline := sendFlags.Bool("offline", false, "Queue for a device that may be offline (v3)")
+		sendTo := sendFlags.String("to", "", "Comma-separated device IDs (v3)")
+		if err := sendFlags.Parse(args[1:]); err != nil {
+			log.Fatalf("[FATAL] %v", err)
 		}
-		runSend(cfg, args[1], args[2:])
+		rest := sendFlags.Args()
+		switch {
+		case *sendAll:
+			if len(rest) < 1 {
+				log.Fatalf("Usage: gaur-share send --all <file|dir>...")
+			}
+			runSendV3(cfg, nil, rest, false, *openRequested)
+		case *sendTo != "":
+			if len(rest) < 1 {
+				log.Fatalf("Usage: gaur-share send --to <id,id> <file|dir>...")
+			}
+			runSendV3(cfg, splitTargets(*sendTo), rest, false, *openRequested)
+		case *sendOffline:
+			if len(rest) < 2 {
+				log.Fatalf("Usage: gaur-share send --offline <device-id> <file|dir>...")
+			}
+			runSendV3(cfg, []string{rest[0]}, rest[1:], true, *openRequested)
+		default:
+			if len(rest) < 2 {
+				log.Fatalf("Usage: gaur-share send [-open] <target-device> <file-path> [file-path...]")
+			}
+			runSend(cfg, rest[0], rest[1:], *openRequested)
+		}
+	case "send-text":
+		if len(args) < 3 {
+			log.Fatalf("Usage: gaur-share send-text <target-device> <text|->")
+		}
+		runSendText(cfg, args[1], strings.Join(args[2:], " "))
+	case "pair":
+		uri := ""
+		if len(args) >= 2 {
+			uri = args[1]
+		} else {
+			data, err := io.ReadAll(io.LimitReader(os.Stdin, 8*1024))
+			if err != nil {
+				log.Fatalf("[FATAL] Could not read pairing URI: %v", err)
+			}
+			uri = string(data)
+		}
+		if err := runPair(cfg, uri); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+	case "ui":
+		uiFlags := flag.NewFlagSet("ui", flag.ExitOnError)
+		uiAddr := uiFlags.String("addr", "127.0.0.1:0", "Local address for the UI")
+		if err := uiFlags.Parse(args[1:]); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		runUI(cfg, *uiAddr)
+	case "notify":
+		notifyFlags := flag.NewFlagSet("notify", flag.ExitOnError)
+		notifyAll := notifyFlags.Bool("all", false, "Send to every online device")
+		notifyIcon := notifyFlags.String("icon", "", "Icon file (PNG, max 64 KiB)")
+		if err := notifyFlags.Parse(args[1:]); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		rest := notifyFlags.Args()
+		if *notifyAll {
+			if len(rest) < 1 {
+				log.Fatalf("Usage: gaur-share notify --all <title> [body...]")
+			}
+			runNotifyAll(cfg, rest[0], strings.Join(rest[1:], " "), *notifyIcon)
+		} else {
+			if len(rest) < 2 {
+				log.Fatalf("Usage: gaur-share notify <device> <title> [body...]")
+			}
+			runNotify(cfg, rest[0], rest[1], strings.Join(rest[2:], " "), *notifyIcon)
+		}
+	case "trust":
+		if len(args) < 2 {
+			log.Fatalf("Usage: gaur-share trust <device-id-or-name>")
+		}
+		id, name := resolveTrustTarget(args[1])
+		if err := trustDevice(id, name); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		fmt.Printf("Trusted %s (%s)\n", name, id)
+	case "untrust":
+		if len(args) < 2 {
+			log.Fatalf("Usage: gaur-share untrust <device-id-or-name>")
+		}
+		id, name := resolveTrustTarget(args[1])
+		removed, err := untrustDevice(id)
+		if err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		if removed {
+			fmt.Printf("Revoked %s (%s)\n", name, id)
+		} else {
+			fmt.Printf("%s was not trusted\n", name)
+		}
+	case "trusted":
+		devices, err := loadTrustedDevices()
+		if err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		mode := "off"
+		if onlyTrustedEnabled(cfg) {
+			mode = "on"
+		}
+		fmt.Printf("Only trusted devices: %s\n", mode)
+		if len(devices) == 0 {
+			fmt.Println("No trusted devices.")
+			return
+		}
+		for _, d := range devices {
+			fmt.Printf("%-24s %s\n", d.ID, d.Name)
+		}
+	case "trust-mode":
+		if len(args) < 2 || (args[1] != "on" && args[1] != "off") {
+			log.Fatalf("Usage: gaur-share trust-mode on|off")
+		}
+		if err := setOnlyTrusted(args[1] == "on"); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		fmt.Printf("Only trusted devices: %s\n", args[1])
 	default:
-		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send", args[0])
+		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, send-text, pair, ui, notify, trust, untrust, trusted, trust-mode", args[0])
 	}
 }

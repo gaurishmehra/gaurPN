@@ -16,3 +16,5 @@ captures/
 dist/
 \$cache
 *.bin
+desktop-client/gaur-share
+desktop-client/gaur-share.exe

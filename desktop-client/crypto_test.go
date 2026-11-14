@@ -174,3 +174,19 @@ func TestResolveUniqueFile(t *testing.T) {
 		t.Errorf("ResolveUniqueFile 2nd = %s, want %s", unique2, expected2)
 	}
 }
+
+func TestDeriveTextKeyDomainSeparation(t *testing.T) {
+	peer := []byte("peer-key-material")
+	textKey := DeriveTextKey(peer)
+	clipboardKey := DeriveClipboardKey(peer)
+
+	if len(textKey) != 32 {
+		t.Fatalf("text key length = %d, want 32", len(textKey))
+	}
+	if bytes.Equal(textKey, clipboardKey) {
+		t.Fatal("text and clipboard keys must be domain-separated")
+	}
+	if !bytes.Equal(textKey, DeriveTextKey(peer)) {
+		t.Fatal("text key derivation must be deterministic")
+	}
+}
