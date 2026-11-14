@@ -259,6 +259,21 @@ object Crypto {
         return "tx-" + digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }.take(32)
     }
 
+    /**
+     * Transfer ids are "tx-" plus 32 lowercase hex chars, exactly as
+     * [deriveTransferId] emits. The id is peer-supplied on an inbound offer
+     * and becomes part of the staging file name, so anything else is rejected
+     * before it can reach a path.
+     */
+    fun isTransferId(value: String): Boolean {
+        if (value.length != 35 || !value.startsWith("tx-")) return false
+        for (i in 3 until value.length) {
+            val c = value[i]
+            if (c !in '0'..'9' && c !in 'a'..'f') return false
+        }
+        return true
+    }
+
     /** 96-bit GCM nonce: four zero bytes followed by the big-endian chunk index. */
     fun chunkNonce(index: Int): ByteArray {
         val nonce = ByteArray(12)

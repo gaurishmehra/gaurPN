@@ -52,8 +52,11 @@ object TextShareNotifications {
             .setAutoCancel(true)
             .addAction(0, "Copy", copyPending)
 
-        if (isUrl) {
-            val openIntent = Intent(Intent.ACTION_VIEW, Uri.parse(text))
+        // Untrusted text only gets an Open action when it passes the shared
+        // URL validator; the canonical form is what opens.
+        val openTarget = TextShareActions.openTarget(text, kind)
+        if (openTarget != null) {
+            val openIntent = Intent(Intent.ACTION_VIEW, Uri.parse(openTarget))
             val openPending = PendingIntent.getActivity(
                 context,
                 notificationId + 1,

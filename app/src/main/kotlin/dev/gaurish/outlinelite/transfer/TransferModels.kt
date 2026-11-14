@@ -4,6 +4,10 @@ data class ClusterPeer(
     val id: String,
     val name: String,
     val isSelf: Boolean = false,
+    /** Last decrypted battery percentage from the peer's status blob, if any. */
+    val battery: Int? = null,
+    /** Last decrypted charging flag; null when no status has arrived. */
+    val charging: Boolean? = null,
 )
 
 sealed interface TransferState {

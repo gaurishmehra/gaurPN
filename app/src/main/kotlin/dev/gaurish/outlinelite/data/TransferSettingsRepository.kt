@@ -18,6 +18,8 @@ object TransferSettingsRepository {
 
     private val AUTO_OPEN_RECEIVED = booleanPreferencesKey("auto_open_received_v1")
     private val ONLY_TRUSTED = booleanPreferencesKey("only_trusted_devices_v1")
+    private val ALLOW_FILE_REQUESTS = booleanPreferencesKey("allow_file_requests_v1")
+    private val ALLOW_SCREENSHOT_REQUESTS = booleanPreferencesKey("allow_screenshot_requests_v1")
 
     /** Whether files received over the cluster relay open automatically. Default: on. */
     fun observeAutoOpen(context: Context): Flow<Boolean> =
@@ -41,5 +43,28 @@ object TransferSettingsRepository {
 
     suspend fun setOnlyTrusted(context: Context, enabled: Boolean) {
         context.transferPrefsDataStore.edit { prefs -> prefs[ONLY_TRUSTED] = enabled }
+    }
+
+    /**
+     * Whether cluster peers may ask this phone for files. On by default:
+     * the request still needs an explicit tap in the picker, and the trust
+     * gate applies first.
+     */
+    fun observeAllowFileRequests(context: Context): Flow<Boolean> =
+        context.transferPrefsDataStore.data.map { it[ALLOW_FILE_REQUESTS] ?: true }
+
+    suspend fun setAllowFileRequests(context: Context, enabled: Boolean) {
+        context.transferPrefsDataStore.edit { prefs -> prefs[ALLOW_FILE_REQUESTS] = enabled }
+    }
+
+    /**
+     * Whether a peer may pull the latest screenshot without a picker. Off by
+     * default: it is the one request kind that sends content automatically.
+     */
+    fun observeAllowScreenshotRequests(context: Context): Flow<Boolean> =
+        context.transferPrefsDataStore.data.map { it[ALLOW_SCREENSHOT_REQUESTS] ?: false }
+
+    suspend fun setAllowScreenshotRequests(context: Context, enabled: Boolean) {
+        context.transferPrefsDataStore.edit { prefs -> prefs[ALLOW_SCREENSHOT_REQUESTS] = enabled }
     }
 }

@@ -81,7 +81,7 @@ internal class TransferEngine(
         val chunkSize = inner.optInt("chunk_size", 0)
         val chunkCount = inner.optInt("chunk_count", 0)
         val chunkHashesArray = inner.optJSONArray("chunk_hashes")
-        if (transferId.isBlank() || sessionId.isBlank() || rawName.isBlank() ||
+        if (!Crypto.isTransferId(transferId) || sessionId.isBlank() || rawName.isBlank() ||
             fileHash.isBlank() || chunkSize <= 0 || chunkCount < 0 ||
             chunkHashesArray == null || chunkHashesArray.length() != chunkCount
         ) {
@@ -95,8 +95,15 @@ internal class TransferEngine(
         downloadsDir.mkdirs()
         if (!Crypto.isPathInsideDirectory(File(downloadsDir, cleanName), downloadsDir)) return
 
-        val partFile = File(downloadsDir, ".$cleanName.$transferId.part")
-        val stateFile = File(downloadsDir, ".$cleanName.$transferId.state")
+        // v3 offers are sealed, so a malformed id is dropped silently like
+        // every other malformed v3 field; there is no unsealed v3 reject.
+        val staging = TransferStaging.forTransfer(downloadsDir, cleanName, transferId)
+        if (staging == null) {
+            Log.w(TAG, "Rejecting sealed offer with an unsafe transfer id or staging path")
+            return
+        }
+        val partFile = staging.part
+        val stateFile = staging.state
         // Resume like v2: reuse the staged .part/.state while it still
         // matches this transfer; a changed file under the same transfer id
         // (content hash differs) resets cleanly.
@@ -218,6 +225,19 @@ internal class TransferEngine(
         val batchTotal = offer.optInt("batch_total", 1).coerceAtLeast(1)
         val batchIndex = offer.optInt("batch_index", 0).coerceIn(0, batchTotal - 1)
 
+        // The transfer id names the .part file, so it must have the shape
+        // Crypto.deriveTransferId produces before any path is built.
+        if (!Crypto.isTransferId(transferId)) {
+            Log.w(TAG, "Rejecting v1 offer with an invalid transfer id")
+            RelayConnection.send(JSONObject().apply {
+                put("type", "transfer_reject")
+                put("target_id", senderId)
+                put("transfer_id", transferId)
+                put("reason", "invalid_transfer_id")
+            }.toString())
+            return
+        }
+
         // Zero-knowledge peer-to-peer authentication (MITM defense). The tag
         // binds the raw envelope fields — including file name and size —
         // before any sanitization, so a relay cannot swap the payload.
@@ -298,7 +318,17 @@ internal class TransferEngine(
         transferState.value = TransferState.Receiving(senderName, label, 0f, 0f)
         RelayManager.showNotification(context, notifId, "Receiving $label", "From $senderName...", ongoing = true, progress = -2)
 
-        val partFile = File(downloadsDir, ".${cleanName}.${transferId}.part")
+        val partFile = TransferStaging.forTransfer(downloadsDir, cleanName, transferId)?.part
+        if (partFile == null) {
+            Log.w(TAG, "Rejecting v1 offer: staging path escaped Downloads")
+            RelayConnection.send(JSONObject().apply {
+                put("type", "transfer_reject")
+                put("target_id", senderId)
+                put("transfer_id", transferId)
+                put("reason", "invalid_path")
+            }.toString())
+            return
+        }
         val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RelayManager.RELAY_HOST }
         val pipeUrl = "http://$relayHost/pipe?transfer_id=$transferId&role=receiver"
         val request = Request.Builder()
@@ -473,6 +503,19 @@ internal class TransferEngine(
         val openOnArrival = offer.optBoolean("open", false)
         val offerMime = offer.optString("mime_type")
 
+        // The transfer id names the .part/.state files, so it must have the
+        // shape Crypto.deriveTransferId produces before any path is built.
+        if (!Crypto.isTransferId(transferId)) {
+            Log.w(TAG, "Rejecting v2 offer with an invalid transfer id")
+            RelayConnection.send(JSONObject().apply {
+                put("type", "transfer_reject")
+                put("target_id", senderId)
+                put("transfer_id", transferId)
+                put("reason", "invalid_transfer_id")
+            }.toString())
+            return
+        }
+
         val validEmpty = fileSize == 0L && chunkCount == 0
         val validNonEmpty = fileSize > 0L && chunkCount > 0
         if (sessionId.isBlank() || fileHash.isBlank() || chunkSize <= 0 ||
@@ -531,8 +574,19 @@ internal class TransferEngine(
             return
         }
 
-        val partFile = File(downloadsDir, ".$cleanName.$transferId.part")
-        val stateFile = File(downloadsDir, ".$cleanName.$transferId.state")
+        val staging = TransferStaging.forTransfer(downloadsDir, cleanName, transferId)
+        if (staging == null) {
+            Log.w(TAG, "Rejecting v2 offer: staging path escaped Downloads")
+            RelayConnection.send(JSONObject().apply {
+                put("type", "transfer_reject")
+                put("target_id", senderId)
+                put("transfer_id", transferId)
+                put("reason", "invalid_path")
+            }.toString())
+            return
+        }
+        val partFile = staging.part
+        val stateFile = staging.state
         var state = ChunkTransport.loadState(stateFile, transferId, fileHash)
         if (state == null) {
             partFile.delete()

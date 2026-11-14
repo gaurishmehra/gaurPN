@@ -74,8 +74,13 @@ class SecretBoxTest {
         val corruptBase64 = "gk1:!!!not-base64!!!"
         assertEquals("", unwrapSecret(corruptBase64, box))
 
-        // Flip a ciphertext byte: GCM authentication must reject it.
-        val bytes = sealed.removePrefix(SECRET_MARKER).toCharArray().also { it[10] = 'A' }
+        // Flip a ciphertext byte: GCM authentication must reject it. The
+        // replacement char is chosen to differ from the original, otherwise
+        // a fresh random IV can already produce 'A' there and the flip is a
+        // no-op (this exact race made the test flake ~1/64 runs).
+        val bytes = sealed.removePrefix(SECRET_MARKER).toCharArray().also {
+            it[10] = if (it[10] == 'A') 'B' else 'A'
+        }
         assertEquals("", unwrapSecret(SECRET_MARKER + String(bytes), box))
     }
 

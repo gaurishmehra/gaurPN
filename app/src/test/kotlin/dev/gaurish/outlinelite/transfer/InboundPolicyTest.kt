@@ -67,4 +67,49 @@ class InboundPolicyTest {
             ),
         )
     }
+
+    /**
+     * Requests are gated exactly like offers: an untrusted requester is
+     * declined by the caller, never served. The generic table above already
+     * covers REQUEST through [InboundKind.entries]; these cases pin the
+     * intent so a future enum edit cannot quietly drop it.
+     */
+    @Test
+    fun requestKindUsesTheSameTrustRulesAsOffers() {
+        assertTrue(
+            InboundPolicy.shouldAccept(InboundKind.REQUEST, "friend-1", selfId, trusted, true),
+        )
+        assertFalse(
+            InboundPolicy.shouldAccept(InboundKind.REQUEST, "stranger", selfId, trusted, true),
+        )
+        assertFalse(
+            InboundPolicy.shouldAccept(InboundKind.REQUEST, selfId, selfId, trusted, false),
+        )
+        assertTrue(
+            InboundPolicy.shouldAccept(InboundKind.REQUEST, "stranger", selfId, emptySet(), false),
+        )
+        assertFalse(
+            InboundPolicy.shouldAccept(InboundKind.REQUEST, "", selfId, emptySet(), false),
+        )
+    }
+
+    /**
+     * The v3.2 trust fallback: a desktop requester connects under an
+     * ephemeral reqdev- id and carries its stable device id in origin_id.
+     * The gate must be handed the stable id, or an only-trusted target
+     * declines every desktop request. [RequestEnvelope.trustId] performs the
+     * fallback; these cases pin the accept/reject outcome it feeds.
+     */
+    @Test
+    fun requestTrustUsesTheStableOriginId() {
+        val ephemeral = "reqdev-4242-a1b2"
+        val stable = "laptop-1"
+        val trusted = setOf(stable)
+        assertFalse(
+            InboundPolicy.shouldAccept(InboundKind.REQUEST, ephemeral, selfId, trusted, true),
+        )
+        assertTrue(
+            InboundPolicy.shouldAccept(InboundKind.REQUEST, stable, selfId, trusted, true),
+        )
+    }
 }

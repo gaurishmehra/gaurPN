@@ -2,6 +2,7 @@ package dev.gaurish.outlinelite.transfer
 
 import android.content.ContentResolver
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
@@ -82,15 +83,21 @@ internal class OutboundSender(
         uris: List<Uri>,
         offline: Boolean = false,
         deviceId: String,
+        request: RequestContext? = null,
+        releaseUriGrants: Boolean = false,
     ) {
-        if (targets.isEmpty() || uris.isEmpty()) return
         val appCtx = context.applicationContext
+        if (targets.isEmpty() || uris.isEmpty()) {
+            if (releaseUriGrants) releaseReadGrants(appCtx, uris)
+            return
+        }
         if (!RelayConnection.isConnected) {
+            if (releaseUriGrants) releaseReadGrants(appCtx, uris)
             transferState.value = TransferState.Error("File sharing not connected")
             return
         }
         sendJob?.cancel()
-        sendJob = scope.launch {
+        val job = scope.launch {
             val token = runCatching { KeyRepository.getClusterToken(appCtx) }.getOrDefault("")
             if (token.isBlank()) {
                 transferState.value = TransferState.Error("Cluster token not configured")
@@ -131,6 +138,7 @@ internal class OutboundSender(
                         offline = offline,
                         notifId = batchNotifId,
                         deviceId = deviceId,
+                        request = request,
                     )
                     sentBefore += file.size
                 }
@@ -158,6 +166,29 @@ internal class OutboundSender(
                 NotificationIds.release(batchNotifId)
             }
         }
+        sendJob = job
+        if (releaseUriGrants) {
+            // Fire-and-forget: the picker's persistable grants die with the
+            // send, whether it completes, fails, or is cancelled.
+            job.invokeOnCompletion { releaseReadGrants(appCtx, uris) }
+        }
+    }
+
+    /**
+     * Drops the persistable read grants the request picker took for a send.
+     * Providers without persistable grants throw and are ignored, exactly
+     * like the take side.
+     */
+    internal fun releaseReadGrants(context: Context, uris: List<Uri>) {
+        uris.forEach { uri ->
+            if (uri.scheme != "content") return@forEach
+            runCatching {
+                context.contentResolver.releasePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                )
+            }
+        }
     }
 
     private suspend fun sendOneV3(
@@ -176,6 +207,7 @@ internal class OutboundSender(
         offline: Boolean,
         notifId: Int,
         deviceId: String,
+        request: RequestContext?,
     ) {
         transferState.value = TransferState.Sending(targets.first().name, label, 0f, 0f)
         RelayManager.showNotification(context, notifId, "Preparing $label", "Hashing file...", ongoing = true, progress = -2)
@@ -263,6 +295,10 @@ internal class OutboundSender(
                 put("open", false)
                 put("offline", offline)
             }
+            // Request answers echo the request id and grant verbatim; the
+            // requester verifies them against its own request. Absent on
+            // every ordinary send, so that path is byte-identical.
+            RequestCodec.applyRequestEcho(inner, request)
             RelayManager.sendSealed(context, target.id, "offer", inner)
         }
         RelayManager.showNotification(

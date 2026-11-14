@@ -9,9 +9,11 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -152,11 +154,13 @@ fun ClusterSharingSection(
 ) {
     val context = LocalContext.current
     val scheme = MaterialTheme.colorScheme
+    val scope = rememberCoroutineScope()
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
     val transferState by RelayManager.transferState.collectAsStateWithLifecycle()
     val token by KeyRepository.observeClusterToken(context).collectAsStateWithLifecycle(initialValue = "")
 
     var targetPeerForPicker by remember { mutableStateOf<ClusterPeer?>(null) }
+    var requestPeer by remember { mutableStateOf<ClusterPeer?>(null) }
     val filePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris: List<Uri> ->
@@ -261,11 +265,53 @@ fun ClusterSharingSection(
                                     targetPeerForPicker = peer
                                     filePickerLauncher.launch("*/*")
                                 },
+                                onLongClick = { requestPeer = peer },
                             )
                         }
                     }
                 }
             }
+        }
+
+        requestPeer?.let { peer ->
+            AlertDialog(
+                onDismissRequest = { requestPeer = null },
+                title = { Text("Request files from ${peer.name}?") },
+                text = {
+                    Text(
+                        "They will get a notification to pick files and send them back " +
+                            "over the encrypted tunnel.",
+                        fontSize = 13.sp,
+                        color = scheme.onSurfaceVariant,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            requestPeer = null
+                            scope.launch {
+                                val sent = RelayManager.requestFiles(context, peer)
+                                Toast.makeText(
+                                    context,
+                                    if (sent) {
+                                        "Request sent to ${peer.name}"
+                                    } else {
+                                        "Request failed: not connected"
+                                    },
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                        },
+                    ) {
+                        Text("Request")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { requestPeer = null }) {
+                        Text("Cancel")
+                    }
+                },
+            )
         }
     }
 }
@@ -469,29 +515,54 @@ fun ShareTargetDialog(
     )
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PeerRow(
     peer: ClusterPeer,
     actionLabel: String = "Send Files",
     onSendClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(onClick = {}, onLongClick = onLongClick)
+                } else {
+                    Modifier
+                }
+            )
             .padding(vertical = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Text(
-                peer.name,
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Medium,
-                color = scheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    peer.name,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = scheme.onSurface,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f, fill = false),
+                )
+                val battery = peer.battery
+                if (battery != null) {
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        buildString {
+                            append(battery)
+                            append('%')
+                            if (peer.charging == true) append(" \u26A1")
+                        },
+                        fontSize = 10.sp,
+                        color = scheme.onSurfaceVariant,
+                    )
+                }
+            }
             Text(
                 peer.id,
                 fontSize = 10.sp,
