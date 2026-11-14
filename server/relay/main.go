@@ -33,6 +33,10 @@ const (
 	defaultMaxPeers = 32
 	// maxDeviceNameBytes bounds the UTF-8 size of a peer's display name.
 	maxDeviceNameBytes = 128
+	// maxStatusBlobBytes bounds the opaque status blob a peer may publish.
+	// 160 base64 chars encode 120 bytes: enough for a small encrypted
+	// telemetry record, small enough that every peers broadcast stays tiny.
+	maxStatusBlobBytes = 160
 	// authFailureLimit is how many failed auth attempts one IP may make per
 	// window before further attempts are throttled.
 	authFailureLimit = 10
@@ -69,10 +73,19 @@ type Config struct {
 }
 
 type Peer struct {
-	ID       string          `json:"id"`
-	Name     string          `json:"name"`
-	conn     *websocket.Conn `json:"-"`
-	writeMu  sync.Mutex      `json:"-"`
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	conn *websocket.Conn `json:"-"`
+
+	// status is the peer's opaque status blob: end-to-end-encrypted cluster
+	// telemetry (battery/charging) that the relay must never parse, decode,
+	// or log. It is guarded by Hub.mu, not by writeMu: peersSnapshot reads
+	// it under the hub lock and it is written only through
+	// Hub.setPeerStatus, so the connection's read goroutine never touches
+	// the field bare. Empty means "this peer has not sent status yet".
+	status string
+
+	writeMu  sync.Mutex `json:"-"`
 	joinedAt time.Time
 
 	// Liveness settings copied from the ws* package vars when the peer
@@ -88,6 +101,9 @@ type Peer struct {
 type PeerInfo struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	// Status is the peer's opaque status blob, omitted until the peer sends
+	// one. Clients that predate v3.2 ignore the extra key.
+	Status string `json:"status,omitempty"`
 }
 
 // writeMessage sends one frame under the write mutex with a bounded write
@@ -473,10 +489,46 @@ func (h *Hub) peersSnapshot() ([]PeerInfo, []*Peer) {
 	list := make([]PeerInfo, 0, len(h.peers))
 	peers := make([]*Peer, 0, len(h.peers))
 	for _, peer := range h.peers {
-		list = append(list, PeerInfo{ID: peer.ID, Name: peer.Name})
+		list = append(list, PeerInfo{ID: peer.ID, Name: peer.Name, Status: peer.status})
 		peers = append(peers, peer)
 	}
 	return list, peers
+}
+
+// setPeerStatus stores a peer's opaque status blob. The write happens under
+// the hub mutex because peersSnapshot and every peers broadcast read the
+// field under the same lock; a bare write from the connection's read
+// goroutine would be a data race. The blob is never inspected.
+func (h *Hub) setPeerStatus(deviceID, status string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if peer, ok := h.peers[deviceID]; ok {
+		peer.status = status
+	}
+}
+
+// validStatusBlob reports whether s is a plausible standard-base64 status
+// blob. This is a shape check only: the relay never decodes or interprets
+// the payload, it just keeps a token holder from using the field as
+// unbounded storage or smuggling arbitrary bytes into every peers
+// broadcast. The alphabet is the standard one (A-Z a-z 0-9 + / =), so
+// URL-safe base64 is rejected.
+func validStatusBlob(s string) bool {
+	if len(s) < 1 || len(s) > maxStatusBlobBytes {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'A' && c <= 'Z':
+		case c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9':
+		case c == '+' || c == '/' || c == '=':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
@@ -610,6 +662,22 @@ func (h *Hub) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 		if msgType == "list_peers" {
 			h.sendPeerList(peer)
+			continue
+		}
+
+		// Status frames carry an opaque, end-to-end-encrypted telemetry blob
+		// (battery/charging). The relay validates the shape, stores it, and
+		// rebroadcasts the peer list; it never parses or logs the contents.
+		// A malformed frame is a client bug, not a security event, so it is
+		// dropped without disconnecting.
+		if msgType == "status" {
+			status, _ := envelope["status"].(string)
+			if !validStatusBlob(status) {
+				log.Printf("[STATUS] invalid status frame from %s (len %d)", deviceID, len(status))
+				continue
+			}
+			h.setPeerStatus(deviceID, status)
+			h.broadcastPeerList()
 			continue
 		}
 
