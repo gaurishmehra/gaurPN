@@ -20,7 +20,7 @@ import (
 
 func TestPeerConcurrentWrites(t *testing.T) {
 	token := []byte("test-cluster-token-secret")
-	hub := NewHub(token, NewChunkStore("", 0, 0))
+	hub := NewHub(token, mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
@@ -68,7 +68,7 @@ func TestPeerConcurrentWrites(t *testing.T) {
 
 func TestPipeSessionCleanup(t *testing.T) {
 	token := []byte("test-secret-token")
-	hub := NewHub(token, NewChunkStore("", 0, 0))
+	hub := NewHub(token, mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	transferID := "tx-test-cleanup-1"
@@ -95,7 +95,7 @@ func TestPipeSessionCleanup(t *testing.T) {
 
 func TestPipeSessionSuccessfulStream(t *testing.T) {
 	token := []byte("test-secret-token")
-	hub := NewHub(token, NewChunkStore("", 0, 0))
+	hub := NewHub(token, mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	transferID := fmt.Sprintf("tx-test-success-%d", time.Now().UnixNano())
@@ -147,7 +147,7 @@ func TestPipeSessionSuccessfulStream(t *testing.T) {
 
 func TestHubAuthenticateWithDerivedToken(t *testing.T) {
 	masterToken := []byte("super-secret-cluster-token")
-	hub := NewHub(masterToken, NewChunkStore("", 0, 0))
+	hub := NewHub(masterToken, mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	// Direct master token should authenticate
@@ -172,7 +172,7 @@ func TestHubAuthenticateWithDerivedToken(t *testing.T) {
 
 func TestRelayAddsTimestampAndSenderIdentity(t *testing.T) {
 	token := []byte("test-cluster-token-secret")
-	hub := NewHub(token, NewChunkStore("", 0, 0))
+	hub := NewHub(token, mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
@@ -227,7 +227,7 @@ func TestRelayAddsTimestampAndSenderIdentity(t *testing.T) {
 
 func TestSealedForwardStripsSenderIdentity(t *testing.T) {
 	token := []byte("test-cluster-token-secret")
-	hub := NewHub(token, NewChunkStore("", 0, 0))
+	hub := NewHub(token, mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
@@ -312,7 +312,7 @@ func waitPipeRole(t *testing.T, hub *Hub, transferID, role string) {
 }
 
 func TestPipeRoleGuardRejectsSecondSender(t *testing.T) {
-	hub := NewHub([]byte("role-token"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("role-token"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 	transferID := "tx-role-sender"
 
@@ -342,7 +342,7 @@ func TestPipeRoleGuardRejectsSecondSender(t *testing.T) {
 }
 
 func TestPipeRoleGuardRejectsSecondReceiver(t *testing.T) {
-	hub := NewHub([]byte("role-token"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("role-token"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 	transferID := "tx-role-receiver"
 
@@ -372,7 +372,7 @@ func TestPipeRoleGuardRejectsSecondReceiver(t *testing.T) {
 }
 
 func TestPipeRoleFreesAfterSenderDisconnect(t *testing.T) {
-	hub := NewHub([]byte("role-token"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("role-token"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 	transferID := "tx-role-free"
 
@@ -406,7 +406,7 @@ func TestPipeRoleFreesAfterSenderDisconnect(t *testing.T) {
 }
 
 func TestHealthConcurrentWithWSChurn(t *testing.T) {
-	hub := NewHub([]byte("race-token"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("race-token"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	mux := http.NewServeMux()

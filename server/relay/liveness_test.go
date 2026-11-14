@@ -91,7 +91,7 @@ func readUntil(t *testing.T, conn *websocket.Conn, pred func([]byte) bool, timeo
 // leave must be broadcast to the remaining peers.
 func TestWSDropsSilentClient(t *testing.T) {
 	setWSLiveness(t, 30*time.Millisecond, 150*time.Millisecond, time.Second)
-	hub := NewHub([]byte("liveness-token"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("liveness-token"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
@@ -178,7 +178,7 @@ func TestWSDropsSilentClient(t *testing.T) {
 // answering pings stays connected across several read windows.
 func TestWSKeepsPongingClient(t *testing.T) {
 	setWSLiveness(t, 30*time.Millisecond, 150*time.Millisecond, time.Second)
-	hub := NewHub([]byte("liveness-token"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("liveness-token"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
@@ -228,7 +228,7 @@ func TestWSWriteTimeoutUnblocksWriter(t *testing.T) {
 	// Only the write timeout is short: the client stays "present" so the
 	// failing writes are purely deadline-driven.
 	setWSLiveness(t, time.Hour, time.Hour, 100*time.Millisecond)
-	hub := NewHub([]byte("liveness-token"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("liveness-token"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))

@@ -3,7 +3,9 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -19,7 +21,26 @@ const (
 	maxChunkSize = 4 << 20
 	// maxChunksPerTransfer bounds the index space (64 GiB at 1 MiB chunks).
 	maxChunksPerTransfer = 65536
+	// chunkDirMarker names the sentinel file that marks a directory as
+	// gaur-relay chunk staging. The boot-time wipe only clears
+	// directories that are empty or carry this marker, so a mistyped
+	// -chunk-dir holding unrelated data is refused instead of deleted.
+	chunkDirMarker = ".gaur-relay-chunks"
 )
+
+// Store error sentinels. The chunk handlers map each class to an honest
+// status code: errOversized → 413, errCapExceeded → 507, errDiskIO →
+// 500; everything else is a validation error → 400.
+var (
+	errOversized   = errors.New("chunk exceeds the maximum chunk size")
+	errCapExceeded = errors.New("chunk store is at its byte cap")
+	errDiskIO      = errors.New("chunk staging I/O failed")
+)
+
+// chunkEvictInterval is how often the store sweeps idle transfers.
+// Package var so tests can shrink it; each store copies the current
+// value when it is constructed.
+var chunkEvictInterval = 30 * time.Second
 
 // Transfer keys are "<transfer_id>/<session_id>". Both halves are generated
 // from hex or random bytes, so this pattern doubles as path-traversal defence.
@@ -54,7 +75,13 @@ type ChunkStore struct {
 	closeOnce sync.Once
 }
 
-func NewChunkStore(dir string, maxBytes int64, ttl time.Duration) *ChunkStore {
+// NewChunkStore prepares the staging directory and returns the store.
+// The error is non-nil only when dir is configured but cannot be used
+// safely: a non-empty directory without the gaur-relay marker is
+// refused instead of wiped, and a path that cannot be inspected (for
+// example a plain file) is an error rather than a silent memory
+// fallback. main surfaces it with log.Fatal.
+func NewChunkStore(dir string, maxBytes int64, ttl time.Duration) (*ChunkStore, error) {
 	if maxBytes <= 0 {
 		maxBytes = 8 << 30
 	}
@@ -70,18 +97,54 @@ func NewChunkStore(dir string, maxBytes int64, ttl time.Duration) *ChunkStore {
 		done:      make(chan struct{}),
 	}
 	if dir != "" {
-		// The in-memory index is lost on restart, so any chunks left on disk
-		// are unreachable. Clear them at boot instead of leaking disk forever.
+		if err := checkChunkDir(dir); err != nil {
+			return nil, err
+		}
+		// The in-memory index is lost on restart, so any chunks left on
+		// disk are unreachable. Clear them at boot instead of leaking
+		// disk forever; checkChunkDir has verified the directory is
+		// either empty or ours.
 		if err := os.RemoveAll(dir); err != nil {
 			log.Printf("[CHUNK] Cannot clear chunk dir %s: %v", dir, err)
 		}
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			log.Printf("[CHUNK] Cannot create chunk dir %s: %v (using memory)", dir, err)
 			s.dir = ""
+		} else if err := os.WriteFile(filepath.Join(dir, chunkDirMarker), nil, 0o600); err != nil {
+			log.Printf("[CHUNK] Cannot write %s marker in %s: %v (using memory)", chunkDirMarker, dir, err)
+			s.dir = ""
 		}
 	}
-	go s.evictLoop()
-	return s
+	// Copy the interval synchronously: reading the package var inside
+	// the goroutine would race with tests that shrink it after the
+	// constructor returns but before the goroutine is first scheduled.
+	evictInterval := chunkEvictInterval
+	go s.evictLoop(evictInterval)
+	return s, nil
+}
+
+// checkChunkDir gates the boot-time wipe. A directory the relay may
+// clear is one that does not exist yet, is empty, or carries the
+// gaur-relay marker from a previous boot. Anything else — including a
+// plain file at the path — is refused with an error naming the
+// directory and the marker.
+func checkChunkDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil // nothing to protect yet
+		}
+		return fmt.Errorf("cannot inspect chunk dir %s: %w", dir, err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	for _, e := range entries {
+		if e.Name() == chunkDirMarker {
+			return nil
+		}
+	}
+	return fmt.Errorf("refusing to clear chunk dir %s: it is not empty and has no %s marker; move its contents or point -chunk-dir at a dedicated directory", dir, chunkDirMarker)
 }
 
 func (s *ChunkStore) Close() {
@@ -90,8 +153,8 @@ func (s *ChunkStore) Close() {
 	})
 }
 
-func (s *ChunkStore) evictLoop() {
-	ticker := time.NewTicker(30 * time.Second)
+func (s *ChunkStore) evictLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -163,10 +226,11 @@ func (s *ChunkStore) evictForLocked(need int64, exclude string) {
 	}
 }
 
-func (s *ChunkStore) transferLocked(key string) (*chunkTransfer, error) {
-	if t, ok := s.transfers[key]; ok {
-		return t, nil
-	}
+// createTransferLocked admits a new transfer and prepares its staging
+// directory. Callers must hold s.mu and have already enforced the byte
+// cap: a transfer becomes "known" — and therefore exempt from the cap —
+// only by being admitted here.
+func (s *ChunkStore) createTransferLocked(key string) (*chunkTransfer, error) {
 	t := &chunkTransfer{
 		key:     key,
 		chunks:  make(map[int]int64),
@@ -178,7 +242,7 @@ func (s *ChunkStore) transferLocked(key string) (*chunkTransfer, error) {
 		sum := sha256.Sum256([]byte(key))
 		t.dir = filepath.Join(s.dir, hex.EncodeToString(sum[:16]))
 		if err := os.MkdirAll(t.dir, 0o700); err != nil {
-			return nil, fmt.Errorf("create transfer dir: %w", err)
+			return nil, fmt.Errorf("%w: create transfer dir: %w", errDiskIO, err)
 		}
 	}
 	s.transfers[key] = t
@@ -191,6 +255,12 @@ func chunkPath(t *chunkTransfer, index int) string {
 
 // Put stores one ciphertext chunk. Re-uploading the same index replaces it,
 // which lets a sender retry a chunk without inflating the byte count.
+//
+// The byte cap is an admission gate: once the store is at its cap, PUTs
+// for transfers without staged chunks are refused (507 in the HTTP
+// layer), while transfers already admitted may always continue so an
+// in-flight transfer can finish, bounded by the per-transfer chunk
+// ceiling.
 func (s *ChunkStore) Put(key string, index int, data []byte) error {
 	if !safeTransferKey.MatchString(key) {
 		return fmt.Errorf("invalid transfer key")
@@ -198,16 +268,30 @@ func (s *ChunkStore) Put(key string, index int, data []byte) error {
 	if index < 0 || index >= maxChunksPerTransfer {
 		return fmt.Errorf("invalid chunk index %d", index)
 	}
-	if len(data) == 0 || len(data) > maxChunkSize {
+	if len(data) == 0 {
 		return fmt.Errorf("invalid chunk size %d", len(data))
+	}
+	if len(data) > maxChunkSize {
+		return fmt.Errorf("%w: %d bytes (max %d)", errOversized, len(data), maxChunkSize)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	t, err := s.transferLocked(key)
-	if err != nil {
-		return err
+	t, known := s.transfers[key]
+	if !known && s.usedBytes >= s.maxBytes {
+		// Recorded ownership must not count as admission: the handler
+		// records the owner before the body is read, so treating it as
+		// "known" would let a rejected PUT succeed on retry and bypass
+		// the cap entirely.
+		return fmt.Errorf("%w: %d of %d bytes staged; new transfers are refused until space frees", errCapExceeded, s.usedBytes, s.maxBytes)
+	}
+	if !known {
+		var err error
+		t, err = s.createTransferLocked(key)
+		if err != nil {
+			return err
+		}
 	}
 
 	old := t.chunks[index]
@@ -220,12 +304,16 @@ func (s *ChunkStore) Put(key string, index int, data []byte) error {
 	if s.dir != "" {
 		final := chunkPath(t, index)
 		tmp := final + ".tmp"
+		// Remove the staging file on every exit path. After a successful
+		// rename the path no longer exists and the remove fails
+		// silently; after a failed write or rename it reclaims the
+		// space instead of leaking .tmp files.
+		defer os.Remove(tmp)
 		if err := os.WriteFile(tmp, data, 0o600); err != nil {
-			return fmt.Errorf("write chunk: %w", err)
+			return fmt.Errorf("%w: write chunk: %w", errDiskIO, err)
 		}
 		if err := os.Rename(tmp, final); err != nil {
-			_ = os.Remove(tmp)
-			return fmt.Errorf("commit chunk: %w", err)
+			return fmt.Errorf("%w: commit chunk: %w", errDiskIO, err)
 		}
 	} else {
 		cp := make([]byte, len(data))
@@ -276,7 +364,10 @@ func (s *ChunkStore) Get(key string, index int) ([]byte, bool) {
 	return cp, true
 }
 
-// Present reports which indices (0..count-1) are already staged.
+// Present reports which indices (0..count-1) are already staged. Like
+// Put and Get it refreshes the transfer's idle timestamp: a receiver
+// that only polls status is actively using the transfer and must not be
+// TTL-swept mid-download.
 func (s *ChunkStore) Present(key string, count int) []int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -284,6 +375,7 @@ func (s *ChunkStore) Present(key string, count int) []int {
 	if !ok {
 		return []int{}
 	}
+	t.last = time.Now()
 	out := make([]int, 0, len(t.chunks))
 	for i := 0; i < count; i++ {
 		if _, ok := t.chunks[i]; ok {

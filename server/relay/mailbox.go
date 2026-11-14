@@ -6,6 +6,19 @@ import (
 	"time"
 )
 
+// Mailbox defaults. Centralized here so the flags in main and the
+// NewHub fallback cannot drift from the constructor's own defaults.
+const (
+	defaultMailboxTTL            = time.Hour
+	defaultMailboxMaxBytes       = 16 << 20
+	defaultMailboxMaxTargetBytes = 4 << 20
+)
+
+// mailboxSweepInterval is how often the background sweeper prunes
+// expired entries. Package var so tests can shrink it; the sweeper
+// copies the current value when Start is called.
+var mailboxSweepInterval = 30 * time.Second
+
 type mailboxEntry struct {
 	// id identifies this exact entry, so delivery can acknowledge the
 	// entry it actually delivered even while concurrent Puts, TTL
@@ -17,31 +30,83 @@ type mailboxEntry struct {
 
 // Mailbox holds opaque sealed envelopes for peers that are currently
 // offline. It is deliberately dumb: it never parses the payload, only the
-// target id and size. Entries are evicted by TTL and a global byte cap.
+// target id and size. Entries are evicted by TTL, a global byte cap, and
+// a per-target byte cap so one offline device cannot monopolize the
+// queue.
 type Mailbox struct {
-	mu       sync.Mutex
-	entries  map[string][]mailboxEntry
-	maxBytes int64
-	ttl      time.Duration
-	bytes    int64
-	seq      uint64
+	mu             sync.Mutex
+	entries        map[string][]mailboxEntry
+	maxBytes       int64
+	maxTargetBytes int64
+	ttl            time.Duration
+	bytes          int64
+	seq            uint64
 	// drains holds one *sync.Mutex per target so Drain calls for the
 	// same device serialize: a reconnecting device can never race its
 	// own dying connection into duplicate deliveries.
 	drains sync.Map // target -> *sync.Mutex
+	// done stops the background sweeper. Start and Close are
+	// once-guarded so repeated calls are safe and Close works even
+	// before Start.
+	done      chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
 }
 
-func NewMailbox(ttl time.Duration, maxBytes int64) *Mailbox {
+func NewMailbox(ttl time.Duration, maxBytes, maxTargetBytes int64) *Mailbox {
 	if ttl <= 0 {
-		ttl = time.Hour
+		ttl = defaultMailboxTTL
 	}
 	if maxBytes <= 0 {
-		maxBytes = 16 << 20
+		maxBytes = defaultMailboxMaxBytes
+	}
+	if maxTargetBytes <= 0 {
+		maxTargetBytes = defaultMailboxMaxTargetBytes
 	}
 	return &Mailbox{
-		entries:  make(map[string][]mailboxEntry),
-		maxBytes: maxBytes,
-		ttl:      ttl,
+		entries:        make(map[string][]mailboxEntry),
+		maxBytes:       maxBytes,
+		maxTargetBytes: maxTargetBytes,
+		ttl:            ttl,
+		done:           make(chan struct{}),
+	}
+}
+
+// Start launches the background TTL sweeper. Pruning is otherwise lazy
+// (it runs on Put/Take/Stats), so entries for a target nobody touches
+// would linger in memory until the next health poll; the sweeper drops
+// them on its own. The Hub starts it and stops it in Close.
+func (m *Mailbox) Start() {
+	m.startOnce.Do(func() {
+		// Copy the interval synchronously: reading the package var
+		// inside the goroutine would race with tests that shrink it
+		// after Start returns but before the goroutine is first
+		// scheduled.
+		interval := mailboxSweepInterval
+		go m.sweepLoop(interval)
+	})
+}
+
+// Close stops the background sweeper. Safe to call more than once and
+// before Start.
+func (m *Mailbox) Close() {
+	m.closeOnce.Do(func() {
+		close(m.done)
+	})
+}
+
+func (m *Mailbox) sweepLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			m.mu.Lock()
+			m.pruneLocked()
+			m.mu.Unlock()
+		case <-m.done:
+			return
+		}
 	}
 }
 
@@ -58,6 +123,20 @@ func (m *Mailbox) Put(target string, data []byte) {
 		log.Printf("[MAILBOX] Dropped %d-byte entry for %s: exceeds %d-byte cap", len(data), target, m.maxBytes)
 		return
 	}
+	if int64(len(data)) > m.maxTargetBytes {
+		// Same rule per target: one device may not queue a single
+		// entry that alone exhausts its per-target budget.
+		log.Printf("[MAILBOX] Dropped %d-byte entry for %s: exceeds %d-byte per-target cap", len(data), target, m.maxTargetBytes)
+		return
+	}
+	// Per-target cap: evict this target's earliest-expiry entries until
+	// the newcomer fits, so one offline device cannot monopolize the
+	// mailbox. Other targets are untouched at this stage.
+	for m.targetBytesLocked(target)+int64(len(data)) > m.maxTargetBytes {
+		if !m.evictTargetOldestLocked(target) {
+			return
+		}
+	}
 	for m.bytes+int64(len(data)) > m.maxBytes {
 		if !m.evictOldestLocked() {
 			return
@@ -70,6 +149,39 @@ func (m *Mailbox) Put(target string, data []byte) {
 		expires: time.Now().Add(m.ttl),
 	})
 	m.bytes += int64(len(data))
+}
+
+// targetBytesLocked reports the bytes currently queued for target.
+// Callers must hold m.mu.
+func (m *Mailbox) targetBytesLocked(target string) int64 {
+	var n int64
+	for _, entry := range m.entries[target] {
+		n += int64(len(entry.data))
+	}
+	return n
+}
+
+// evictTargetOldestLocked drops target's earliest-expiring entry and
+// reports whether one existed. Callers must hold m.mu.
+func (m *Mailbox) evictTargetOldestLocked(target string) bool {
+	entries := m.entries[target]
+	if len(entries) == 0 {
+		return false
+	}
+	oldest := 0
+	for i, entry := range entries {
+		if entry.expires.Before(entries[oldest].expires) {
+			oldest = i
+		}
+	}
+	m.bytes -= int64(len(entries[oldest].data))
+	entries = append(entries[:oldest], entries[oldest+1:]...)
+	if len(entries) == 0 {
+		delete(m.entries, target)
+	} else {
+		m.entries[target] = entries
+	}
+	return true
 }
 
 // Take removes and returns all queued entries for target in FIFO order.

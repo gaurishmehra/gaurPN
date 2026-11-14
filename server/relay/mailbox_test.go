@@ -9,7 +9,7 @@ import (
 )
 
 func TestMailboxPutTake(t *testing.T) {
-	m := NewMailbox(time.Hour, 1<<20)
+	m := NewMailbox(time.Hour, 1<<20, 0)
 	m.Put("a", []byte("one"))
 	m.Put("a", []byte("two"))
 	m.Put("b", []byte("three"))
@@ -27,7 +27,7 @@ func TestMailboxPutTake(t *testing.T) {
 }
 
 func TestMailboxTTL(t *testing.T) {
-	m := NewMailbox(10*time.Millisecond, 1<<20)
+	m := NewMailbox(10*time.Millisecond, 1<<20, 0)
 	m.Put("a", []byte("x"))
 	time.Sleep(20 * time.Millisecond)
 	if len(m.Take("a")) != 0 {
@@ -36,7 +36,7 @@ func TestMailboxTTL(t *testing.T) {
 }
 
 func TestMailboxByteCap(t *testing.T) {
-	m := NewMailbox(time.Hour, 10)
+	m := NewMailbox(time.Hour, 10, 0)
 	m.Put("a", []byte("12345"))
 	m.Put("b", []byte("67890"))
 	m.Put("c", []byte("abcde"))
@@ -48,7 +48,7 @@ func TestMailboxByteCap(t *testing.T) {
 }
 
 func TestMailboxOversizedEntryDropped(t *testing.T) {
-	m := NewMailbox(time.Hour, 10)
+	m := NewMailbox(time.Hour, 10, 0)
 	m.Put("a", bytes.Repeat([]byte("x"), 11))
 	if _, queued := m.Stats(); queued != 0 {
 		t.Fatalf("oversized entry was stored: %d bytes queued", queued)
@@ -56,7 +56,7 @@ func TestMailboxOversizedEntryDropped(t *testing.T) {
 }
 
 func TestMailboxPutEvictsOldestForNewcomer(t *testing.T) {
-	m := NewMailbox(time.Hour, 10)
+	m := NewMailbox(time.Hour, 10, 0)
 	m.Put("a", []byte("12345"))
 	m.Put("b", []byte("67890")) // exactly at cap
 	m.Put("c", []byte("abcde")) // must evict the oldest entry ("a")
@@ -69,8 +69,121 @@ func TestMailboxPutEvictsOldestForNewcomer(t *testing.T) {
 	}
 }
 
+// TestMailboxPerTargetCapDropsOversized covers MED-5: a single entry
+// larger than the per-target cap is dropped and logged, exactly like
+// the global-cap oversized rule.
+func TestMailboxPerTargetCapDropsOversized(t *testing.T) {
+	m := NewMailbox(time.Hour, 1<<20, 10)
+	m.Put("a", bytes.Repeat([]byte("x"), 11))
+	if _, queued := m.Stats(); queued != 0 {
+		t.Fatalf("per-target oversized entry was stored: %d bytes queued", queued)
+	}
+}
+
+// TestMailboxPerTargetCapEvictsOnlyThatTarget covers MED-5: when a
+// target is at its per-target cap, Put evicts that target's
+// earliest-expiry entries until the newcomer fits; other targets keep
+// their queues untouched.
+func TestMailboxPerTargetCapEvictsOnlyThatTarget(t *testing.T) {
+	m := NewMailbox(time.Hour, 1<<20, 10)
+	m.Put("a", []byte("12345")) // a: 5 bytes
+	m.Put("b", []byte("67890")) // b: 5 bytes
+	m.Put("a", []byte("abcde")) // a full at 10 bytes
+
+	// A third entry for "a" must evict a's earliest-expiry entry
+	// ("12345"), never "b".
+	m.Put("a", []byte("fghij"))
+
+	gotA := m.Take("a")
+	if len(gotA) != 2 || string(gotA[0]) != "abcde" || string(gotA[1]) != "fghij" {
+		t.Fatalf("target a = %q, want [abcde fghij] with the oldest evicted", gotA)
+	}
+	gotB := m.Take("b")
+	if len(gotB) != 1 || string(gotB[0]) != "67890" {
+		t.Fatalf("target b = %q, must be untouched by a's eviction", gotB)
+	}
+}
+
+// TestMailboxDefaultTargetCapIsFourMiB pins the -mailbox-max-target-bytes
+// default: the flag registers defaultMailboxMaxTargetBytes and the
+// constructor falls back to the same constant.
+func TestMailboxDefaultTargetCapIsFourMiB(t *testing.T) {
+	if defaultMailboxMaxTargetBytes != 4<<20 {
+		t.Fatalf("default per-target cap = %d, want 4 MiB", defaultMailboxMaxTargetBytes)
+	}
+	if m := NewMailbox(0, 0, 0); m.maxTargetBytes != 4<<20 {
+		t.Fatalf("NewMailbox default per-target cap = %d, want 4 MiB", m.maxTargetBytes)
+	}
+}
+
+// TestMailboxSweeperPrunesWithoutCalls covers MED-4: the background
+// sweeper prunes expired entries even when no Put/Take/Stats ever
+// touches the target again.
+func TestMailboxSweeperPrunesWithoutCalls(t *testing.T) {
+	orig := mailboxSweepInterval
+	mailboxSweepInterval = 10 * time.Millisecond
+	t.Cleanup(func() { mailboxSweepInterval = orig })
+
+	m := NewMailbox(20*time.Millisecond, 1<<20, 1<<20)
+	m.Start()
+	defer m.Close()
+
+	m.Put("a", []byte("x"))
+
+	// No mailbox call after the entry expires: only the sweeper can
+	// remove it. The entries map is inspected under the mutex instead
+	// of Stats, which would prune lazily and mask the sweeper.
+	time.Sleep(100 * time.Millisecond)
+
+	m.mu.Lock()
+	_, queued := m.entries["a"]
+	m.mu.Unlock()
+	if queued {
+		t.Fatal("expired entry survived without any mailbox call; the sweeper did not prune it")
+	}
+}
+
+// TestMailboxSweeperStopsOnClose covers MED-4: Close stops the
+// sweeper. An entry that expires after Close stays queued until some
+// mailbox call prunes it — and none runs.
+func TestMailboxSweeperStopsOnClose(t *testing.T) {
+	orig := mailboxSweepInterval
+	mailboxSweepInterval = 10 * time.Millisecond
+	t.Cleanup(func() { mailboxSweepInterval = orig })
+
+	// The TTL leaves ample margin between "the entry expired" and
+	// "a dangerous tick could fire": after Close the sweeper goroutine
+	// only has to observe the closed done channel once, well before the
+	// expiry, for the post-Close entry to be provably safe from it.
+	m := NewMailbox(40*time.Millisecond, 1<<20, 1<<20)
+	m.Start()
+
+	m.Put("a", []byte("x"))
+	time.Sleep(80 * time.Millisecond)
+	m.mu.Lock()
+	_, alive := m.entries["a"]
+	m.mu.Unlock()
+	if alive {
+		t.Fatal("sweeper did not prune an expired entry before Close")
+	}
+
+	// A fresh entry queued just before Close: it expires while the
+	// sweeper is already stopped, so only a mailbox call could remove
+	// it — and none runs.
+	m.Put("b", []byte("y"))
+	m.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	m.mu.Lock()
+	entries := m.entries["b"]
+	m.mu.Unlock()
+	if len(entries) != 1 {
+		t.Fatal("entry queued just before Close was pruned afterwards; the sweeper did not stop")
+	}
+}
+
 func TestMailboxDrainDeliversAndRemoves(t *testing.T) {
-	m := NewMailbox(time.Hour, 1<<20)
+	m := NewMailbox(time.Hour, 1<<20, 0)
 	m.Put("a", []byte("one"))
 	m.Put("a", []byte("two"))
 
@@ -88,7 +201,7 @@ func TestMailboxDrainDeliversAndRemoves(t *testing.T) {
 }
 
 func TestMailboxDrainStopsAtFirstFailure(t *testing.T) {
-	m := NewMailbox(time.Hour, 1<<20)
+	m := NewMailbox(time.Hour, 1<<20, 0)
 	m.Put("a", []byte("one"))
 	m.Put("a", []byte("two"))
 	m.Put("a", []byte("three"))
@@ -108,7 +221,7 @@ func TestMailboxDrainStopsAtFirstFailure(t *testing.T) {
 }
 
 func TestMailboxDrainPartialFailureKeepsOrder(t *testing.T) {
-	m := NewMailbox(time.Hour, 1<<20)
+	m := NewMailbox(time.Hour, 1<<20, 0)
 	m.Put("a", []byte("one"))
 	m.Put("a", []byte("two"))
 	m.Put("a", []byte("three"))
@@ -125,7 +238,7 @@ func TestMailboxDrainPartialFailureKeepsOrder(t *testing.T) {
 }
 
 func TestMailboxDrainSerializesPerTarget(t *testing.T) {
-	m := NewMailbox(time.Hour, 1<<20)
+	m := NewMailbox(time.Hour, 1<<20, 0)
 	m.Put("a", []byte("one"))
 	m.Put("a", []byte("two"))
 

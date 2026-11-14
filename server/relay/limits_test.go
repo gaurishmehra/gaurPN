@@ -13,7 +13,7 @@ import (
 )
 
 func TestWSRejectsInvalidIdentity(t *testing.T) {
-	hub := NewHub([]byte("secret"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("secret"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	badDeviceIDs := []string{
@@ -60,7 +60,7 @@ func TestWSRejectsInvalidIdentity(t *testing.T) {
 }
 
 func TestMaxPeersCap(t *testing.T) {
-	hub := NewHub([]byte("secret"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("secret"), mustChunkStore(t, "", 0, 0))
 	hub.SetMaxPeers(2)
 	defer hub.Close()
 
@@ -117,7 +117,7 @@ func TestMaxPeersCap(t *testing.T) {
 }
 
 func TestAuthFailureThrottle(t *testing.T) {
-	hub := NewHub([]byte("secret"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("secret"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	attempt := func(ip, token string) *httptest.ResponseRecorder {
@@ -158,7 +158,7 @@ func TestAuthFailureThrottle(t *testing.T) {
 }
 
 func TestAuthFailureWindowReset(t *testing.T) {
-	hub := NewHub([]byte("secret"), NewChunkStore("", 0, 0))
+	hub := NewHub([]byte("secret"), mustChunkStore(t, "", 0, 0))
 	defer hub.Close()
 
 	// Shrink the window under the limiter's mutex so the test need not wait

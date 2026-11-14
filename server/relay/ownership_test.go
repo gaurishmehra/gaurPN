@@ -33,7 +33,7 @@ func testCap(peerKey []byte, transferID, sessionID string) string {
 
 func TestChunkOwnershipAndCapabilities(t *testing.T) {
 	master := "ownership-master-token"
-	store := NewChunkStore("", 0, time.Hour)
+	store := mustChunkStore(t, "", 0, time.Hour)
 	hub := NewHub([]byte(master), store)
 	defer hub.Close()
 
@@ -140,7 +140,7 @@ func TestChunkOpenModeLogsOncePerTransfer(t *testing.T) {
 	defer log.SetOutput(os.Stderr)
 
 	master := "openmode-master-token"
-	store := NewChunkStore("", 0, time.Hour)
+	store := mustChunkStore(t, "", 0, time.Hour)
 	hub := NewHub([]byte(master), store)
 	defer hub.Close()
 

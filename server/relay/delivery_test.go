@@ -49,8 +49,8 @@ func TestMailboxSurvivesFailedJoin(t *testing.T) {
 	// 500ms write timeout still leaves ample headroom for the healthy
 	// rejoin to receive the 16 MiB envelope inside one deadline.
 	setWSLiveness(t, 50*time.Millisecond, time.Hour, 500*time.Millisecond)
-	mailbox := NewMailbox(time.Hour, 64<<20)
-	hub := NewHub([]byte("delivery-token"), NewChunkStore("", 0, 0), mailbox)
+	mailbox := NewMailbox(time.Hour, 64<<20, 64<<20)
+	hub := NewHub([]byte("delivery-token"), mustChunkStore(t, "", 0, 0), mailbox)
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))
@@ -108,8 +108,8 @@ func TestSealedForwardRequeuesToPresentButDeadPeer(t *testing.T) {
 	// No ping drops and a long read window so the dead peer stays
 	// "present"; only the write timeout is short.
 	setWSLiveness(t, time.Hour, time.Hour, 500*time.Millisecond)
-	mailbox := NewMailbox(time.Hour, 64<<20)
-	hub := NewHub([]byte("delivery-token"), NewChunkStore("", 0, 0), mailbox)
+	mailbox := NewMailbox(time.Hour, 64<<20, 64<<20)
+	hub := NewHub([]byte("delivery-token"), mustChunkStore(t, "", 0, 0), mailbox)
 	defer hub.Close()
 
 	server := httptest.NewServer(http.HandlerFunc(hub.handleWS))

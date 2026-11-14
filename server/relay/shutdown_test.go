@@ -19,7 +19,7 @@ func TestGracefulShutdown(t *testing.T) {
 	shutdownTimeout = 2 * time.Second
 	t.Cleanup(func() { shutdownTimeout = orig })
 
-	chunks := NewChunkStore("", 0, 0)
+	chunks := mustChunkStore(t, "", 0, 0)
 	hub := NewHub([]byte("shutdown-token"), chunks)
 	defer hub.Close() // sync.Once: shutdownRelay already ran this
 

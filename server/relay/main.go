@@ -246,9 +246,11 @@ func (fw *flushWriter) Write(p []byte) (n int, err error) {
 
 func NewHub(token []byte, chunks *ChunkStore, mailboxes ...*Mailbox) *Hub {
 	if chunks == nil {
-		chunks = NewChunkStore("", 0, 0)
+		// Memory-only fallback. An empty dir performs no disk setup, so
+		// this construction cannot fail.
+		chunks, _ = NewChunkStore("", 0, 0)
 	}
-	mailbox := NewMailbox(time.Hour, 16<<20)
+	mailbox := NewMailbox(defaultMailboxTTL, defaultMailboxMaxBytes, defaultMailboxMaxTargetBytes)
 	if len(mailboxes) > 0 && mailboxes[0] != nil {
 		mailbox = mailboxes[0]
 	}
@@ -274,6 +276,11 @@ func NewHub(token []byte, chunks *ChunkStore, mailboxes ...*Mailbox) *Hub {
 			},
 		},
 	}
+	// The mailbox prunes expired entries in the background; lazy
+	// pruning on Put/Take/Stats alone would let entries for
+	// never-touched targets linger in RAM until a health poll.
+	// hub.Close stops the sweeper.
+	h.mailbox.Start()
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -324,6 +331,9 @@ func (h *Hub) Close() {
 		close(h.done)
 		if h.chunks != nil {
 			h.chunks.Close()
+		}
+		if h.mailbox != nil {
+			h.mailbox.Close()
 		}
 	})
 }
@@ -849,7 +859,9 @@ func (h *Hub) handleChunkPut(w http.ResponseWriter, r *http.Request) {
 	// The first PUT carrying a device_id claims ownership for that device.
 	// Recording happens once the request is authorized, before the body is
 	// read: ownership is write-once and never overwritten, even if this PUT
-	// later fails on chunk size.
+	// later fails on chunk size or the store's byte cap. Ownership alone
+	// never grants admission: the cap check in Put keys on staged chunks,
+	// so a PUT refused with 507 stays refused on retry.
 	if deviceID := strings.TrimSpace(r.URL.Query().Get("device_id")); deviceID != "" {
 		h.chunks.RecordOwner(key, deviceID)
 	}
@@ -859,7 +871,21 @@ func (h *Hub) handleChunkPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.chunks.Put(key, index, body); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		// Map the store's error classes to honest status codes:
+		// 507 cap-exceeded, 413 oversized, 500 disk I/O, 400
+		// validation. Disk errors are logged server-side but answered
+		// with a generic body so filesystem paths stay internal.
+		switch {
+		case errors.Is(err, errCapExceeded):
+			http.Error(w, err.Error(), http.StatusInsufficientStorage)
+		case errors.Is(err, errOversized):
+			http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+		case errors.Is(err, errDiskIO):
+			log.Printf("[CHUNK] Staging failed for %s index %d: %v", key, index, err)
+			http.Error(w, "Chunk staging failed", http.StatusInternalServerError)
+		default:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1092,8 +1118,9 @@ func main() {
 	chunkDir := flag.String("chunk-dir", filepath.Join(os.TempDir(), "gaur-relay-chunks"), "Directory for resumable chunk staging (empty = memory only)")
 	chunkMax := flag.Int64("chunk-max-bytes", 8<<30, "Maximum bytes of staged chunks across all transfers")
 	chunkTTL := flag.Duration("chunk-ttl", 24*time.Hour, "Idle time before a staged transfer is evicted")
-	mailboxTTL := flag.Duration("mailbox-ttl", time.Hour, "How long sealed messages for offline peers are held")
-	mailboxMax := flag.Int64("mailbox-max-bytes", 16<<20, "Maximum bytes of queued sealed messages")
+	mailboxTTL := flag.Duration("mailbox-ttl", defaultMailboxTTL, "How long sealed messages for offline peers are held")
+	mailboxMax := flag.Int64("mailbox-max-bytes", defaultMailboxMaxBytes, "Maximum bytes of queued sealed messages")
+	mailboxMaxTarget := flag.Int64("mailbox-max-target-bytes", defaultMailboxMaxTargetBytes, "Maximum bytes of queued sealed messages per target device (0 = default 4 MiB)")
 	maxPeers := flag.Int("max-peers", defaultMaxPeers, "Maximum number of distinct online devices (0 = unlimited)")
 	initMode := flag.Bool("init", false, "Generate a cluster token, write it, print a pairing QR, and exit")
 	qrMode := flag.Bool("qr", false, "Print a pairing QR for the existing token and exit")
@@ -1121,8 +1148,11 @@ func main() {
 		log.Fatalf("[FATAL] %v", err)
 	}
 
-	chunks := NewChunkStore(*chunkDir, *chunkMax, *chunkTTL)
-	mailbox := NewMailbox(*mailboxTTL, *mailboxMax)
+	chunks, err := NewChunkStore(*chunkDir, *chunkMax, *chunkTTL)
+	if err != nil {
+		log.Fatalf("[FATAL] %v", err)
+	}
+	mailbox := NewMailbox(*mailboxTTL, *mailboxMax, *mailboxMaxTarget)
 	hub := NewHub([]byte(token), chunks, mailbox)
 	hub.SetMaxPeers(*maxPeers)
 	// shutdownRelay calls hub.Close itself; sync.Once makes this deferred
