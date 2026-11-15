@@ -678,7 +678,14 @@ another cluster device's files in its own UI and fetch what it picks.
 - **Android**: media collections as virtual roots — `Pictures`, `DCIM`,
   `Download`, `Documents`, `Movies`, `Music` — listed via MediaStore
   (`RELATIVE_PATH` prefix grouping, SQL LIMIT, LIKE-escaped). A file's fetch
-  path is its `RELATIVE_PATH + DISPLAY_NAME`.
+  path is its `RELATIVE_PATH + DISPLAY_NAME`. When the user grants **All
+  files access** (Settings → Transfers → All files access,
+  `MANAGE_EXTERNAL_STORAGE`), a seventh root `Storage` appears that serves
+  the entire shared-storage volume via the File API — including other apps'
+  non-media files — with the same dotfile/symlink/containment rules as the
+  desktop. Without it, Android 13+ media-visibility rules limit the media
+  collections to what the provider exposes (other apps' non-media files
+  stay invisible).
 
 ### Authorization — read this
 

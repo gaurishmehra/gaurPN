@@ -1116,6 +1116,11 @@ object RelayManager {
      * toggle says — and every accepted request is additionally bounded by a
      * per-requester window, a phone-wide budget, and a worker cap. Every
      * refusal is a `browse_listing` carrying an error, never silence.
+     *
+     * With all-files access granted, the Storage root exposes the ENTIRE
+     * shared storage, not just MediaStore rows. That is the explicit,
+     * user-granted intent of the feature: the trust requirement is the gate
+     * and the per-device cluster key (v4) is the hard boundary.
      */
     private suspend fun handleIncomingBrowse(context: Context, inner: JSONObject) {
         val browse = RequestCodec.parseBrowse(inner) ?: return
@@ -1147,11 +1152,24 @@ object RelayManager {
             return
         }
 
-        // A path outside the six virtual collections cannot exist; answer
-        // not_found instead of querying for it.
-        if (browse.path.isNotEmpty() &&
-            MediaCollection.forRoot(browse.path.substringBefore('/')) == null
-        ) {
+        // A path outside every root cannot exist; answer not_found instead of
+        // querying for it. Storage is only a root while all-files access
+        // makes the whole shared volume readable, and a Storage path that
+        // fails the dotfile/segment policy is treated the same as an unknown
+        // root: neither could have come from a listing.
+        val backend = if (browse.path.isEmpty()) {
+            null
+        } else {
+            BrowseListingBuilder.backendFor(browse.path)
+        }
+        if (browse.path.isNotEmpty() && backend == null) {
+            sendListingError(
+                context, browse.requesterId, browse.requestId, browse.path,
+                BrowseError.NOT_FOUND,
+            )
+            return
+        }
+        if (backend == BrowseBackend.STORAGE && !hasAllFilesAccess()) {
             sendListingError(
                 context, browse.requesterId, browse.requestId, browse.path,
                 BrowseError.NOT_FOUND,
@@ -1223,6 +1241,13 @@ object RelayManager {
      * like browse: only an explicitly trusted device is served. One fetch
      * runs at a time; the lease is held until the send job finishes, so a
      * second fetch cannot cancel the first mid-flight.
+     *
+     * With all-files access granted, a `Storage/...` path can name ANY file in
+     * shared storage, not just a MediaStore row. That is the explicit,
+     * user-granted intent of the feature: the trust requirement is the gate
+     * and the per-device cluster key (v4) is the hard boundary. Every path is
+     * still canonicalized inside the storage root, so an escape resolves to
+     * not_found exactly like a missing file.
      */
     private suspend fun handleIncomingFetch(
         context: Context,
@@ -1281,7 +1306,7 @@ object RelayManager {
             val resolved = fetch.paths.map { BrowseSource.resolve(context, it) }
             val rejection = FetchValidation.validate(
                 paths = fetch.paths,
-                sizes = resolved.map { it?.row?.size },
+                sizes = resolved.map { it?.size },
             )
             if (rejection != null) {
                 sendDecline(context, fetch.requesterId, fetch.requestId, rejection.reason)

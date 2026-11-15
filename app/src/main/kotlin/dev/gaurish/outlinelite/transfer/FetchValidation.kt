@@ -45,6 +45,13 @@ internal object FetchValidation {
         if (paths.any { path -> path.split('/').any { it.length > MAX_SEGMENT_CHARS } }) {
             return FetchRejection.INVALID_PATH
         }
+        // A path outside every root could never have come from a listing.
+        // The Storage policy also rejects dotfiles and ".." segments, so a
+        // fetch cannot probe outside the shared-storage root; anything that
+        // still resolves out of bounds fails later as not_found.
+        if (paths.any { BrowseListingBuilder.backendFor(it) == null }) {
+            return FetchRejection.NOT_FOUND
+        }
         var total = 0L
         for (size in sizes) {
             val bytes = size ?: return FetchRejection.NOT_FOUND

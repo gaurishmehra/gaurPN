@@ -122,4 +122,67 @@ class FetchValidationTest {
         assertEquals(32, FetchValidation.MAX_PATHS)
         assertEquals(4L * 1024 * 1024 * 1024, FetchValidation.MAX_TOTAL_BYTES)
     }
+
+    @Test
+    fun storagePathsAreAccepted() {
+        assertNull(
+            FetchValidation.validate(
+                listOf("Storage/Download/manual.pdf", "Storage/DCIM/Camera/IMG_1.jpg"),
+                listOf(1L, 2L),
+            ),
+        )
+    }
+
+    @Test
+    fun storageEscapesAreNotFound() {
+        val rejected = listOf(
+            "Storage/../etc/passwd",
+            "Storage/Download/../Documents",
+            "Storage/.hidden",
+            "Storage/Download/.hidden",
+            "Storage//manual.pdf",
+            "Storage/",
+        )
+        for (path in rejected) {
+            assertEquals(
+                path,
+                FetchRejection.NOT_FOUND,
+                FetchValidation.validate(listOf(path), listOf(1L)),
+            )
+        }
+    }
+
+    @Test
+    fun unknownRootIsNotFound() {
+        assertEquals(
+            FetchRejection.NOT_FOUND,
+            FetchValidation.validate(listOf("Bogus/a.txt"), listOf(1L)),
+        )
+    }
+
+    @Test
+    fun storageBatchesKeepTheSameCaps() {
+        val storagePaths = (0 until 33).map { "Storage/Download/f-$it.pdf" }
+        assertEquals(
+            FetchRejection.INVALID_COUNT,
+            FetchValidation.validate(storagePaths, List(33) { 1L }),
+        )
+        assertEquals(
+            FetchRejection.TOO_LARGE,
+            FetchValidation.validate(
+                listOf("Storage/Download/a.pdf", "Storage/Download/b.pdf"),
+                listOf(FetchValidation.MAX_TOTAL_BYTES, 1L),
+            ),
+        )
+        assertEquals(
+            FetchRejection.INVALID_PATH,
+            FetchValidation.validate(
+                listOf(
+                    "Storage/Download/" +
+                        "x".repeat(FetchValidation.MAX_SEGMENT_CHARS + 1),
+                ),
+                listOf(1L),
+            ),
+        )
+    }
 }
