@@ -19,3 +19,4 @@ dist/
 desktop-client/gaur-share
 desktop-client/gaur-share.exe
 server/relay/gaur-relay
+__pycache__/
