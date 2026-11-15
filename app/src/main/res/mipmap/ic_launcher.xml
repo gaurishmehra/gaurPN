@@ -20,16 +20,16 @@
             <!-- body + stinger (solid) -->
             <path
                 android:fillColor="#FFFFFF"
-                android:pathData="M210,225a32,38 0 1,0 64,0a32,38 0 1,0 -64,0" />
+                android:pathData="M178,225a32,38 0 1,0 64,0a32,38 0 1,0 -64,0" />
             <path
                 android:fillColor="#FFFFFF"
-                android:pathData="M210,280a28,13 0 1,0 56,0a28,13 0 1,0 -56,0" />
+                android:pathData="M182,280a28,13 0 1,0 56,0a28,13 0 1,0 -56,0" />
             <path
                 android:fillColor="#FFFFFF"
-                android:pathData="M210,306a23,11 0 1,0 46,0a23,11 0 1,0 -46,0" />
+                android:pathData="M187,306a23,11 0 1,0 46,0a23,11 0 1,0 -46,0" />
             <path
                 android:fillColor="#FFFFFF"
-                android:pathData="M210,328a17,9 0 1,0 34,0a17,9 0 1,0 -34,0" />
+                android:pathData="M193,328a17,9 0 1,0 34,0a17,9 0 1,0 -34,0" />
             <path
                 android:fillColor="#FFFFFF"
                 android:pathData="M201,108Q199,134 196,150Q214,134 219,108Z" />
