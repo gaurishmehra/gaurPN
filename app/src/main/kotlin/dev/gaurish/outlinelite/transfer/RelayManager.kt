@@ -1443,6 +1443,7 @@ object RelayManager {
                 publishStatus(sample)
             }
         }
+        var initialSample: BatterySample? = null
         synchronized(statusLock) {
             unregisterStatusReceiverLocked()
             // Set the key before registering: the sticky broadcast may be
@@ -1459,11 +1460,27 @@ object RelayManager {
             }.isSuccess
             if (registered) {
                 statusReceiver = receiver
+                // API 34+ does not deliver the sticky initial value to a
+                // context-registered receiver on registration — query it
+                // directly so the first sample publishes deterministically
+                // on every Android version.
+                val sticky = runCatching {
+                    appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+                }.getOrNull()
+                if (sticky?.action == Intent.ACTION_BATTERY_CHANGED) {
+                    initialSample = BatteryStatus.fromExtras(
+                        level = sticky.getIntExtra(BatteryManager.EXTRA_LEVEL, -1),
+                        scale = sticky.getIntExtra(BatteryManager.EXTRA_SCALE, -1),
+                        status = sticky.getIntExtra(BatteryManager.EXTRA_STATUS, -1),
+                    )
+                }
             } else {
                 statusContext = null
                 statusPeerKey = null
             }
         }
+        // Publish outside the lock — publishStatus takes statusLock itself.
+        initialSample?.let { publishStatus(it) }
     }
 
     /** Unregisters the battery receiver; safe to call when none is registered. */
