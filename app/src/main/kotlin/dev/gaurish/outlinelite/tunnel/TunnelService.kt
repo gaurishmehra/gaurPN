@@ -71,11 +71,6 @@ class TunnelService : VpnService() {
     private var watchdog: Job? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var currentNetwork: Network? = null
-
-    /** UDP-relay probe cache: result, keyed to the active network, with TTL. */
-    private data class UdpProbe(val network: Any?, val works: Boolean, val at: Long)
-
-    @Volatile private var udpProbeCache: UdpProbe? = null
     private var debounceJob: Job? = null
 
     @Volatile
@@ -213,32 +208,17 @@ class TunnelService : VpnService() {
         }
         tunPfd = pfd
         // Go does not own the fd: the caller closes it (see the AAR docs).
-        // Probe the SS UDP relay against the VPN's ACTUAL resolver before
-        // connecting: carrier CGNATs or private-destination relays kill UDP
-        // DNS, and with UDP force-enabled DNS dies entirely. When the relay
-        // is dead, connect with UDP off so the engine's DNS-over-TCP
-        // fallback serves queries instead.
-        val probeResolver = dnsServers.firstOrNull { !it.contains(":") } ?: "1.1.1.1"
-        val activeNet = currentNetwork
-        val cached = udpProbeCache
-        val udpWorks = if (cached != null && cached.network == activeNet &&
-            SystemClock.elapsedRealtime() - cached.at < UDP_PROBE_CACHE_MS
-        ) {
-            Log.i(TAG, "udp relay probe: cached (${cached.works})")
-            cached.works
-        } else {
-            val result = runCatching {
-                Outlinev.checkUDPConnectivity(configJson, protector, probeResolver)
-            }.onFailure { Log.i(TAG, "udp relay probe error: ${it.message}") }
-                .getOrDefault(true)
-            udpProbeCache = UdpProbe(activeNet, result, SystemClock.elapsedRealtime())
-            Log.i(
-                TAG,
-                "udp relay probe ($probeResolver): " +
-                    if (result) "ok" else "failed — dns-over-tcp fallback enabled",
-            )
-            result
-        }
+        //
+        // UDP is DISABLED on the tunnel: on several devices the engine's
+        // lwIP→SS-UDP relay silently swallows packets (the direct dialer
+        // probe succeeds while engine-relayed DNS never reaches the server),
+        // which kills DNS and therefore all browsing. With UDP off, the
+        // engine's dnsfallback handler answers UDP:53 queries with a
+        // truncated (TC) response so resolvers retry over TCP — and TCP
+        // through the SS relay is rock solid (the whole cluster rides it).
+        // Non-DNS UDP (QUIC) falls back to TCP in clients, at a small latency
+        // cost. Revisit if the engine's UDP relay is ever fixed upstream.
+        val udpWorks = false
         val tunnel = Outlinev.connectTunnel(pfd.getFd().toLong(), configJson, protector, udpWorks)
         if (gen != generation || userStopped) {
             Log.i(TAG, "connect superseded (gen $gen) — releasing, current gen $generation")
@@ -390,7 +370,6 @@ class TunnelService : VpnService() {
                     val sameTransport = previous != null &&
                         transportsOf(cm, previous) == transportsOf(cm, network)
                     if (!sameTransport) {
-                        udpProbeCache = null // different uplink: re-probe UDP
                         scheduleDebouncedBounce()
                         return
                     }
