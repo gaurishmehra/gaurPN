@@ -701,10 +701,10 @@ identity keys (protocol v4) are the planned hard boundary.
   per 30 s, ≤32 paths, ≤4 GiB total (both ends enforce), 30-minute send
   bound, and a receive-side cap on the requester.
 - Requester UIs: Android gets a full-screen browser (breadcrumb, multi-select,
-  download bar); the desktop gets `gaur-share browse <target> [path] [--json]`,
-  `gaur-share fetch <target> <path>...`, and the web UI
-  (`gaur-share ui`, fixed port `127.0.0.1:9877`, `--open`) with a browse
-  pane. The old `gaur-share request` command is gone; `screenshot <target>`
+  download bar); the desktop gets a native GTK/libadwaita window
+  (`gaur-browse [target]`, installed from `desktop-client/gaur-browse.py`)
+  that follows the system theme, plus the `browse`/`fetch`/`screenshot` CLI
+  commands. The old `gaur-share request` command is gone; `screenshot <target>`
   remains the quick action for the newest phone screenshot.
 
 ---

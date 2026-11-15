@@ -353,8 +353,8 @@ gaur-share notify --all "Build finished" "The release APK is ready"
 gaur-share browse "Pixel 8"            # list the phone's media collections
 gaur-share fetch "Pixel 8" "Pictures/Screenshots/Screenshot_01.png"
 
-# Or use the local web UI (Quickshell's Request button opens it)
-gaur-share ui --open
+# Or use the native GTK window (Quickshell's Request button opens it)
+gaur-browse "Pixel 8"
 
 # Ask a phone for its latest screenshot (quick action)
 gaur-share screenshot "Pixel 8"
