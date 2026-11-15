@@ -71,6 +71,11 @@ class TunnelService : VpnService() {
     private var watchdog: Job? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var currentNetwork: Network? = null
+
+    /** UDP-relay probe cache: result, keyed to the active network, with TTL. */
+    private data class UdpProbe(val network: Any?, val works: Boolean, val at: Long)
+
+    @Volatile private var udpProbeCache: UdpProbe? = null
     private var debounceJob: Job? = null
 
     @Volatile
@@ -208,15 +213,31 @@ class TunnelService : VpnService() {
         }
         tunPfd = pfd
         // Go does not own the fd: the caller closes it (see the AAR docs).
-        // Probe the SS UDP relay before connecting: carrier CGNATs often drop
-        // it, and with UDP force-enabled DNS dies (the engine relays resolver
-        // traffic over UDP). When the relay is dead, connect with UDP off so
-        // the engine's DNS-over-TCP fallback serves queries instead.
-        val udpWorks = runCatching {
-            Outlinev.checkUDPConnectivity(configJson, protector)
-        }.getOrDefault(true)
-        if (!udpWorks) {
-            Log.i(TAG, "udp relay unreachable — enabling dns-over-tcp fallback")
+        // Probe the SS UDP relay against the VPN's ACTUAL resolver before
+        // connecting: carrier CGNATs or private-destination relays kill UDP
+        // DNS, and with UDP force-enabled DNS dies entirely. When the relay
+        // is dead, connect with UDP off so the engine's DNS-over-TCP
+        // fallback serves queries instead.
+        val probeResolver = dnsServers.firstOrNull { !it.contains(":") } ?: "1.1.1.1"
+        val activeNet = currentNetwork
+        val cached = udpProbeCache
+        val udpWorks = if (cached != null && cached.network == activeNet &&
+            SystemClock.elapsedRealtime() - cached.at < UDP_PROBE_CACHE_MS
+        ) {
+            Log.i(TAG, "udp relay probe: cached (${cached.works})")
+            cached.works
+        } else {
+            val result = runCatching {
+                Outlinev.checkUDPConnectivity(configJson, protector, probeResolver)
+            }.onFailure { Log.i(TAG, "udp relay probe error: ${it.message}") }
+                .getOrDefault(true)
+            udpProbeCache = UdpProbe(activeNet, result, SystemClock.elapsedRealtime())
+            Log.i(
+                TAG,
+                "udp relay probe ($probeResolver): " +
+                    if (result) "ok" else "failed — dns-over-tcp fallback enabled",
+            )
+            result
         }
         val tunnel = Outlinev.connectTunnel(pfd.getFd().toLong(), configJson, protector, udpWorks)
         if (gen != generation || userStopped) {
@@ -346,6 +367,9 @@ class TunnelService : VpnService() {
     /**
      * Watches for real internet networks while the tunnel is up.
      * Uses active network tracking and a 1s debounce to rebuild quickly on genuine network transitions.
+     * Same-transport agent churn (common on cellular + hotspot) does NOT
+     * rebuild blindly: the tunnel is health-checked first, because a rebuild
+     * costs a full reconnect — visible as a connect loop.
      */
     private fun startNetworkMonitoring() {
         runCatching {
@@ -359,10 +383,35 @@ class TunnelService : VpnService() {
                 .build()
             val callback = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    if (network != currentNetwork) {
-                        currentNetwork = network
-                        updateUnderlyingNetworks(network)
+                    if (network == currentNetwork) return
+                    val previous = currentNetwork
+                    currentNetwork = network
+                    updateUnderlyingNetworks(network)
+                    val sameTransport = previous != null &&
+                        transportsOf(cm, previous) == transportsOf(cm, network)
+                    if (!sameTransport) {
+                        udpProbeCache = null // different uplink: re-probe UDP
                         scheduleDebouncedBounce()
+                        return
+                    }
+                    // Agent churn on the same uplink: verify the tunnel still
+                    // reaches the server before tearing it down.
+                    val cfg = activeConfig
+                    if (cfg == null) {
+                        scheduleDebouncedBounce()
+                        return
+                    }
+                    val gen = generation
+                    serviceScope.launch(tunnelDispatcher) {
+                        val healthy = runCatching {
+                            Outlinev.checkServerReachable(cfg.first, protector)
+                        }.isSuccess
+                        if (!healthy && gen == generation && network == currentNetwork) {
+                            Log.i(TAG, "network churn broke the tunnel — rebuilding")
+                            scheduleDebouncedBounce()
+                        } else {
+                            Log.i(TAG, "network agent churn — tunnel healthy, not bouncing")
+                        }
                     }
                 }
                 override fun onLost(network: Network) {
@@ -375,6 +424,17 @@ class TunnelService : VpnService() {
             }
             cm.registerNetworkCallback(request, callback)
             netCallback = callback
+        }
+    }
+
+    private fun transportsOf(cm: ConnectivityManager, network: Network): Set<Int> {
+        val caps = runCatching { cm.getNetworkCapabilities(network) }.getOrNull()
+            ?: return emptySet()
+        return buildSet {
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) add(NetworkCapabilities.TRANSPORT_CELLULAR)
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) add(NetworkCapabilities.TRANSPORT_WIFI)
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) add(NetworkCapabilities.TRANSPORT_ETHERNET)
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) add(NetworkCapabilities.TRANSPORT_VPN)
         }
     }
 
@@ -655,6 +715,9 @@ class TunnelService : VpnService() {
         private const val NOTIFICATION_ID = 4041
         private const val MTU = 1400
         private const val TAG = "gaurPN"
+
+        /** How long a UDP-relay probe result stays valid for the same network. */
+        private const val UDP_PROBE_CACHE_MS = 60_000L
 
         const val ACTION_START = "dev.gaurish.outlinelite.action.START"
         const val ACTION_STOP = "dev.gaurish.outlinelite.action.STOP"

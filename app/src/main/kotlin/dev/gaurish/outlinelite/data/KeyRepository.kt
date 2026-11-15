@@ -76,10 +76,12 @@ object KeyRepository {
 
     /**
      * AdGuard Home on the VPS, reached through the Shadowsocks tunnel.
-     * The VPS private address is stable and is forced into the tunnel with a
-     * /32 route, so LAN bypass cannot steal it.
+     * The address is a loopback alias on the VPS in the TEST-NET-2 range:
+     * unlike RFC 1918 addresses, the Shadowsocks UDP relay forwards to it,
+     * so DNS keeps the fast UDP path instead of falling back over TCP.
      */
-    const val DEFAULT_DNS_SERVERS = "10.0.0.182"
+    const val DEFAULT_DNS_SERVERS = "198.51.100.1"
+    const val LEGACY_DNS_SERVERS = "10.0.0.182"
 
     fun observeRelayAddress(context: Context): Flow<String> =
         context.dataStore.data.map { it[RELAY_ADDR] ?: DEFAULT_RELAY_ADDR }
@@ -307,10 +309,21 @@ object KeyRepository {
     }
 
     fun observeDnsServers(context: Context): Flow<String> =
-        context.dataStore.data.map { it[DNS_SERVERS] ?: DEFAULT_DNS_SERVERS }
+        context.dataStore.data.map { prefs ->
+            // 10.0.0.182 was the pre-v3.2.2 default AND the VPS's real
+            // interface address (never a true loopback alias): the SS UDP
+            // relay refuses RFC 1918 destinations, so DNS fell back to slow
+            // TCP. Remap it to the current default.
+            when (prefs[DNS_SERVERS]) {
+                null, LEGACY_DNS_SERVERS -> DEFAULT_DNS_SERVERS
+                else -> prefs[DNS_SERVERS]!!
+            }
+        }
 
     suspend fun getDnsServers(context: Context): String =
-        context.dataStore.data.first()[DNS_SERVERS] ?: DEFAULT_DNS_SERVERS
+        context.dataStore.data.first()[DNS_SERVERS]?.let {
+            if (it == LEGACY_DNS_SERVERS) DEFAULT_DNS_SERVERS else it
+        } ?: DEFAULT_DNS_SERVERS
 
     suspend fun setDnsServers(context: Context, servers: String) {
         context.dataStore.edit { prefs -> prefs[DNS_SERVERS] = servers.trim() }
