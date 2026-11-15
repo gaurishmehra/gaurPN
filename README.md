@@ -1,67 +1,66 @@
 # gaurPN
 
-**One private network for every device you own.**
+Your phone, your laptop, your desktop. One private network.
 
-gaurPN is a self-hosted ecosystem that keeps your phone, laptop, and desktop connected to each other — and to the open internet — no matter where you are, without surrendering a single byte of visibility to anyone else. A custom Android VPN client, a desktop companion, and a zero-knowledge relay on your own VPS work together as one system: your traffic tunnels through Shadowsocks to a server you control, and everything shared between your devices is end-to-end encrypted before it ever leaves them.
+gaurPN turns a Shadowsocks VPS into a home for every device you carry. The Android app is the VPN. The desktop binary is the companion. The relay on your server routes ciphertext between them. Connect once and your devices find each other through the tunnel: send files, sync the clipboard, mirror notifications, control media, pull a screenshot off your phone while you sit at your desk. Every payload is end-to-end encrypted before it leaves the device, and the relay in the middle holds no keys.
 
-No accounts. No telemetry. No third-party servers. Just your devices, your tunnel, your keys.
+## The pieces
 
-## The ecosystem
+| | Runs on | Job |
+|---|---|---|
+| **gaurPN** | Android | Shadowsocks VPN with a Quick Settings tile, per-app split tunneling, and LAN bypass, plus the cluster UI: peer cards, transfers, clipboard, notifications |
+| **gaur-share** | Linux, macOS, Windows | One Go binary that sends and receives files, text, notifications, clipboard, and media commands. CLI, local web UI, or your desktop shell |
+| **gaur-relay** | Your VPS | Loopback-only daemon that routes ciphertext between your devices and queues sealed envelopes for offline ones. TTL and byte caps evict everything |
 
-Three surfaces, one network:
+## Why it exists
 
-- **gaurPN (Android)** — the VPN client and your always-on link back to the cluster. Connects with one tap or a Quick Settings tile, reconnects on its own when the network drops, and routes every packet through a protected Go tunnel engine. On top of the VPN it carries the cluster experience: live peer cards, file transfers, clipboard sync, notification mirroring, and media control.
-- **gaur-share (Linux / macOS / Windows)** — a single standalone Go binary that plugs any desktop into the same cluster. It receives files, sends text and links, mirrors notifications, syncs the clipboard, and lets you browse and pull files from your other devices — driven by a CLI, a local browser UI, or your desktop shell.
-- **gaur-relay (your VPS)** — a tiny Go daemon bound to loopback on your own server, reachable only through the tunnel. It routes opaque ciphertext between your devices and holds sealed envelopes for offline ones. It has no keys, cannot decrypt anything, and forgets everything on a TTL.
+Your devices should talk to each other through a server you pay for. gaurPN keeps that promise: the relay sees transfer IDs and ciphertext, files stream from sender to receiver with no plaintext at the hop, and nothing backs up to anyone's cloud. DNS goes through AdGuard Home on your VPS, so no public resolver logs your queries. There are no accounts because there is nothing to sign into. The cluster token lives on your server and your devices, and that is the whole user database.
 
-Everything between them rides one Shadowsocks tunnel. Your devices find each other through it, share through it, and stay reachable through it — at home, on hotel Wi-Fi, or on mobile data — and nothing about that sharing ever touches a LAN broadcast domain or a cloud service.
+## Highlights
 
-## What it does
+- **One tunnel for everything.** The VPN, file transfers, clipboard, and notifications ride the same Shadowsocks connection. No mDNS, no LAN broadcasts, no extra ports.
+- **End-to-end encrypted.** Ephemeral ECDH (P-256), HKDF-SHA256, AES-256-GCM with per-chunk AAD. The relay stores bytes it cannot read.
+- **Sealed sender.** The relay routes by target and kind. It never learns who sent a file, what the file is named, or what is inside.
+- **Resumable.** Transfers are keyed by `HMAC(K_peer, sha256(file))`. Drop your connection mid-transfer and the retry uploads only the missing chunks. "Sent" appears after the receiver decrypted and saved the file, never before.
+- **Works while you're away.** Send to a device that is offline; the relay holds a sealed envelope in a TTL-capped mailbox and delivers on reconnect.
+- **Browse and pull.** Open any trusted device's files from your screen and fetch what you want. Every fetch notifies the target.
+- **Clipboard that follows you.** Copy on the phone, paste on the laptop. Text and images, newest clip wins, passwords and OTP codes skipped by default.
+- **Zero telemetry.** No trackers, no analytics, no third-party calls. Keys stay in Android Keystore and never leave your devices.
 
-### VPN Core
-- **Protected Go Engine**: Runs Jigsaw's lwIP TUN stack and Shadowsocks proxy via a custom Go JNI wrapper (`go/outlinev`).
-- **Loop-Free Sockets**: Binds every outbound socket to `VpnService.protect()` using `intra/protect.MakeDialer`, preventing routing loops.
-- **System DNS**: Resolves DNS queries through protected system resolvers without leaks.
-- **Reliable Lifecycle**: Automatic reconnect with exponential backoff, battery-optimization exemption shortcut, and optional start-on-boot.
-- **Quick Settings Tile**: Instant two-way toggle from the system notification shade.
-- **ss:// Import**: Deep link and clipboard parser supporting SIP002 URIs, percent-encoded userinfo, IPv6 host brackets, legacy base64 strings, and port bounds checking.
-- **Kill Switch**: Keeps the TUN interface up while reconnecting, so packets are dropped instead of escaping directly during the backoff window.
-- **DNS Through the Tunnel**: Queries go to AdGuard Home on the VPS over the Shadowsocks tunnel, not to a public resolver. The default is `10.0.0.182`; it is configurable and forced into the tunnel with a host route.
-- **IPv6-Aware LAN Bypass**: When LAN access is enabled, IPv4 private ranges and IPv6 link-local/ULA/multicast stay local while global IPv6 unicast remains tunneled.
+---
 
-### Staying connected across devices (`gaur-share`)
-- **Zero Local Wi-Fi Leakage**: All cluster traffic stays inside the Shadowsocks tunnel. No mDNS, no Bonjour, no ARP broadcasts, and no UDP hole punching on your local network.
-- **Double Encryption**: Outer Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`) wraps an inner layer of ephemeral ECDH (NIST P-256) key exchange, HKDF-SHA256 session key derivation, and authenticated AES-256-GCM chunked streaming (1 MiB chunks, index-bound nonces, per-chunk AAD).
-- **Content-Addressed Resume**: Transfers are keyed by `HMAC(K_peer, sha256(file))`, so the same bytes always resume the same transfer. The receiver keeps a `.part` file and a chunk bitmap in `Downloads`; a dropped connection re-uploads only the missing chunks. A signed completion receipt means "Sent" only after the receiver decrypted and saved the file.
-- **Zero-Knowledge Dual-Key Architecture**: Derives separate relay presence keys ($K_{relay}$) and local peer authentication keys ($K_{peer}$), with HMAC-SHA256 authentication tags binding the transfer ID, recipient ID, ephemeral public keys, and the v2 file manifest, preventing relay Man-In-The-Middle attacks and enabling safety number verification.
-- **Path Traversal & Collision Protection**: Automatic filename sanitization, staging to `.part` files, and automatic non-destructive collision resolution preserving seamless file auto-acceptance.
-- **Zero-Knowledge VPS Relay**: The relay daemon binds only to the loopback alias `198.51.100.1:9876` on your VPS and requires pre-shared cluster token authentication. It stages opaque ciphertext chunks on disk for resume and holds sealed envelopes for offline peers; it possesses no keys and cannot decrypt them. Chunks and mailbox entries are evicted by TTL and byte caps.
-- **Android Integration**: Live peer cards on the home screen, native file picker, progress notifications, and automatic saving to the public `Downloads` directory.
-- **Text and Link Sharing**: Share a URL or snippet from Android's Sharesheet or `gaur-share send-text`; the receiver gets a notification with Copy/Open instead of a silent clipboard overwrite.
-- **Transfer History**: Local-only list of sent/received files and text, with open, retry, resend, and cancel.
-- **Trusted Devices**: Pin devices by stable ID on Android or with `gaur-share trust`, auto-accept only from trusted peers, and revoke without rotating the cluster token.
-- **Broadcast and Folders**: Send to every online peer at once from the Android share dialog, and send a folder as a flat batch from the desktop client.
-- **Sealed Sender (v3)**: New transfers, text, and notifications use a sealed envelope. The relay sees only the target, timestamp, and kind — not the sender, file name, or payload.
-- **Offline Delivery**: Queue a file, text, or notification for a device that is offline. The relay holds only ciphertext in a TTL/byte-capped mailbox and delivers it on reconnect.
-- **One Upload, Many Recipients**: Send a file to every online device with a single upload; each recipient unwraps the shared content key.
-- **Notification Mirroring**: Android notifications appear on every cluster device with the app icon, action buttons, and inline replies. The app ignores its own notifications to prevent loops. Quickshell forwards desktop notifications to every online device with `gaur-share notify --all`; gaurPN-tagged notifications are skipped.
-- **Media Control (MPRIS)**: Android media sessions appear as local MPRIS players on the desktop, so Quickshell's media widget can play, pause, skip, seek, and set volume. Position is interpolated locally; commands are sealed and expire after 30 seconds.
-- **Request (Pull) Transfers)**: Browse any cluster device's files from your own screen and fetch what you pick — long-press a peer card on Android for the full-screen file browser, or press Request in Quickshell to open the native GTK picker. Targets serve their home directory (desktop) or media collections (phone; grant All files access in the app to expose the phone's full shared storage). Browsing is trusted-only, rate-limited, and every fetch notifies the target.
-- **Peer Telemetry**: Battery and charging state travel end-to-end encrypted inside presence updates — the relay stores only opaque ciphertext — so the desktop and the phone's cluster cards show whether a device can survive a transfer before you send one.
-- **Safe URL Opening**: Shared links get an "Open in browser" action on the desktop and an Open action on Android, restricted to validated `http`/`https` URLs — a malicious peer can never trigger other protocol handlers.
-- **Desktop Companion Client**: Single standalone Go binary for Linux, macOS, and Windows with `daemon`, `list`, `send`, `send-text`, `notify`, `pair`, and `ui` commands.
+## Feature reference
 
-### In-Tunnel Clipboard Sync
-- **Latest Clip Wins**: Copy text or an image on any cluster device and it is pushed to every other online device. Clipboard updates are ordered by the relay's receive timestamp, so the newest copy wins even with clock skew.
-- **Text and Images**: Android images are decoded, downscaled to 2048 px, and re-encoded before transfer. Desktop images use the native clipboard (`wl-clipboard`/`xclip` on Linux, `pngpaste` on macOS, PowerShell on Windows).
-- **End-to-End Encrypted**: Clipboard payloads use AES-256-GCM with a key derived from the cluster token (`K_clipboard = HMAC-SHA256(K_peer, "gaur-clipboard-v1")`). The relay only sees ciphertext and routing metadata.
-- **Echo and Replay Protection**: Content hashes suppress local echo, and relay timestamps reject stale or replayed updates. Sensitive clips (passwords/OTP) are skipped by default on Android; desktop clients cannot detect the platform sensitive flag, so disable desktop clipboard sync when handling secrets.
-- **Per-Device Control**: Disable clipboard sync for specific peers, such as a work laptop, without turning it off everywhere.
-- **Android Background Read**: Android 10+ only allows the focused app or default IME to read the clipboard. gaurPN uses a 1x1 focusable overlay while the screen is unlocked to read the clipboard, then removes it. Android may show its "pasted from clipboard" privacy toast when a new clip is captured.
+### VPN core
 
-### Network Control
-- **Per-App Split Tunneling**: Exclude chosen apps (banking apps, local streaming apps, games) from the VPN tunnel. Includes a searchable installed app list.
-- **Local Network (LAN) Bypass**: Partitioned IPv4 routing table excludes RFC 1918 subnets (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local (`169.254.0.0/16`), and loopback (`127.0.0.0/8`). Access local printers, NAS, and Smart TVs without disconnecting.
+- **Protected Go engine**: Jigsaw's lwIP TUN stack and Shadowsocks proxy through a custom JNI wrapper (`go/outlinev`). Every outbound socket binds via `VpnService.protect()`, so the VPN's own packets never loop back into the tunnel.
+- **Kill switch**: the TUN interface stays up during reconnects and drops traffic instead of leaking around the tunnel.
+- **DNS through the tunnel**: AdGuard Home on your VPS answers every query; a host route forces it in. Default `10.0.0.182`, configurable.
+- **Reliable lifecycle**: reconnect with exponential backoff, battery-optimization exemption shortcut, optional start on boot.
+- **`ss://` import**: SIP002 URIs, percent-encoded userinfo, IPv6 host brackets, legacy base64 strings, port bounds checking, from clipboard or deep link.
+- **Per-app split tunneling**: exclude banking apps, local streaming, games. Searchable installed-app list, stored in DataStore.
+- **IPv6-aware LAN bypass**: RFC 1918, link-local, and ULA ranges stay local while global IPv6 unicast stays tunneled. Reach printers, NAS, and TVs without disconnecting.
+
+### Sharing and sync
+
+- **Files**: chunked AES-256-GCM streaming (1 MiB chunks, index-bound nonces, per-chunk AAD), resumable through a `.part` file and chunk bitmap, signed completion receipts, sanitized filenames, non-destructive collision handling. Incoming files land in `Downloads`.
+- **Text and links**: from Android's Sharesheet or `gaur-share send-text`. Receivers get Copy/Open actions, and Open validates `http`/`https` so a hostile peer can never fire other protocol handlers.
+- **Dual-key zero-knowledge design**: separate relay presence keys ($K_{relay}$) and peer authentication keys ($K_{peer}$), HMAC-SHA256 tags binding the transfer ID, recipient, ephemeral keys, and the v2 manifest. This blocks relay man-in-the-middle attacks and enables safety-number verification.
+- **Trusted devices**: pin peers by stable ID on Android or with `gaur-share trust`. Auto-accept only from trusted peers, revoke without rotating the cluster token. The trust gate covers files, text, clipboard, notifications, and notification actions.
+- **Broadcast**: one upload reaches every online device; each recipient unwraps the shared content key. Folders send as flat batches.
+- **Offline delivery**: sealed envelopes in a TTL/byte-capped mailbox, ack-based, so a failed write re-queues instead of dropping.
+- **Notification mirroring**: Android notifications appear on every cluster device with the app icon, action buttons, and inline replies. Desktop notifications mirror back through `gaur-share notify --all`. The app ignores its own notifications to prevent loops, and shared content hides on the lock screen.
+- **Media control (MPRIS)**: Android media sessions appear as local players on the desktop. Play, pause, skip, seek, volume. Position interpolates locally; commands are sealed and expire after 30 seconds.
+- **Pull transfers**: browse a trusted device's home directory (desktop) or media collections (phone; grant All files access for full shared storage) and fetch what you pick. Browsing is trusted-only and rate-limited, grants expire in five minutes, and every accepted fetch posts a notification on the target.
+- **Peer status**: battery and charging state ride inside encrypted presence updates, so you know a device can survive a transfer before you send one.
+- **Transfer history**: local-only list of sent and received files and text, with open, retry, resend, and cancel.
+
+### Clipboard sync
+
+- **Newest clip wins** across devices, ordered by the relay's receive timestamp so clock skew cannot resurrect old clips.
+- **Text and images**: Android downscales images to 2048 px before transfer; desktops use `wl-clipboard`/`xclip` (Linux), `pngpaste` (macOS), or PowerShell (Windows).
+- **Encrypted**: AES-256-GCM with `K_clipboard = HMAC-SHA256(K_peer, "gaur-clipboard-v1")`. Content hashes suppress echo; relay timestamps reject replays.
+- **Discretion**: sensitive clips (passwords, OTP) are skipped by default on Android, and you can disable sync per peer, such as a work laptop.
 
 ---
 
@@ -89,7 +88,7 @@ Everything between them rides one Shadowsocks tunnel. Your devices find each oth
                                      Encrypted Shadowsocks Tunnel
                                                     │
                                                     ▼
-┌──────────────────────────────────────── VPS (Outline Server) ─────────────────────────────────────────┐
+┌──────────────────────────────────── VPS (Shadowsocks Server) ─────────────────────────────────────────┐
 │                                                                                                       │
 │  Shadowsocks Server Daemon (e.g. outline-ss-server)                                                   │
 │                                                                                                       │
@@ -115,9 +114,9 @@ Everything between them rides one Shadowsocks tunnel. Your devices find each oth
 
 ### Why the custom Go wrapper?
 
-The stock `outline.aar` dials the proxy using unprotected sockets. If an Android VPN routes all device traffic into its TUN interface, the VPN's own outbound packets loop back into the tunnel.
+The stock Android client dials the proxy with unprotected sockets. When a VPN routes all device traffic into its TUN interface, the VPN's own outbound packets loop back into the tunnel and die there.
 
-`go/outlinev` wraps the Outline SDK's `TCPEndpoint` and `UDPEndpoint` with `intra/protect.MakeDialer(protector)`. This dialer sets a `net.Dialer.Control` hook that calls into Kotlin and executes `VpnService.protect(fd)` before every socket connects. Traffic to the proxy server bypasses the TUN interface to reach the physical network interface. DNS resolves through the phone's protected system resolvers.
+`go/outlinev` wraps the upstream `TCPEndpoint` and `UDPEndpoint` with `intra/protect.MakeDialer(protector)`. The dialer sets a `net.Dialer.Control` hook that calls into Kotlin and runs `VpnService.protect(fd)` before every socket connects. Traffic to the proxy server bypasses the TUN interface and reaches the physical network interface. DNS resolves through the phone's protected system resolvers.
 
 ---
 
@@ -224,7 +223,7 @@ GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o dist/gaur-share-windows-a
 
 ### 1. Connecting to Shadowsocks
 
-1. Copy an access key (`ss://...`) from your Outline Manager or Shadowsocks server.
+1. Copy an access key (`ss://...`) from your Shadowsocks server's manager.
 2. Open gaurPN and tap **+** to paste the key, or open the link on your device to import it.
 3. Tap **Connect** and confirm the system VPN permission dialog once.
 4. Add the gaurPN tile to your Quick Settings panel for one-tap toggling.
@@ -407,17 +406,17 @@ For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.m
 - **Zero Telemetry**: No trackers, no analytics SDKs, no third-party network calls.
 - **Local Storage**: Access keys and cluster tokens stay on your device, wrapped with Android Keystore (AES-256-GCM) inside Jetpack DataStore; nothing is cloud-backed up.
 - **Zero-Knowledge Relay**: The relay server runs on loopback inside the VPN server and possesses no keys to decrypt inner payloads. It stages opaque ciphertext chunks on disk for resume and evicts them by TTL and a byte cap. It refuses to start on a non-loopback bind, caps peers and input sizes, and throttles repeated auth failures.
-- **Transfer Ownership**: Chunk endpoints carry a per-transfer capability tag (`HMAC(K_peer, "gaur-cap-v1:…")`) and the creator's device id, so cluster members cannot silently read, overwrite, or drop each other's staged transfers. A malicious relay cannot redirect sealed envelopes — receivers verify the target and dedup by message id, and media commands expire after 30 seconds.
+- **Transfer Ownership**: Chunk endpoints carry a per-transfer capability tag (`HMAC(K_peer, "gaur-cap-v1:…")`) and the creator's device id, so cluster members cannot silently read, overwrite, or drop each other's staged transfers. A malicious relay cannot redirect sealed envelopes: receivers verify the target and dedup by message id, and media commands expire after 30 seconds.
 - **Pairing Confirmation**: `gaur://pair` links show a confirmation dialog (relay, masked token, DNS) before anything is written; the app refuses relays on public hosts.
 - **Isolated Transport**: File transfers do not touch local LAN broadcast or multicast domains, protecting peer visibility on public Wi-Fi networks.
 - **DNS Privacy**: DNS queries are answered by AdGuard Home on the VPS through the tunnel. No public resolver sees them unless you explicitly choose System mode.
 - **Kill Switch**: While reconnecting, the TUN stays up and drops traffic instead of falling back to the physical network.
-- **Trusted Devices**: Auto-accept can be restricted to pinned device IDs on Android (Settings → Trusted devices) and on the desktop (`gaur-share trust` / `trust-mode`). Revoking removes the peer from this device's trust list; rotate the cluster token to remove its relay access entirely. The trust gate covers every inbound kind — files, text, clipboard, notifications, and notification actions.
+- **Trusted Devices**: Auto-accept can be restricted to pinned device IDs on Android (Settings → Trusted devices) and on the desktop (`gaur-share trust` / `trust-mode`). Revoking removes the peer from this device's trust list; rotate the cluster token to remove its relay access entirely. The trust gate covers every inbound kind: files, text, clipboard, notifications, and notification actions.
 - **Sealed Sender**: v3 messages omit the sender from the relay-visible envelope. The relay routes by target, timestamp, and kind only, and strips sender fields even if a client includes them.
 - **Ephemeral Mailbox**: Offline messages are ciphertext with a TTL (default 1h) and byte caps (global and per-target); the relay never parses them, and delivery is ack-based so a failed write re-queues instead of dropping.
 - **Notification Privacy**: Mirrored notifications are sealed; the relay sees only that a notification event exists. The source app ignores gaurPN's own notifications to prevent loops, and shared content is hidden from the lock screen.
-- **Resumable Transfers**: v2 and v3 transfers resume from a `.part` file and chunk bitmap after a dropped connection or app restart — senders skip chunks the relay still holds, receivers keep progress across attempts.
-- **Request Security**: Pull transfers are sealed and grant-verified, expire in five minutes, and are rate-limited on the target. Browsing is a trusted-only capability — trust a device once, then it can browse; every accepted fetch posts a notification on the target. Under the shared-token model identity claims are advisory (the seal proves membership, the trust list decides which claims to believe); per-device identity keys (v4) are the planned hard boundary.
+- **Resumable Transfers**: v2 and v3 transfers resume from a `.part` file and chunk bitmap after a dropped connection or app restart. Senders skip chunks the relay still holds, receivers keep progress across attempts.
+- **Request Security**: Pull transfers are sealed and grant-verified, expire in five minutes, and are rate-limited on the target. Browsing is a trusted-only capability: trust a device once, then it can browse; every accepted fetch posts a notification on the target. Under the shared-token model identity claims are advisory (the seal proves membership, the trust list decides which claims to believe); per-device identity keys (v4) are the planned hard boundary.
 
 ---
 
