@@ -644,62 +644,68 @@ player. Quickshell's media widget discovers it like any other player.
 
 ## 14. Requests (Pull Transfers)
 
-Everything else in this document is push. Requests let any device ask any
-other device for files: the target shows a picker (Android: the system
-document picker via a notification; desktop: zenity/kdialog), and the picked
-files stream back to the requester.
+Everything else in this document is push. Pull transfers let a device browse
+another cluster device's files in its own UI and fetch what it picks.
 
-### Protocol (v3.2)
+### Protocol (v3.2.1)
 
-- Sealed kind `request`, inner JSON:
-  `{"request_id":"req-<16hex>","requester_id","origin_id"?,"requester_name","target_id","kind":"files"|"screenshot","expires_ts","grant","ts"}`.
-- `request_id` is 16 random hex chars; `expires_ts` is at most
-  `now + 5 min` (receivers reject anything beyond `+7 min` for clock skew and
-  anything already past).
-- `grant = hex(HMAC-SHA256(K_peer, "gaur-request-grant-v1:" + request_id + ":" + requester_id + ":" + target_id + ":" + expires_ts))`.
-- `requester_id` is the id of the connection that will receive the response
-  (the desktop CLI connects under an ephemeral `reqdev-…` id so it does not
-  evict the daemon's connection). `origin_id`, when present, is the
-  requester's STABLE device id — targets apply the trust gate to it.
-- Sealed kind `request_declined`, inner
-  `{"request_id","reason","ts"}` with reason one of
-  `declined|busy|expired|unsupported|picker_unavailable|not_allowed`.
-- The response is a normal v3 sealed offer whose inner JSON additionally
-  carries `request_id` and `grant` (echoed verbatim). A desktop CLI requester
-  auto-accepts an offer iff its grant matches the one it computed and its
-  claimed sender id equals the target it asked; the request TTL bounds
-  time-to-first-offer, and the receive window then extends by the normal
-  completion timeout so large files survive.
+- Sealed kind `browse` (requester → target), inner JSON:
+  `{"request_id","requester_id","origin_id"?,"requester_name","target_id","path","ts"}`.
+  `path` is `""` for the root listing, otherwise relative segments joined by
+  `/` (no leading slash, no `..`, no control characters, ≤1024 UTF-16 units,
+  each segment ≤255).
+- Sealed kind `browse_listing` (target → requester), inner:
+  `{"request_id","path","entries":[{"name","size","modified","dir"}...],"truncated"?,​"error"?,"ts"}`.
+  Entries are dirs-first, case-insensitive, capped at 1000 (`truncated` set
+  when cut). `error` (mutually exclusive with entries) is one of
+  `denied|not_found|rate_limited|unsupported`.
+- Sealed kind `fetch` (requester → target), inner:
+  `{"request_id","requester_id","origin_id"?,"requester_name","target_id","paths":[...],"expires_ts","grant","ts"}`.
+  `paths` is 1–32 relative paths from a prior listing; the grant is the
+  existing `"gaur-request-grant-v1"` HMAC. Declines use the sealed
+  `request_declined` kind with reasons
+  `declined|busy|expired|unsupported|not_allowed|not_found|too_large`.
+- The target streams each fetched file as a normal sealed v3 offer carrying
+  the echoed `request_id` + `grant`; the requester auto-accepts (CLI pending
+  state) or trust-accepts (Android) exactly like the old request flow.
 
-### Behavior and limits
+### What the target serves
 
-- Android: one request active at a time (extra requests are declined `busy`);
-  request ids are deduplicated; toggles live in **Settings → Transfers**
-  (file requests default on, screenshot requests default off and additionally
-  require the media-read permission, granted when the toggle is enabled).
-  Screenshot requests auto-send the newest file in `Pictures/Screenshots/`,
-  rate-limited to one per requester per 60 seconds. Peer-supplied names are
-  shown with the stable id prefix (`Lilac (lilac-76…)`) — the name is a
-  claim, the id is what the trust list contains.
-- Desktop: `gaur-share request <target> [--screenshot]`. As a target the
-  daemon pops a zenity/kdialog multi-file picker (one at a time; a hung
-  picker times out with `expired`), then spawns a `send --to --request-meta`
-  subprocess with a 1-hour lifetime bound. Screenshot requests to a desktop
-  are declined `unsupported`.
-- The relay is not involved beyond sealed forwarding; requests to offline
-  devices ride the mailbox and are declined `expired` if they surface late.
+- **Desktop**: a browse root (flag `-browse-root`, default `$HOME`).
+  Dotfiles and symlinks are hidden; paths are resolved (`EvalSymlinks`) and
+  containment-checked before listing or fetch; the listing stops reading at
+  the entry cap. A legacy `request` kind always declines `unsupported`.
+- **Android**: media collections as virtual roots — `Pictures`, `DCIM`,
+  `Download`, `Documents`, `Movies`, `Music` — listed via MediaStore
+  (`RELATIVE_PATH` prefix grouping, SQL LIMIT, LIKE-escaped). A file's fetch
+  path is its `RELATIVE_PATH + DISPLAY_NAME`.
 
-### Security model — read this
+### Authorization — read this
 
-The grant proves "a cluster member that saw this request responded", not
-"the device you asked responded": every member holds `K_peer` and can mint
-grants and claim any sender/origin id. Under the shared-token model the
-trust gate on requests is therefore **advisory**, exactly like offer
-`sender_id` claims everywhere else in the protocol. The mitigations are:
-the picker always shows the claimed stable id next to the name, screenshot
-requests are off by default and rate-limited, and unsolicited declines are
-only surfaced for requests the device itself issued. The real boundary is
-per-device identity keys (protocol v4).
+Browse and fetch are **trusted-only capabilities**: the claimed origin
+(`origin_id`, falling back to `requester_id`) must be in the target's
+trusted list (`gaur-share trust` on the desktop, Settings → Trusted devices
+on Android), regardless of the only-trusted toggle. Trust a device once,
+then it can browse. Every accepted fetch posts a notification on the target
+(peer and file count only — never names). Under the shared-token model the
+identity claim is still forgeable by any cluster member (the seal proves
+membership, the trust list decides which claims to believe); per-device
+identity keys (protocol v4) are the planned hard boundary.
+
+### Availability limits
+
+- Browse: per-origin 2/sec, global 10/sec, at most 2 concurrent listing
+  workers per target; excess browses answer `rate_limited` without doing
+  filesystem work.
+- Fetch: one active fetch per target (busy), one accepted fetch per origin
+  per 30 s, ≤32 paths, ≤4 GiB total (both ends enforce), 30-minute send
+  bound, and a receive-side cap on the requester.
+- Requester UIs: Android gets a full-screen browser (breadcrumb, multi-select,
+  download bar); the desktop gets `gaur-share browse <target> [path] [--json]`,
+  `gaur-share fetch <target> <path>...`, and the web UI
+  (`gaur-share ui`, fixed port `127.0.0.1:9877`, `--open`) with a browse
+  pane. The old `gaur-share request` command is gone; `screenshot <target>`
+  remains the quick action for the newest phone screenshot.
 
 ---
 

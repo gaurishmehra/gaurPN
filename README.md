@@ -38,7 +38,7 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 - **One Upload, Many Recipients**: Send a file to every online device with a single upload; each recipient unwraps the shared content key.
 - **Notification Mirroring**: Android notifications appear on every cluster device with the app icon, action buttons, and inline replies. The app ignores its own notifications to prevent loops. Quickshell forwards desktop notifications to every online device with `gaur-share notify --all`; gaurPN-tagged notifications are skipped.
 - **Media Control (MPRIS)**: Android media sessions appear as local MPRIS players on the desktop, so Quickshell's media widget can play, pause, skip, seek, and set volume. Position is interpolated locally; commands are sealed and expire after 30 seconds.
-- **Request (Pull) Transfers**: Ask any cluster device for files — `gaur-share request "Pixel 8"` pops the phone's file picker and the chosen files stream back; long-press a peer card on Android to request from the desktop. Requests are sealed, expire after five minutes, and are answered by a grant-verified transfer.
+- **Request (Pull) Transfers**: Browse any cluster device's files from your own screen and fetch what you pick — long-press a peer card on Android for the full-screen file browser, or press Request in Quickshell to open the desktop's browse UI. Targets serve their home directory (desktop) or media collections (phone); browsing is trusted-only, rate-limited, and every fetch notifies the target.
 - **Peer Telemetry**: Battery and charging state travel end-to-end encrypted inside presence updates — the relay stores only opaque ciphertext — so the desktop and the phone's cluster cards show whether a device can survive a transfer before you send one.
 - **Safe URL Opening**: Shared links get an "Open in browser" action on the desktop and an Open action on Android, restricted to validated `http`/`https` URLs — a malicious peer can never trigger other protocol handlers.
 - **Desktop Companion Client**: Single standalone Go binary for Linux, macOS, and Windows with `daemon`, `list`, `send`, `send-text`, `notify`, `pair`, and `ui` commands.
@@ -349,11 +349,15 @@ gaur-share notify "Lavander" "Build finished" "The release APK is ready"
 # Send a notification to every online device
 gaur-share notify --all "Build finished" "The release APK is ready"
 
-# Request files from a device (its picker opens, files stream back)
-gaur-share request "Pixel 8"
+# Browse a device's files (trusted devices only) and fetch what you pick
+gaur-share browse "Pixel 8"            # list the phone's media collections
+gaur-share fetch "Pixel 8" "Pictures/Screenshots/Screenshot_01.png"
 
-# Ask a phone for its latest screenshot (toggle required on the phone)
-gaur-share request "Pixel 8" --screenshot
+# Or use the local web UI (Quickshell's Request button opens it)
+gaur-share ui --open
+
+# Ask a phone for its latest screenshot (quick action)
+gaur-share screenshot "Pixel 8"
 ```
 
 #### On Android (`gaurPN`)
@@ -405,7 +409,7 @@ For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.m
 - **Ephemeral Mailbox**: Offline messages are ciphertext with a TTL (default 1h) and byte caps (global and per-target); the relay never parses them, and delivery is ack-based so a failed write re-queues instead of dropping.
 - **Notification Privacy**: Mirrored notifications are sealed; the relay sees only that a notification event exists. The source app ignores gaurPN's own notifications to prevent loops, and shared content is hidden from the lock screen.
 - **Resumable Transfers**: v2 and v3 transfers resume from a `.part` file and chunk bitmap after a dropped connection or app restart — senders skip chunks the relay still holds, receivers keep progress across attempts.
-- **Request Security**: Pull requests are sealed and grant-verified, expire in five minutes, and are rate-limited on the target. The grant proves a cluster member answered — under the shared-token model identity claims are advisory (the picker always shows the claimed device id); per-device identity keys (v4) are the planned hard boundary.
+- **Request Security**: Pull transfers are sealed and grant-verified, expire in five minutes, and are rate-limited on the target. Browsing is a trusted-only capability — trust a device once, then it can browse; every accepted fetch posts a notification on the target. Under the shared-token model identity claims are advisory (the seal proves membership, the trust list decides which claims to believe); per-device identity keys (v4) are the planned hard boundary.
 
 ---
 
