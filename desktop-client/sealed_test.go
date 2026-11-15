@@ -219,7 +219,7 @@ func TestSealedOfferGeometryOK(t *testing.T) {
 		{"empty file", 0, ChunkSize, 0, 0, true},
 		{"one full chunk", ChunkSize, ChunkSize, 1, 1, true},
 		{"partial last chunk", ChunkSize + 1, ChunkSize, 2, 2, true},
-		{"max chunk count", ChunkSize, ChunkSize, maxCount, maxCount, true},
+		{"max chunk count", int64(maxCount) * ChunkSize, ChunkSize, maxCount, maxCount, true},
 		{"chunk size mismatch", 1024, ChunkSize / 2, 1, 1, false},
 		{"chunk size zero", 1024, 0, 1, 1, false},
 		{"chunk count overflow", ChunkSize, ChunkSize, maxCount + 1, maxCount + 1, false},
@@ -229,6 +229,7 @@ func TestSealedOfferGeometryOK(t *testing.T) {
 		{"negative size", -1, ChunkSize, 1, 1, false},
 		{"zero size with chunks", 0, ChunkSize, 1, 1, false},
 		{"non-empty with no chunks", 1, ChunkSize, 0, 0, false},
+		{"size underclaims the chunk count", 1, ChunkSize, 2, 2, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

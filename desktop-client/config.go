@@ -17,6 +17,7 @@ type Config struct {
 	SenderID        string
 	Name            string
 	InboxDir        string
+	BrowseRoot      string
 	PeersFile       string
 	Clipboard       bool
 	ClipboardSource string
@@ -38,6 +39,18 @@ func defaultInboxDir() string {
 		return "./gaur-inbox"
 	}
 	return filepath.Join(home, "Downloads", "gaur-inbox")
+}
+
+// defaultBrowseRoot is the directory the daemon exposes to browse/fetch
+// requests. It is the user's home by default; -browse-root narrows or widens
+// it. The value is resolved through symlinks on every request, so a root that
+// is itself a link still gets a correct containment check.
+func defaultBrowseRoot() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "."
+	}
+	return home
 }
 
 // ensureInboxDir creates the inbox directory with owner-only permissions and

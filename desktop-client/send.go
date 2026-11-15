@@ -83,7 +83,7 @@ func collectSendMetas(filePaths []string, openRequested bool) ([]sendFileMeta, e
 
 // requestMeta is the grant a pull request's target echoes in its sealed
 // offers. It is parsed from the hidden --request-meta flag, which only the
-// send subprocess spawned by handleIncomingRequest sets.
+// send subprocess spawned by handleIncomingFetch sets.
 type requestMeta struct {
 	RequestID string
 	Grant     string

@@ -97,6 +97,13 @@ func envelopeInt64(m map[string]interface{}, key string) int64 {
 	return numberToInt64(m[key])
 }
 
+// envelopeBool reads a boolean field from a JSON envelope. A missing or
+// non-boolean field yields false.
+func envelopeBool(m map[string]interface{}, key string) bool {
+	value, _ := m[key].(bool)
+	return value
+}
+
 func openSealed(
 	peerCryptoKey []byte,
 	envelope map[string]interface{},
@@ -381,11 +388,21 @@ func handleIncomingSealed(
 		log.Printf("[SEALED] Could not open %v envelope: %v", envelope["kind"], err)
 		return
 	}
-	// A pull request carries requester_id/requester_name, not sender_id, so it
-	// must be dispatched before the generic sender gate. Its own trust check
-	// lives in handleIncomingRequest and declines rather than dropping.
-	if kind == "request" {
-		go handleIncomingRequest(cfg, peerCryptoKey, client, inner)
+	// Browse and fetch carry requester_id/requester_name, not sender_id, so
+	// they must be dispatched before the generic sender gate. Their own trust,
+	// replay, and rate-limit checks live in the handlers. The legacy "request"
+	// kind (the old picker/screenshot quick action) has no sender_id either;
+	// it is answered with an immediate "unsupported" decline so an old client
+	// fails fast instead of waiting out its request timeout.
+	switch kind {
+	case "browse":
+		go handleIncomingBrowse(cfg, peerCryptoKey, client, inner)
+		return
+	case "fetch":
+		go handleIncomingFetch(cfg, peerCryptoKey, client, inner)
+		return
+	case "request":
+		handleLegacyRequest(peerCryptoKey, client, inner)
 		return
 	}
 	senderID := envelopeString(inner, "sender_id")
@@ -454,6 +471,24 @@ func handleIncomingSealed(
 	}
 }
 
+// handleLegacyRequest answers the removed picker/screenshot request kind.
+// Desktop targets have no picker and no screen capture, so every request is
+// declined "unsupported" immediately. One line is enough: the requester's
+// grant-verified loop turns the decline into a fast CLI failure instead of a
+// five-minute wait.
+func handleLegacyRequest(peerCryptoKey []byte, client *wsClient, inner map[string]interface{}) {
+	requestID := envelopeString(inner, "request_id")
+	requesterID := envelopeString(inner, "requester_id")
+	if !isRequestID(requestID) || !isValidDeviceID(requesterID) {
+		return
+	}
+	name := singleLineDisplayName(envelopeString(inner, "requester_name"))
+	if name == "" {
+		name = singleLineDisplayName(requesterID)
+	}
+	declineRequest(peerCryptoKey, client, requesterID, peerLabel(name, requesterID), requestID, "unsupported")
+}
+
 func handleSealedOffer(
 	cfg Config,
 	relayToken string,
@@ -488,7 +523,7 @@ func handleSealedOffer(
 }
 
 // receiveSealedOfferFile downloads, verifies, and commits one sealed v3
-// offer. It is shared by the daemon's push path and the request (pull)
+// offer. It is shared by the daemon's push path and the fetch (pull)
 // command; deviceID is the identity used for chunk auth — the daemon's id
 // for a pushed offer, the request's ephemeral id for a requested one.
 //
@@ -600,14 +635,24 @@ func receiveSealedOfferFile(
 // bounded, the manifest must have one hash per chunk, and the file size must
 // fit the chunks. An empty file is exactly (0 bytes, 0 chunks); a zero-byte
 // file with chunks, or a non-empty file with none, is malformed.
+//
+// The lower bound on fileSize is what makes the requester's byte cap
+// meaningful: without it a sender could claim fileSize=1 while staging
+// 65536 chunks (64 GiB), and the receiver would download all of them before
+// the hash check. With the bound, the claimed size is within one chunk of the
+// actual size, so summing fileSize bounds the real download.
 func sealedOfferGeometryOK(fileSize int64, chunkSize, chunkCount, hashCount int) bool {
 	validEmpty := fileSize == 0 && chunkCount == 0
 	validNonEmpty := fileSize > 0 && chunkCount > 0
+	consistent := validEmpty
+	if validNonEmpty {
+		consistent = fileSize > int64(chunkCount-1)*int64(ChunkSize)
+	}
 	return chunkSize == ChunkSize &&
 		chunkCount >= 0 && chunkCount <= 65536 &&
 		hashCount == chunkCount &&
 		fileSize >= 0 && fileSize <= int64(chunkCount)*int64(ChunkSize) &&
-		(validEmpty || validNonEmpty)
+		consistent
 }
 
 func splitTargets(raw string) []string {

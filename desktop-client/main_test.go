@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -423,5 +426,66 @@ func TestRunListJSONHappyPathUnchanged(t *testing.T) {
 	}
 	if ids[fmt.Sprintf("list-%d", os.Getpid())] {
 		t.Fatalf("the list client must not list itself, got: %s", out)
+	}
+}
+
+// TestRequestCommandRemovedExitCode runs the real main() in a child process
+// and pins the removed command's contract: a usage-error exit code of 2 and a
+// one-line hint pointing at browse/fetch and the UI.
+func TestRequestCommandRemovedExitCode(t *testing.T) {
+	if os.Getenv("GAUR_HELPER_MAIN") == "1" {
+		if home := os.Getenv("GAUR_HELPER_HOME"); home != "" {
+			_ = os.Setenv("HOME", home)
+		}
+		os.Args = []string{"gaur-share", "request"}
+		// The testing package already parsed its own flags on the global
+		// set; main() needs a fresh set to parse the CLI arguments.
+		flag.CommandLine = flag.NewFlagSet("gaur-share", flag.ExitOnError)
+		main()
+		os.Exit(0)
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=TestRequestCommandRemovedExitCode")
+	cmd.Env = append(os.Environ(),
+		"GAUR_HELPER_MAIN=1",
+		"GAUR_HELPER_HOME="+t.TempDir(),
+	)
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected a non-zero exit, got %v (output %q)", err, out)
+	}
+	if code := exitErr.ExitCode(); code != 2 {
+		t.Fatalf("exit code = %d, want 2 (output %q)", code, out)
+	}
+	if !strings.Contains(string(out), "browse/fetch") {
+		t.Fatalf("output = %q, want the browse/fetch hint", out)
+	}
+}
+
+func TestSplitDoubleDash(t *testing.T) {
+	cases := []struct {
+		name string
+		in   []string
+		head []string
+		tail []string
+	}{
+		{"sentinel before a dash path", []string{"phone-1", "--", "-json"}, []string{"phone-1"}, []string{"-json"}},
+		{"no sentinel", []string{"phone-1", "docs"}, []string{"phone-1", "docs"}, nil},
+		{"sentinel first", []string{"--", "-json"}, []string{}, []string{"-json"}},
+		{"only sentinel", []string{"--"}, []string{}, []string{}},
+		{"only the first sentinel is special", []string{"a", "--", "b", "--", "c"}, []string{"a"}, []string{"b", "--", "c"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			head, tail := splitDoubleDash(tc.in)
+			if !slices.Equal(head, tc.head) {
+				t.Fatalf("head = %q, want %q", head, tc.head)
+			}
+			if !slices.Equal(tail, tc.tail) {
+				t.Fatalf("tail = %q, want %q", tail, tc.tail)
+			}
+		})
 	}
 }

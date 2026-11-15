@@ -22,6 +22,33 @@ func notifyUser(title, message string) {
 	}
 }
 
+// notifyFetchAccepted reports an accepted fetch. It is a package var so tests
+// can observe the call; the default starts notify-send without waiting for it.
+var notifyFetchAccepted = notifyFetchAcceptedDesktop
+
+// notifyFetchAcceptedDesktop raises the "Files shared" notification for an
+// accepted fetch. The peer label is already sanitized and carries no file
+// names. Start (not Run) keeps the caller non-blocking: a missing or broken
+// notification daemon must never delay or fail the send.
+func notifyFetchAcceptedDesktop(peerLabel string, count int) {
+	message := fmt.Sprintf("%s fetched %d file(s)", peerLabel, count)
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "linux":
+		cmd = exec.Command("notify-send", "-a", "gaurPN", "--", "Files shared", message)
+	case "darwin":
+		script := fmt.Sprintf(`display notification "%s" with title "%s"`,
+			escapeAppleScriptString(message), escapeAppleScriptString("Files shared"))
+		cmd = exec.Command("osascript", "-e", script)
+	default:
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	go func() { _ = cmd.Wait() }()
+}
+
 // openCommand builds the platform-specific command that opens a file with its
 // default application. The context bounds the launcher so a hung opener
 // cannot linger; it does not affect the already-completed transfer.

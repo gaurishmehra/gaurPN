@@ -22,6 +22,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/hkdf"
 )
@@ -307,6 +308,18 @@ func SanitizeFileName(rawName string) string {
 	}
 	reg := regexp.MustCompile(`[\x00-\x1F\x7F/\\:*?"<>|]`)
 	clean := strings.TrimSpace(reg.ReplaceAllString(base, "_"))
+	// Drop Unicode format characters (Cf) exactly like singleLineDisplayName:
+	// zero-width joiners and bidi overrides have no place in a filename and
+	// can disguise an extension or reorder displayed text.
+	var b strings.Builder
+	b.Grow(len(clean))
+	for _, r := range clean {
+		if unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	clean = strings.TrimSpace(b.String())
 	clean = strings.TrimLeft(clean, ".")
 	if clean == "" {
 		return fmt.Sprintf("download_%d", time.Now().Unix())

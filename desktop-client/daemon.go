@@ -120,6 +120,8 @@ func runDaemon(cfg Config) {
 
 	// Fresh replay protection for this daemon lifetime.
 	replayGuard = NewReplayGuard()
+	resetBrowseState()
+	fetchBusy.Store(false)
 
 	sender := &CommandSender{cfg: cfg}
 	mpris, mprisErr := NewMprisManager(sender.Send)
@@ -144,6 +146,11 @@ func runDaemon(cfg Config) {
 	}
 	log.Printf("[DAEMON] Starting gaur-share daemon as '%s' (ID: %s)", cfg.Name, cfg.DeviceID)
 	log.Printf("[DAEMON] Incoming files will be saved to: %s", cfg.InboxDir)
+	browseRoot := cfg.BrowseRoot
+	if browseRoot == "" {
+		browseRoot = defaultBrowseRoot()
+	}
+	log.Printf("[DAEMON] Browse root: %s", browseRoot)
 	writePeersFile(cfg, nil)
 
 	session := &daemonSession{

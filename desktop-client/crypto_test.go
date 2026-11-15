@@ -104,6 +104,9 @@ func TestSanitizeFileNameAndPathCheck(t *testing.T) {
 		{"..\\..\\windows\\system32", "system32"},
 		{"nul\x00lbyte.exe", "nul_lbyte.exe"},
 		{"...hidden", "hidden"},
+		{"a\u202eb.txt", "ab.txt"},
+		{"a\u200bb.txt", "ab.txt"},
+		{"\ufeffreport\u2060.pdf", "report.pdf"},
 	}
 
 	for _, tc := range cases {

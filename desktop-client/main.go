@@ -11,6 +11,20 @@ import (
 	"syscall"
 )
 
+// splitDoubleDash separates the arguments before a "--" sentinel from the
+// positionals after it. Go's flag package stops parsing at the first positional
+// argument, so a path that begins with "-" needs an explicit sentinel; this
+// helper keeps the sentinel out of the FlagSet and appends the tail after
+// parsing. Only the first sentinel is special.
+func splitDoubleDash(args []string) (head, tail []string) {
+	for i, arg := range args {
+		if arg == "--" {
+			return args[:i], args[i+1:]
+		}
+	}
+	return args, nil
+}
+
 func main() {
 	var cfg Config
 	var jsonOutput bool
@@ -20,6 +34,7 @@ func main() {
 	flag.StringVar(&cfg.DeviceID, "device-id", generateDeviceID(), "Unique device identifier")
 	flag.StringVar(&cfg.Name, "name", defaultName, "Human readable device name")
 	flag.StringVar(&cfg.InboxDir, "inbox", defaultInboxDir(), "Directory where incoming files are saved")
+	flag.StringVar(&cfg.BrowseRoot, "browse-root", defaultBrowseRoot(), "Root directory exposed to browse and fetch requests")
 	flag.StringVar(&cfg.PeersFile, "peers-file", defaultPeersFile(), "Path to the peer state file watched by desktop shells")
 	flag.BoolVar(&cfg.Clipboard, "clipboard", true, "Sync the desktop clipboard with cluster devices")
 	flag.StringVar(&cfg.ClipboardSource, "clipboard-source", "poll", "Clipboard source: poll, socket, or off")
@@ -46,10 +61,12 @@ func main() {
 		fmt.Println("  gaur-share send --all <file|dir>...          Upload once, send to every online device")
 		fmt.Println("  gaur-share send --offline <device> <file>... Queue for a device that may be offline")
 		fmt.Println("  gaur-share send --to <id,id> <file>...       Send to specific device IDs")
-		fmt.Println("  gaur-share request [--screenshot] <device>   Request files (or a screenshot) from a device")
+		fmt.Println("  gaur-share browse <device> [path] [--json]  List files a device shares")
+		fmt.Println("  gaur-share fetch <device> <path> [path...]  Fetch files from a device")
+		fmt.Println("  gaur-share screenshot <device>              Ask a device for a screenshot")
 		fmt.Println("  gaur-share send-text <device> <text|->       Send a text or link (use - for stdin)")
 		fmt.Println("  gaur-share pair <gaur://pair?...>           Pair using the QR URI from gaur-relay -init")
-		fmt.Println("  gaur-share ui [-addr 127.0.0.1:0]           Local browser UI for peers, text, and files")
+		fmt.Println("  gaur-share ui [--open] [-addr 127.0.0.1:9877] Local browser UI for peers, browsing, and files")
 		fmt.Println("  gaur-share notify <device> <title> [body]   Send a notification to a device")
 		fmt.Println("  gaur-share notify --all <title> [body]      Send a notification to every online device")
 		fmt.Println("  gaur-share trust <device>                   Trust a device by id or name")
@@ -69,9 +86,9 @@ func main() {
 		if args[0] == "daemon" {
 			writePeersFile(cfg, nil)
 			stopDaemonStatus()
-			// A send subprocess for a pull request outlives the handler that
+			// A send subprocess for a fetch outlives the handler that
 			// started it; os.Exit skips its context cancel, so kill it here.
-			killRequestSubprocesses()
+			killFetchSubprocesses()
 			// Unlink the socket the daemon is listening on so Quickshell's
 			// next dial does not hit a stale file. Only the socket source
 			// ever creates it.
@@ -147,19 +164,61 @@ func main() {
 			runSend(cfg, rest[0], rest[1:], *openRequested)
 		}
 	case "request":
-		requestFlags := flag.NewFlagSet("request", flag.ExitOnError)
-		requestScreenshot := requestFlags.Bool("screenshot", false, "Ask the target for a screenshot instead of files")
-		if err := requestFlags.Parse(requestArgsFromFlags(args[1:])); err != nil {
+		// The picker-based pull request is gone: browsing replaced it. Exit 2
+		// (usage error) so a launcher can tell it apart from a failed transfer.
+		fmt.Fprintln(os.Stderr, `request is now browse/fetch — run "gaur-share ui" for the picker UI`)
+		os.Exit(2)
+	case "browse":
+		browseFlags := flag.NewFlagSet("browse", flag.ExitOnError)
+		browseJSON := browseFlags.Bool("json", false, "Output the listing as JSON")
+		head, tail := splitDoubleDash(args[1:])
+		if err := browseFlags.Parse(browseArgsFromFlags(head)); err != nil {
 			log.Fatalf("[FATAL] %v", err)
 		}
-		requestArgs := requestFlags.Args()
-		if len(requestArgs) != 1 {
-			log.Fatalf("Usage: gaur-share request [--screenshot] <target-device>")
+		browseRest := append(append([]string(nil), browseFlags.Args()...), tail...)
+		if len(browseRest) < 1 || len(browseRest) > 2 {
+			log.Fatalf("Usage: gaur-share browse <device> [path] [--json]")
 		}
-		if err := runRequest(cfg, requestArgs[0], *requestScreenshot); err != nil {
-			// runRequest returns the user-facing outcome line (declined,
-			// timed out, connection lost) as its error text.
-			fmt.Fprintln(os.Stderr, err.Error())
+		browsePath := ""
+		if len(browseRest) == 2 {
+			browsePath = browseRest[1]
+		}
+		// Honor the global -json as well as the subcommand flag.
+		browseJSONOut := *browseJSON || jsonOutput
+		if err := runBrowse(cfg, browseRest[0], browsePath, browseJSONOut); err != nil {
+			// In JSON mode runBrowse already printed the error object; the
+			// human mode gets the pinned one-line "error: <reason>" form.
+			if !browseJSONOut {
+				fmt.Fprintln(os.Stderr, "error: "+singleLineDisplayName(err.Error()))
+			}
+			os.Exit(1)
+		}
+	case "fetch":
+		fetchFlags := flag.NewFlagSet("fetch", flag.ExitOnError)
+		head, tail := splitDoubleDash(args[1:])
+		if err := fetchFlags.Parse(head); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		fetchRest := append(append([]string(nil), fetchFlags.Args()...), tail...)
+		if len(fetchRest) < 2 {
+			log.Fatalf("Usage: gaur-share fetch <device> <path> [path...]")
+		}
+		if err := runFetch(cfg, fetchRest[0], fetchRest[1:]); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+singleLineDisplayName(err.Error()))
+			os.Exit(1)
+		}
+	case "screenshot":
+		shotFlags := flag.NewFlagSet("screenshot", flag.ExitOnError)
+		head, tail := splitDoubleDash(args[1:])
+		if err := shotFlags.Parse(head); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		shotRest := append(append([]string(nil), shotFlags.Args()...), tail...)
+		if len(shotRest) != 1 {
+			log.Fatalf("Usage: gaur-share screenshot <device>")
+		}
+		if err := runScreenshot(cfg, shotRest[0]); err != nil {
+			fmt.Fprintln(os.Stderr, "error: "+singleLineDisplayName(err.Error()))
 			os.Exit(1)
 		}
 	case "send-text":
@@ -183,11 +242,15 @@ func main() {
 		}
 	case "ui":
 		uiFlags := flag.NewFlagSet("ui", flag.ExitOnError)
-		uiAddr := uiFlags.String("addr", "127.0.0.1:0", "Local address for the UI")
+		uiAddr := uiFlags.String("addr", defaultUIAddr, "Local address for the UI")
+		uiOpen := uiFlags.Bool("open", false, "Open the UI in the default browser")
 		if err := uiFlags.Parse(args[1:]); err != nil {
 			log.Fatalf("[FATAL] %v", err)
 		}
-		runUI(cfg, *uiAddr)
+		if err := runUI(cfg, *uiAddr, *uiOpen); err != nil {
+			fmt.Fprintln(os.Stderr, err.Error())
+			os.Exit(1)
+		}
 	case "notify":
 		notifyFlags := flag.NewFlagSet("notify", flag.ExitOnError)
 		notifyAll := notifyFlags.Bool("all", false, "Send to every online device")
@@ -256,6 +319,6 @@ func main() {
 		}
 		fmt.Printf("Only trusted devices: %s\n", args[1])
 	default:
-		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, request, send-text, pair, ui, notify, trust, untrust, trusted, trust-mode", args[0])
+		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, browse, fetch, screenshot, send-text, pair, ui, notify, trust, untrust, trusted, trust-mode", args[0])
 	}
 }
