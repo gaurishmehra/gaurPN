@@ -405,7 +405,7 @@ const uiHTML = `<!doctype html>
 </head>
 <body>
 <main>
-  <h1>gaurPN share</h1>
+  <h1><svg viewBox="70 45 375 420" width="25" height="28" role="img" aria-label="gaurPN scorpion logo" style="vertical-align:-6px;margin-right:9px"><g transform="translate(-13 9)"><g fill="#fff"><ellipse cx="210" cy="225" rx="32" ry="38"/><ellipse cx="210" cy="280" rx="28" ry="13"/><ellipse cx="210" cy="306" rx="23" ry="11"/><ellipse cx="210" cy="328" rx="17" ry="9"/><path d="M201 108Q199 134 196 150Q214 134 219 108Z"/></g><path fill="none" stroke="#fff" stroke-width="18" stroke-linecap="round" stroke-linejoin="round" d="M210 333C210 400 255 438 320 436C385 434 432 372 432 262C432 150 380 62 300 58C270 57 240 66 222 84C214 92 210 100 210 110"/><g fill="none" stroke="#fff" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"><path d="M190 212C160 208 124 196 112 170C104 148 118 124 150 122M112 170C122 176 150 168 160 140"/><path d="M230 212C260 208 296 196 308 170C316 148 302 124 270 122M308 170C298 176 270 168 260 140"/></g><g fill="none" stroke="#fff" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"><path d="M180 240C150 238 124 246 104 270"/><path d="M199 258C168 262 140 280 126 308"/><path d="M184 282C162 292 148 312 146 340"/><path d="M189 304C174 316 168 336 172 360"/><path d="M240 240C270 238 296 246 316 270"/><path d="M221 258C252 262 280 280 294 308"/><path d="M236 282C258 292 272 312 274 340"/><path d="M231 304C246 316 252 336 248 360"/></g></g></svg>gaurPN share</h1>
   <p class="sub">Local control panel. Traffic stays inside the Shadowsocks tunnel.</p>
 
   <div class="card">

@@ -1,6 +1,12 @@
+<p align="center">
+  <img src="assets/logo.svg" width="140" alt="gaurPN scorpion logo">
+</p>
+
 # gaurPN
 
-Your phone, your laptop, your desktop. One private network.
+<p align="center">
+  <strong>Your phone, your laptop, your desktop. One private network.</strong>
+</p>
 
 gaurPN turns a Shadowsocks VPS into a home for every device you carry. The Android app is the VPN. The desktop binary is the companion. The relay on your server routes ciphertext between them. Connect once and your devices find each other through the tunnel: send files, sync the clipboard, mirror notifications, control media, pull a screenshot off your phone while you sit at your desk. Every payload is end-to-end encrypted before it leaves the device, and the relay in the middle holds no keys.
 
@@ -124,6 +130,7 @@ The stock Android client dials the proxy with unprotected sockets. When a VPN ro
 
 ```
 outline/
+├── assets/               # Logo and brand assets (logo.svg)
 ├── app/                  # Android application (Kotlin, Jetpack Compose, DataStore)
 │   ├── src/main/kotlin/  # UI, tunnel service, key parsing, and in-tunnel transfer logic
 │   └── src/test/         # Unit tests (URI parser, cryptography tests)
