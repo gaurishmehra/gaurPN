@@ -460,3 +460,18 @@ func TestWriteBrowseResultReencodes(t *testing.T) {
 		t.Fatalf("empty output: code = %d, want 500", rec.Code)
 	}
 }
+
+// The peers JSON is snake_case (runList); the page JS must read it that way.
+// A past regression rendered every peer as "undefined".
+func TestUIHTMLUsesSnakeCasePeerFields(t *testing.T) {
+	for _, bad := range []string{"p.ID", "p.Name", "p.IsSelf", ".IsSelf"} {
+		if strings.Contains(uiHTML, bad) {
+			t.Errorf("uiHTML references %q — the peers JSON is snake_case", bad)
+		}
+	}
+	for _, want := range []string{"p.id", "p.name", "!p.is_self"} {
+		if !strings.Contains(uiHTML, want) {
+			t.Errorf("uiHTML missing %q", want)
+		}
+	}
+}

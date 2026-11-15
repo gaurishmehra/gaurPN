@@ -487,7 +487,7 @@ function fillPeers(select, peers) {
     return;
   }
   for (const p of peers) {
-    select.appendChild(option(p.ID, p.Name + " (" + p.ID + ")"));
+    select.appendChild(option(p.id, p.name + " (" + p.id + ")"));
   }
 }
 
@@ -497,7 +497,7 @@ async function refresh() {
     const r = await fetch("/api/peers");
     const j = await r.json();
     const peers = JSON.parse(j.output || "[]");
-    const others = peers.filter(p => !p.IsSelf);
+    const others = peers.filter(p => !p.is_self);
     fillPeers(peer, others);
     fillPeers(browsePeer, others);
     out.textContent = j.output || "No devices.";
