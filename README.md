@@ -1,12 +1,20 @@
 # gaurPN
 
-A custom Android client for Outline (Shadowsocks) with in-tunnel end-to-end encrypted file sharing, per-app split tunneling, and LAN bypass. Built with Material 3 dark UI, a Quick Settings tile, and a protected Go tun2socks engine.
+**One private network for every device you own.**
 
-## Why this exists
+gaurPN is a self-hosted ecosystem that keeps your phone, laptop, and desktop connected to each other — and to the open internet — no matter where you are, without surrendering a single byte of visibility to anyone else. A custom Android VPN client, a desktop companion, and a zero-knowledge relay on your own VPS work together as one system: your traffic tunnels through Shadowsocks to a server you control, and everything shared between your devices is end-to-end encrypted before it ever leaves them.
 
-I like the official Outline app. I do not like using it. Every session, I tap through screens, read labels I already know, and stare at an interface that looks the same on every phone. So I kept the part Jigsaw got right (the Go tunnel and its protected sockets) and rewrote everything you touch.
+No accounts. No telemetry. No third-party servers. Just your devices, your tunnel, your keys.
 
-gaurPN consolidates control into one dark screen, one status ring, and one button. It toggles from Quick Settings, reconnects when the network drops, and stays out of your way. On top of the core VPN, it integrates tools missing from the stock client: direct peer-to-peer file transfer running inside the tunnel without local Wi-Fi leakage, per-app split tunneling, and LAN bypass for local network devices.
+## The ecosystem
+
+Three surfaces, one network:
+
+- **gaurPN (Android)** — the VPN client and your always-on link back to the cluster. Connects with one tap or a Quick Settings tile, reconnects on its own when the network drops, and routes every packet through a protected Go tunnel engine. On top of the VPN it carries the cluster experience: live peer cards, file transfers, clipboard sync, notification mirroring, and media control.
+- **gaur-share (Linux / macOS / Windows)** — a single standalone Go binary that plugs any desktop into the same cluster. It receives files, sends text and links, mirrors notifications, syncs the clipboard, and lets you browse and pull files from your other devices — driven by a CLI, a local browser UI, or your desktop shell.
+- **gaur-relay (your VPS)** — a tiny Go daemon bound to loopback on your own server, reachable only through the tunnel. It routes opaque ciphertext between your devices and holds sealed envelopes for offline ones. It has no keys, cannot decrypt anything, and forgets everything on a TTL.
+
+Everything between them rides one Shadowsocks tunnel. Your devices find each other through it, share through it, and stay reachable through it — at home, on hotel Wi-Fi, or on mobile data — and nothing about that sharing ever touches a LAN broadcast domain or a cloud service.
 
 ## What it does
 
@@ -21,8 +29,8 @@ gaurPN consolidates control into one dark screen, one status ring, and one butto
 - **DNS Through the Tunnel**: Queries go to AdGuard Home on the VPS over the Shadowsocks tunnel, not to a public resolver. The default is `10.0.0.182`; it is configurable and forced into the tunnel with a host route.
 - **IPv6-Aware LAN Bypass**: When LAN access is enabled, IPv4 private ranges and IPv6 link-local/ULA/multicast stay local while global IPv6 unicast remains tunneled.
 
-### In-Tunnel File Sharing (`gaur-share`)
-- **Zero Local Wi-Fi Leakage**: All traffic stays inside the Shadowsocks tunnel. No mDNS, no Bonjour, no ARP broadcasts, and no UDP hole punching on your local network.
+### Staying connected across devices (`gaur-share`)
+- **Zero Local Wi-Fi Leakage**: All cluster traffic stays inside the Shadowsocks tunnel. No mDNS, no Bonjour, no ARP broadcasts, and no UDP hole punching on your local network.
 - **Double Encryption**: Outer Shadowsocks AEAD (`chacha20-ietf-poly1305` or `aes-256-gcm`) wraps an inner layer of ephemeral ECDH (NIST P-256) key exchange, HKDF-SHA256 session key derivation, and authenticated AES-256-GCM chunked streaming (1 MiB chunks, index-bound nonces, per-chunk AAD).
 - **Content-Addressed Resume**: Transfers are keyed by `HMAC(K_peer, sha256(file))`, so the same bytes always resume the same transfer. The receiver keeps a `.part` file and a chunk bitmap in `Downloads`; a dropped connection re-uploads only the missing chunks. A signed completion receipt means "Sent" only after the receiver decrypted and saved the file.
 - **Zero-Knowledge Dual-Key Architecture**: Derives separate relay presence keys ($K_{relay}$) and local peer authentication keys ($K_{peer}$), with HMAC-SHA256 authentication tags binding the transfer ID, recipient ID, ephemeral public keys, and the v2 file manifest, preventing relay Man-In-The-Middle attacks and enabling safety number verification.
