@@ -1,7 +1,6 @@
 package dev.gaurish.outlinelite.ui
 
 import android.net.Uri
-import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
@@ -150,17 +149,17 @@ fun LanAccessRow(
 @Composable
 fun ClusterSharingSection(
     onOpenSettings: () -> Unit,
+    onBrowsePeer: (ClusterPeer) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val scheme = MaterialTheme.colorScheme
-    val scope = rememberCoroutineScope()
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
     val transferState by RelayManager.transferState.collectAsStateWithLifecycle()
     val token by KeyRepository.observeClusterToken(context).collectAsStateWithLifecycle(initialValue = "")
 
     var targetPeerForPicker by remember { mutableStateOf<ClusterPeer?>(null) }
-    var requestPeer by remember { mutableStateOf<ClusterPeer?>(null) }
+    var browsePeer by remember { mutableStateOf<ClusterPeer?>(null) }
     val filePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris: List<Uri> ->
@@ -265,7 +264,7 @@ fun ClusterSharingSection(
                                     targetPeerForPicker = peer
                                     filePickerLauncher.launch("*/*")
                                 },
-                                onLongClick = { requestPeer = peer },
+                                onLongClick = { browsePeer = peer },
                             )
                         }
                     }
@@ -273,13 +272,13 @@ fun ClusterSharingSection(
             }
         }
 
-        requestPeer?.let { peer ->
+        browsePeer?.let { peer ->
             AlertDialog(
-                onDismissRequest = { requestPeer = null },
-                title = { Text("Request files from ${peer.name}?") },
+                onDismissRequest = { browsePeer = null },
+                title = { Text("Browse files") },
                 text = {
                     Text(
-                        "They will get a notification to pick files and send them back " +
+                        "Open ${peer.name}'s shared folders and download what you pick " +
                             "over the encrypted tunnel.",
                         fontSize = 13.sp,
                         color = scheme.onSurfaceVariant,
@@ -288,26 +287,15 @@ fun ClusterSharingSection(
                 confirmButton = {
                     TextButton(
                         onClick = {
-                            requestPeer = null
-                            scope.launch {
-                                val sent = RelayManager.requestFiles(context, peer)
-                                Toast.makeText(
-                                    context,
-                                    if (sent) {
-                                        "Request sent to ${peer.name}"
-                                    } else {
-                                        "Request failed: not connected"
-                                    },
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            }
+                            browsePeer = null
+                            onBrowsePeer(peer)
                         },
                     ) {
-                        Text("Request")
+                        Text("Browse ${peer.name}'s files")
                     }
                 },
                 dismissButton = {
-                    TextButton(onClick = { requestPeer = null }) {
+                    TextButton(onClick = { browsePeer = null }) {
                         Text("Cancel")
                     }
                 },

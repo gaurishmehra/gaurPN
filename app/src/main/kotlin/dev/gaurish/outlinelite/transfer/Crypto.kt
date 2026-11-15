@@ -368,9 +368,25 @@ object Crypto {
     fun sanitizeFileName(rawName: String): String {
         val normalized = rawName.trim().trimEnd('/', '\\').replace('\\', '/')
         val base = normalized.substringAfterLast('/')
-        val clean = base.replace(Regex("[\\x00-\\x1F\\x7F/\\\\:*?\"<>|]"), "_").trim()
+        val controlFree = base.replace(Regex("[\\x00-\\x1F\\x7F/\\\\:*?\"<>|]"), "_")
+        // A malicious target must not smuggle bidi overrides, zero-width
+        // joiners, or a BOM into the Downloads name: Unicode Cf is stripped
+        // with the same rule the display sanitizer uses.
+        val clean = stripFormatChars(controlFree).trim()
         val sanitized = clean.replace(Regex("^\\.+"), "")
         return if (sanitized.isBlank()) "download_${System.currentTimeMillis()}" else sanitized
+    }
+
+    /** Removes Unicode Cf (format) code points, surrogate pairs included. */
+    private fun stripFormatChars(value: String): String = buildString(value.length) {
+        var index = 0
+        while (index < value.length) {
+            val codePoint = value.codePointAt(index)
+            if (Character.getType(codePoint) != Character.FORMAT.toInt()) {
+                appendCodePoint(codePoint)
+            }
+            index += Character.charCount(codePoint)
+        }
     }
 
     fun isPathInsideDirectory(destFile: File, baseDir: File): Boolean {

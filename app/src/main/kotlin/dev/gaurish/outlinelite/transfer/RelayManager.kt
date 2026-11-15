@@ -29,12 +29,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.WebSocket
 import org.json.JSONObject
 import java.util.UUID
@@ -61,6 +65,9 @@ object RelayManager {
     private const val MAX_SEALED_PAYLOAD_BYTES = 512 * 1024
     private const val MAX_NOTIFICATION_PAYLOAD_BYTES = 256 * 1024
     private const val MAX_HISTORY_LABEL_CHARS = 120
+
+    /** One listing round trip; a lost reply becomes a retryable UI error. */
+    private const val BROWSE_TIMEOUT_MS = 10_000L
     private val URL_REGEX = Regex("^https?://\\S+$", RegexOption.IGNORE_CASE)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -97,6 +104,32 @@ object RelayManager {
 
     /** Per-requester throttle for automatic screenshot replies. */
     private val screenshotRateLimiter = ScreenshotRateLimiter()
+
+    /** Per-requester throttle for browse listings (2 accepted per second). */
+    private val browseRateLimiter = BrowseRateLimiter()
+
+    /** Phone-wide browse budget (10 accepted listings per second, all requesters). */
+    private val globalBrowseBucket = GlobalBrowseBucket()
+
+    /** At most two listings are built at once; a third is answered rate_limited. */
+    private val browseWorkers = BrowseWorkerSlots()
+
+    /**
+     * Browse listings this phone asked for and is still waiting on, keyed by
+     * request id. The id is generated locally and only sent to one peer, so a
+     * reply that finds no entry is dropped like an unknown decline. The
+     * expected path travels with the entry so a reply for a different
+     * directory cannot be spliced into the screen.
+     */
+    private val pendingBrowseListings = PendingBrowseListings()
+
+    /**
+     * Declines for fetches this phone sent. The existing notification path
+     * still posts; an open BrowseScreen also collects this to show the reason
+     * in place. Buffered so emission never blocks the socket thread.
+     */
+    private val _browseDeclines = MutableSharedFlow<DeclineEnvelope>(extraBufferCapacity = 16)
+    internal val browseDeclines: SharedFlow<DeclineEnvelope> = _browseDeclines.asSharedFlow()
 
     /** Devices whose malformed status blob was already logged once. */
     private val statusWarned = ConcurrentHashMap.newKeySet<String>()
@@ -713,8 +746,8 @@ object RelayManager {
         uris: List<Uri>,
         offline: Boolean = false,
         request: RequestContext? = null,
-    ) {
-        outboundSender.sendFilesV3(context, targets, uris, offline, deviceId, request)
+    ): Job? {
+        return outboundSender.sendFilesV3(context, targets, uris, offline, deviceId, request)
     }
 
     fun sendFiles(
@@ -812,7 +845,10 @@ object RelayManager {
 
         // Requests carry their own trust gate (an untrusted requester gets a
         // decline, not silence) and their own sender key, so they are
-        // dispatched before the generic sender_id gate.
+        // dispatched before the generic sender_id gate. Browse and fetch do
+        // the same: their envelopes name the requester and target directly,
+        // and their target-side gate is the trusted-device list (a consent
+        // capability), not the generic only-trusted toggle.
         when (kind) {
             "request" -> {
                 handleIncomingRequest(context, relayToken, peerCryptoKey, inner)
@@ -820,6 +856,18 @@ object RelayManager {
             }
             "request_declined" -> {
                 handleRequestDeclined(context, inner)
+                return
+            }
+            "browse" -> {
+                handleIncomingBrowse(context, inner)
+                return
+            }
+            "browse_listing" -> {
+                handleBrowseListing(inner)
+                return
+            }
+            "fetch" -> {
+                handleIncomingFetch(context, peerCryptoKey, inner)
                 return
             }
         }
@@ -922,33 +970,12 @@ object RelayManager {
         }
 
         when (request.kind) {
-            RequestKind.FILES -> handleFileRequest(context, request)
-            RequestKind.SCREENSHOT -> handleScreenshotRequest(context, request)
-        }
-    }
-
-    /** File requests need a user decision, so they park in a notification. */
-    private suspend fun handleFileRequest(context: Context, request: RequestEnvelope) {
-        if (!allowFileRequests) {
-            sendDecline(context, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED)
-            return
-        }
-        // Allocate the notification id before claiming the slot: the lease
-        // owns it until the request is answered, so it must be held even if a
-        // concurrent request loses the race below.
-        val notifId = NotificationIds.acquire(request.requestId, sending = false)
-        if (!tryAcquireRequest(context, request, notifId)) {
-            NotificationIds.release(notifId)
-            sendDecline(context, request.requesterId, request.requestId, DeclineReason.BUSY)
-            return
-        }
-        if (!RequestNotifications.showFileRequest(context, request, notifId)) {
-            // No notification means no picker, so free the slot and say so.
-            releaseRequest(context, request.requestId)
-            sendDecline(
-                context, request.requesterId, request.requestId,
-                DeclineReason.PICKER_UNAVAILABLE,
+            // The old picker flow is gone. Old clients still send kind
+            // "files"; answer so they are not left waiting.
+            RequestKind.FILES -> sendDecline(
+                context, request.requesterId, request.requestId, DeclineReason.UNSUPPORTED,
             )
+            RequestKind.SCREENSHOT -> handleScreenshotRequest(context, request)
         }
     }
 
@@ -1012,6 +1039,9 @@ object RelayManager {
         // only gate: a decline for a request this phone never sent (including
         // a reflected request aimed at a victim) finds nothing and is dropped.
         if (!outstandingRequests.take(decline.requestId)) return
+        // An open BrowseScreen shows the reason in place; the notification is
+        // the fallback when no screen is listening.
+        _browseDeclines.tryEmit(decline)
         RequestNotifications.showDeclined(context, decline.requestId, decline.reason)
     }
 
@@ -1034,16 +1064,18 @@ object RelayManager {
      * a request the user never answered cannot wedge the phone forever; the
      * displaced lease's notification id is released with it.
      */
-    private fun tryAcquireRequest(
+    private fun tryAcquireSlot(
         context: Context,
-        request: RequestEnvelope,
+        requestId: String,
+        expiresTs: Long,
+        trustId: String,
         notifId: Int?,
     ): Boolean {
         val result = requestSlot.acquire(
             RequestSlot.Lease(
-                id = request.requestId,
-                expiresTs = request.expiresTs,
-                trustId = request.trustId,
+                id = requestId,
+                expiresTs = expiresTs,
+                trustId = trustId,
                 notifId = notifId,
             ),
         )
@@ -1051,6 +1083,18 @@ object RelayManager {
         releaseLeaseNotification(context, result.displaced)
         return true
     }
+
+    private fun tryAcquireRequest(
+        context: Context,
+        request: RequestEnvelope,
+        notifId: Int?,
+    ): Boolean = tryAcquireSlot(
+        context = context,
+        requestId = request.requestId,
+        expiresTs = request.expiresTs,
+        trustId = request.trustId,
+        notifId = notifId,
+    )
 
     private fun releaseRequest(context: Context, requestId: String) {
         releaseLeaseNotification(context, requestSlot.release(requestId))
@@ -1063,23 +1107,245 @@ object RelayManager {
         NotificationIds.release(notifId)
     }
 
+    // ------------------------------------------------------ browse (target)
+
     /**
-     * Asks [target] for files. The phone auto-accepts the returning offer
-     * through the existing trust-gated flow; the grant is included for
-     * uniformity with the desktop requester, which verifies it.
+     * Sealed `browse`: a peer asks for one directory listing. Browse is a
+     * consent capability — only a device the user explicitly trusted
+     * (Settings -> Trusted devices) is served, whatever the only-trusted
+     * toggle says — and every accepted request is additionally bounded by a
+     * per-requester window, a phone-wide budget, and a worker cap. Every
+     * refusal is a `browse_listing` carrying an error, never silence.
      */
-    suspend fun requestFiles(context: Context, target: ClusterPeer): Boolean {
-        if (!RelayConnection.isConnected) return false
+    private suspend fun handleIncomingBrowse(context: Context, inner: JSONObject) {
+        val browse = RequestCodec.parseBrowse(inner) ?: return
+        if (browse.targetId != deviceId || browse.trustId == deviceId) return
+
+        if (!isTrustedBrowser(context, browse.trustId)) {
+            sendListingError(
+                context, browse.requesterId, browse.requestId, browse.path, BrowseError.DENIED,
+            )
+            return
+        }
+        if (requestDeduper.seen(browse.requestId)) return
+
+        val now = System.currentTimeMillis()
+        if (!browseRateLimiter.isAllowed(browse.trustId, now) ||
+            !globalBrowseBucket.isAllowed(now)
+        ) {
+            sendListingError(
+                context, browse.requesterId, browse.requestId, browse.path,
+                BrowseError.RATE_LIMITED,
+            )
+            return
+        }
+        // Browsing is a file request: the same toggle governs both.
+        if (!allowFileRequests) {
+            sendListingError(
+                context, browse.requesterId, browse.requestId, browse.path, BrowseError.DENIED,
+            )
+            return
+        }
+
+        // A path outside the six virtual collections cannot exist; answer
+        // not_found instead of querying for it.
+        if (browse.path.isNotEmpty() &&
+            MediaCollection.forRoot(browse.path.substringBefore('/')) == null
+        ) {
+            sendListingError(
+                context, browse.requesterId, browse.requestId, browse.path,
+                BrowseError.NOT_FOUND,
+            )
+            return
+        }
+
+        // Claim a worker before touching MediaStore. Two listings already in
+        // flight means the phone is saturated: answer rate_limited instead of
+        // queueing more cursor work behind them.
+        if (!browseWorkers.tryAcquire()) {
+            sendListingError(
+                context, browse.requesterId, browse.requestId, browse.path,
+                BrowseError.RATE_LIMITED,
+            )
+            return
+        }
+        // Recorded only once the request will actually be served, so a
+        // refused browse does not spend the requester's or the phone's budget.
+        browseRateLimiter.record(browse.trustId, now)
+        globalBrowseBucket.record(now)
+
+        val listing = try {
+            BrowseSource.list(context, browse.path)
+        } catch (c: CancellationException) {
+            throw c
+        } catch (t: Throwable) {
+            Log.w(TAG, "Browse ${browse.requestId} failed: ${t.javaClass.simpleName}")
+            sendListingError(
+                context, browse.requesterId, browse.requestId, browse.path,
+                BrowseError.UNSUPPORTED,
+            )
+            return
+        } finally {
+            browseWorkers.release()
+        }
+        val reply = RequestCodec.buildBrowseListing(
+            requestId = browse.requestId,
+            path = browse.path,
+            entries = listing.entries,
+            truncated = listing.truncated,
+            ts = System.currentTimeMillis(),
+        )
+        sendSealed(context, browse.requesterId, "browse_listing", reply)
+    }
+
+    private suspend fun sendListingError(
+        context: Context,
+        targetId: String,
+        requestId: String,
+        path: String,
+        error: BrowseError,
+    ) {
+        val reply = RequestCodec.buildBrowseListing(
+            requestId = requestId,
+            path = path,
+            error = error,
+            ts = System.currentTimeMillis(),
+        )
+        sendSealed(context, targetId, "browse_listing", reply)
+    }
+
+    // ------------------------------------------------------- fetch (target)
+
+    /**
+     * Sealed `fetch`: the requester picked files from a listing. The target
+     * resolves every path, enforces the batch cap, and hands the URIs to the
+     * existing v3 sender with the request echo. Fetch is a consent capability
+     * like browse: only an explicitly trusted device is served. One fetch
+     * runs at a time; the lease is held until the send job finishes, so a
+     * second fetch cannot cancel the first mid-flight.
+     */
+    private suspend fun handleIncomingFetch(
+        context: Context,
+        peerCryptoKey: ByteArray,
+        inner: JSONObject,
+    ) {
+        val fetch = RequestCodec.parseFetch(inner) ?: return
+        if (fetch.targetId != deviceId || fetch.trustId == deviceId) return
+
+        if (!isTrustedBrowser(context, fetch.trustId)) {
+            sendDecline(context, fetch.requesterId, fetch.requestId, DeclineReason.NOT_ALLOWED)
+            return
+        }
+        if (requestDeduper.seen(fetch.requestId)) return
+        // Expiry gates NEW fetches only. Once accepted, the lease below is
+        // held until the send job completes, however long that takes.
+        if (RequestCodec.isExpired(fetch.expiresTs)) {
+            sendDecline(context, fetch.requesterId, fetch.requestId, DeclineReason.EXPIRED)
+            return
+        }
+        // The grant binds the request to this target and expiry; the seal
+        // already proves cluster membership, and this proves the fetch was
+        // minted for this exact request rather than replayed.
+        if (!ClusterCrypto.verifyRequestGrant(
+                peerCryptoKey,
+                fetch.requestId,
+                fetch.requesterId,
+                fetch.targetId,
+                fetch.expiresTs,
+                fetch.grant,
+            )
+        ) {
+            sendDecline(context, fetch.requesterId, fetch.requestId, DeclineReason.NOT_ALLOWED)
+            return
+        }
+        if (!allowFileRequests) {
+            sendDecline(context, fetch.requesterId, fetch.requestId, DeclineReason.NOT_ALLOWED)
+            return
+        }
+        if (!tryAcquireSlot(
+                context = context,
+                requestId = fetch.requestId,
+                // Held until the send job completes: a 4 GiB send can outlive
+                // the grant's five-minute window, and expiry only gates new
+                // fetches (checked above).
+                expiresTs = RequestSlot.HELD_UNTIL_RELEASED,
+                trustId = fetch.trustId,
+                notifId = null,
+            )
+        ) {
+            sendDecline(context, fetch.requesterId, fetch.requestId, DeclineReason.BUSY)
+            return
+        }
+
+        try {
+            val resolved = fetch.paths.map { BrowseSource.resolve(context, it) }
+            val rejection = FetchValidation.validate(
+                paths = fetch.paths,
+                sizes = resolved.map { it?.row?.size },
+            )
+            if (rejection != null) {
+                sendDecline(context, fetch.requesterId, fetch.requestId, rejection.reason)
+                releaseRequest(context, fetch.requestId)
+                return
+            }
+            val uris = resolved.mapNotNull { it?.uri }
+            val targetName = _peers.value.firstOrNull { it.id == fetch.requesterId }?.name
+                ?: singleLineDisplayName(fetch.requesterName)
+            // Tell the user what left the phone before it starts moving: the
+            // peer label and the count, never the file names.
+            RequestNotifications.showFetchStarted(
+                context = context,
+                requesterName = fetch.requesterName,
+                stableId = fetch.trustId,
+                fileCount = fetch.paths.size,
+            )
+            val job = outboundSender.sendFilesV3(
+                context = context,
+                targets = listOf(ClusterPeer(fetch.requesterId, targetName)),
+                uris = uris,
+                offline = false,
+                deviceId = deviceId,
+                request = RequestContext(fetch.requestId, fetch.grant),
+            )
+            if (job == null) {
+                releaseRequest(context, fetch.requestId)
+            } else {
+                // Hold the slot for the whole send, however long it runs: a
+                // second fetch while this one streams is answered BUSY instead
+                // of cancelling it.
+                val appCtx = context.applicationContext
+                job.invokeOnCompletion { releaseRequest(appCtx, fetch.requestId) }
+            }
+        } catch (c: CancellationException) {
+            releaseRequest(context, fetch.requestId)
+            throw c
+        } catch (t: Throwable) {
+            Log.w(TAG, "Fetch ${fetch.requestId} failed: ${t.javaClass.simpleName}")
+            releaseRequest(context, fetch.requestId)
+            sendDecline(context, fetch.requesterId, fetch.requestId, DeclineReason.UNSUPPORTED)
+        }
+    }
+
+    // --------------------------------------------------- browse (requester)
+
+    /**
+     * Asks [target] for the listing at [path] and waits one round trip. The
+     * reply is matched by the locally generated request id; a timeout or a
+     * dropped socket yields null and the screen shows a retryable error.
+     */
+    internal suspend fun browseListing(
+        context: Context,
+        target: ClusterPeer,
+        path: String,
+    ): BrowseListingEnvelope? {
+        if (!RelayConnection.isConnected) return null
+        if (!RequestCodec.isBrowsePath(path)) return null
         val token = KeyRepository.getClusterToken(context)
-        if (token.isBlank()) return false
-        val (_, peerCryptoKey) = Crypto.deriveSubKeys(token)
+        if (token.isBlank()) return null
+
         val now = System.currentTimeMillis()
         val requestId = ClusterCrypto.newRequestId()
-        val expiresTs = now + RequestCodec.REQUEST_TTL_MS
-        val grant = ClusterCrypto.computeRequestGrant(
-            peerCryptoKey, requestId, deviceId, target.id, expiresTs,
-        )
-        val inner = RequestCodec.buildRequest(
+        val inner = RequestCodec.buildBrowse(
             requestId = requestId,
             requesterId = deviceId,
             // The phone always asks under its real id; the stable origin is
@@ -1087,7 +1353,62 @@ object RelayManager {
             originId = deviceId,
             requesterName = KeyRepository.getDeviceName(context),
             targetId = target.id,
-            kind = RequestKind.FILES,
+            path = path,
+            ts = now,
+        )
+        val deferred = CompletableDeferred<BrowseListingEnvelope>()
+        pendingBrowseListings.add(requestId, path, deferred)
+        return try {
+            if (!sendSealed(context, target.id, "browse", inner)) {
+                null
+            } else {
+                withTimeoutOrNull(BROWSE_TIMEOUT_MS) { deferred.await() }
+            }
+        } finally {
+            pendingBrowseListings.remove(requestId)
+        }
+    }
+
+    private fun handleBrowseListing(inner: JSONObject) {
+        val listing = RequestCodec.parseBrowseListing(inner) ?: return
+        // A reply for a different directory is not the answer to this
+        // request. Match the path before consuming the entry: the real reply
+        // may still arrive, and the requester's timeout cleans up if it does
+        // not.
+        val pending = pendingBrowseListings.take(listing.requestId, listing.path) ?: return
+        pending.deferred.complete(listing)
+    }
+
+    /**
+     * Sends a sealed `fetch` for paths the user picked in a listing. Returns
+     * the request id on success so the screen can match a decline, or null
+     * when the frame never left the phone.
+     */
+    suspend fun requestFetch(
+        context: Context,
+        target: ClusterPeer,
+        paths: List<String>,
+    ): String? {
+        if (!RelayConnection.isConnected) return null
+        if (paths.isEmpty() || paths.size > RequestCodec.MAX_FETCH_PATHS) return null
+        if (paths.any { !RequestCodec.isRelativePath(it) }) return null
+        val token = KeyRepository.getClusterToken(context)
+        if (token.isBlank()) return null
+        val (_, peerCryptoKey) = Crypto.deriveSubKeys(token)
+
+        val now = System.currentTimeMillis()
+        val requestId = ClusterCrypto.newRequestId()
+        val expiresTs = now + RequestCodec.REQUEST_TTL_MS
+        val grant = ClusterCrypto.computeRequestGrant(
+            peerCryptoKey, requestId, deviceId, target.id, expiresTs,
+        )
+        val inner = RequestCodec.buildFetch(
+            requestId = requestId,
+            requesterId = deviceId,
+            originId = deviceId,
+            requesterName = KeyRepository.getDeviceName(context),
+            targetId = target.id,
+            paths = paths,
             expiresTs = expiresTs,
             grant = grant,
             ts = now,
@@ -1095,67 +1416,12 @@ object RelayManager {
         // Record before sending so a fast decline cannot beat the map; drop
         // the entry again if the socket refused the frame.
         outstandingRequests.add(requestId, expiresTs, now)
-        val sent = sendSealed(context, target.id, "request", inner)
-        if (!sent) outstandingRequests.remove(requestId)
-        return sent
-    }
-
-    /**
-     * Re-validates a picker answer against the live lease and the current
-     * trust settings. The notification extras are a snapshot: a request can
-     * expire or be superseded while the system picker is open, and the trust
-     * list can change. Both are checked again immediately before the send.
-     */
-    internal suspend fun isRequestActiveAndTrusted(context: Context, requestId: String): Boolean {
-        val trustId = requestSlot.trustIdIfActive(requestId) ?: return false
-        return acceptsInbound(context, InboundKind.REQUEST, trustId)
-    }
-
-    /** Sends the files the user picked for [requestId] back to the requester. */
-    fun sendFilesFromRequest(
-        context: Context,
-        requesterId: String,
-        requestId: String,
-        grant: String,
-        uris: List<Uri>,
-    ) {
-        if (!RequestCodec.isDeviceId(requesterId) || !RequestCodec.isRequestId(requestId) ||
-            !RequestCodec.isGrant(grant) || uris.isEmpty()
-        ) {
-            releaseRequest(context, requestId)
-            outboundSender.releaseReadGrants(context, uris)
-            return
+        val sent = sendSealed(context, target.id, "fetch", inner)
+        if (!sent) {
+            outstandingRequests.remove(requestId)
+            return null
         }
-        if (!requestSlot.isActive(requestId)) {
-            // The picker's snapshot went stale while the system picker was
-            // open; never send an answer for a request that is no longer live.
-            Log.i(TAG, "Ignoring answer for request $requestId: no longer active")
-            outboundSender.releaseReadGrants(context, uris)
-            return
-        }
-        val targetName = _peers.value.firstOrNull { it.id == requesterId }?.name ?: "Remote device"
-        outboundSender.sendFilesV3(
-            context = context,
-            targets = listOf(ClusterPeer(requesterId, targetName)),
-            uris = uris,
-            offline = false,
-            deviceId = deviceId,
-            request = RequestContext(requestId, grant),
-            releaseUriGrants = true,
-        )
-        releaseRequest(context, requestId)
-    }
-
-    /** Declines [requestId] and frees the request slot. */
-    fun declineRequest(
-        context: Context,
-        requesterId: String,
-        requestId: String,
-        reason: DeclineReason,
-    ) {
-        releaseRequest(context, requestId)
-        if (!RequestCodec.isDeviceId(requesterId) || !RequestCodec.isRequestId(requestId)) return
-        scope.launch { sendDecline(context.applicationContext, requesterId, requestId, reason) }
+        return requestId
     }
 
     /**
@@ -1274,6 +1540,31 @@ object RelayManager {
             )
         }
         return accepted
+    }
+
+    /**
+     * Browse and fetch are a consent capability, not passive receive: a
+     * listing or a file pull is served only to a device the user explicitly
+     * trusted (Settings -> Trusted devices), whatever the "only trusted
+     * devices" toggle says. The toggle governs passive kinds (clipboard,
+     * offers); browsing needs an explicit grant. The claimed origin id
+     * (`origin_id ?: requester_id`) is all that is available today;
+     * per-device keys (v4) will replace the claim-based check.
+     *
+     * Fails closed: a DataStore read error means no browsing.
+     */
+    private suspend fun isTrustedBrowser(context: Context, trustId: String): Boolean {
+        val trustedIds = runCatching {
+            TrustedDeviceRepository.observe(context).first().map { it.id }.toSet()
+        }.getOrDefault(emptySet())
+        val allowed = InboundPolicy.shouldServeBrowse(trustId, deviceId, trustedIds)
+        if (!allowed) {
+            Log.i(
+                TAG,
+                "Rejected browse/fetch from ${trustId.ifBlank { "(no id)" }}: not a trusted device",
+            )
+        }
+        return allowed
     }
 
     private fun sealedInboundKind(kind: String): InboundKind = when (kind) {

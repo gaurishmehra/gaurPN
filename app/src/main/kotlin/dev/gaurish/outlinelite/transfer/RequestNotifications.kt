@@ -1,20 +1,14 @@
 package dev.gaurish.outlinelite.transfer
 
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
-import androidx.core.app.NotificationCompat
-import androidx.core.app.NotificationManagerCompat
-import dev.gaurish.outlinelite.R
 
 /**
  * Collapses a peer-supplied display name to a single line. Request parsing
  * already trims and bounds the name, but it is peer-controlled text shown in
- * notification titles, the picker, and log lines, so line breaks, control
- * characters, and Unicode Cf (zero-width and bidi-override) characters are
- * stripped at every display boundary. The wire value is never changed. The Go
- * desktop client implements the same rule.
+ * notification titles and log lines, so line breaks, control characters, and
+ * Unicode Cf (zero-width and bidi-override) characters are stripped at every
+ * display boundary. The wire value is never changed. The Go desktop client
+ * implements the same rule.
  */
 internal fun singleLineDisplayName(raw: String): String = buildString(raw.length) {
     var index = 0
@@ -49,68 +43,16 @@ internal fun requesterLabel(rawName: String, stableId: String): String {
 }
 
 /**
- * User-facing surfaces for pull requests. A file request needs an explicit
- * tap (choosing what to send is a decision, not a background action), so it
- * gets its own high-importance channel and a content action into
- * [RequestPickerActivity]. Screenshot requests are auto-handled and only
- * report the result.
+ * User-facing surfaces for pull requests. Screenshot requests are
+ * auto-handled and only report the result; browse fetches stream through the
+ * existing transfer notifications, and an open BrowseScreen shows declines
+ * in place. The one-shot decline notification here is the fallback when no
+ * screen is listening.
  *
  * Lock-screen visibility matches [TextShareNotifications]: SECRET, because
  * the requester's name is private to the cluster.
  */
 internal object RequestNotifications {
-
-    private const val CHANNEL_ID = "file_requests"
-
-    /**
-     * Posts the "wants a file" notification. False when it could not be shown.
-     *
-     * [notifId] is allocated by the caller and owned by the request lease; it
-     * is not released here. The lease holds it until the request is answered
-     * (picked, declined, or reclaimed after expiry), so a crafted transfer id
-     * cannot take the slot while the request is still pending. The PendingIntent
-     * request code is the same id: unique while pending, so a second request
-     * cannot overwrite the first's extras through FLAG_UPDATE_CURRENT.
-     */
-    fun showFileRequest(context: Context, request: RequestEnvelope, notifId: Int): Boolean {
-        ensureChannel(context)
-        val manager = NotificationManagerCompat.from(context)
-        // Without notifications there is no picker entry point, so report
-        // failure and let the caller decline instead of parking the request.
-        if (!manager.areNotificationsEnabled()) return false
-        val label = requesterLabel(request.requesterName, request.trustId)
-        val intent = Intent(context, RequestPickerActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
-            putExtra(RequestPickerActivity.EXTRA_REQUEST_ID, request.requestId)
-            putExtra(RequestPickerActivity.EXTRA_REQUESTER_ID, request.requesterId)
-            putExtra(RequestPickerActivity.EXTRA_REQUESTER_NAME, label)
-            putExtra(RequestPickerActivity.EXTRA_GRANT, request.grant)
-            putExtra(RequestPickerActivity.EXTRA_EXPIRES_TS, request.expiresTs)
-            putExtra(RequestPickerActivity.EXTRA_KIND, request.kind.wire)
-        }
-        val pending = PendingIntent.getActivity(
-            context,
-            notifId,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        val builder = NotificationCompat.Builder(context, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_share)
-            .setContentTitle("$label requests a file")
-            .setContentText("Tap to choose files to send")
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setVisibility(NotificationCompat.VISIBILITY_SECRET)
-            .setAutoCancel(true)
-            .setContentIntent(pending)
-            .addAction(0, "Choose files", pending)
-
-        return try {
-            manager.notify(notifId, builder.build())
-            true
-        } catch (t: Throwable) {
-            false
-        }
-    }
 
     /** Confirms the automatic screenshot reply. */
     fun showScreenshotSent(context: Context, requesterName: String, stableId: String) {
@@ -123,6 +65,34 @@ internal object RequestNotifications {
         )
     }
 
+    /**
+     * The target-side record of an accepted fetch: who asked and how many
+     * files, never which files. [requesterLabel] carries the sanitized name
+     * plus the stable-id prefix, so a name that imitates a trusted device is
+     * exposed.
+     */
+    internal fun fetchNotificationText(
+        requesterName: String,
+        stableId: String,
+        fileCount: Int,
+    ): String = "${requesterLabel(requesterName, stableId)} fetched $fileCount file(s)"
+
+    /** Announces an accepted fetch before its send starts. Fire-and-forget. */
+    fun showFetchStarted(
+        context: Context,
+        requesterName: String,
+        stableId: String,
+        fileCount: Int,
+    ) {
+        RelayManager.showOneShotNotification(
+            context,
+            key = "fetch-${System.currentTimeMillis()}",
+            sending = true,
+            title = "Files fetched",
+            message = fetchNotificationText(requesterName, stableId, fileCount),
+        )
+    }
+
     /** Reports a decline to the requester side. */
     fun showDeclined(context: Context, requestId: String, reason: DeclineReason) {
         RelayManager.showOneShotNotification(
@@ -131,16 +101,6 @@ internal object RequestNotifications {
             sending = false,
             title = "Request declined (${reason.wire})",
             message = "The other device could not send the files",
-        )
-    }
-
-    private fun ensureChannel(context: Context) {
-        NotificationChannels.ensureChannel(
-            context,
-            CHANNEL_ID,
-            "File requests",
-            NotificationManager.IMPORTANCE_HIGH,
-            description = "Requests from cluster devices for files on this phone",
         )
     }
 }

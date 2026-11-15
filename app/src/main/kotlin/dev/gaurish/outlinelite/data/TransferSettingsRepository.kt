@@ -46,9 +46,9 @@ object TransferSettingsRepository {
     }
 
     /**
-     * Whether cluster peers may ask this phone for files. On by default:
-     * the request still needs an explicit tap in the picker, and the trust
-     * gate applies first.
+     * Whether cluster peers may browse this phone's shared collections and
+     * fetch files from them. On by default: the trust gate applies first and
+     * the phone only exposes its six media collections.
      */
     fun observeAllowFileRequests(context: Context): Flow<Boolean> =
         context.transferPrefsDataStore.data.map { it[ALLOW_FILE_REQUESTS] ?: true }

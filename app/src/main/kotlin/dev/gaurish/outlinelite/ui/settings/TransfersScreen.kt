@@ -81,7 +81,7 @@ fun TransfersScreen(
 
         SettingsRow(
             title = "Allow file requests",
-            summary = "Let cluster devices ask this phone for files; you still choose what to send",
+            summary = "Let cluster devices browse this phone's shared folders and download what they pick",
         ) {
             GaurSwitch(allowFileRequests) { enabled ->
                 scope.launch { TransferSettingsRepository.setAllowFileRequests(context, enabled) }

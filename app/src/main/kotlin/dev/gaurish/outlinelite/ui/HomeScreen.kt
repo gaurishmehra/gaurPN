@@ -87,6 +87,7 @@ import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.AccessKey
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.SsKeyParser
+import dev.gaurish.outlinelite.transfer.ClusterPeer
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelStatus
 import kotlinx.coroutines.Dispatchers
@@ -121,6 +122,7 @@ fun HomeScreen(
     onRename: (AccessKey, String) -> Unit,
     onDelete: (AccessKey) -> Unit,
     onOpenSettings: () -> Unit,
+    onBrowsePeer: (ClusterPeer) -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -178,6 +180,7 @@ fun HomeScreen(
                         activeKey = activeKey,
                         onConnectToggle = onConnectToggle,
                         onOpenSettings = onOpenSettings,
+                        onBrowsePeer = onBrowsePeer,
                     )
                     ServersSection(
                         Modifier.fillMaxWidth(),
@@ -202,6 +205,7 @@ fun HomeScreen(
                         activeKey = activeKey,
                         onConnectToggle = onConnectToggle,
                         onOpenSettings = onOpenSettings,
+                        onBrowsePeer = onBrowsePeer,
                     )
                     ServersSection(
                         Modifier
@@ -358,6 +362,7 @@ private fun ConnectHero(
     activeKey: AccessKey?,
     onConnectToggle: () -> Unit,
     onOpenSettings: () -> Unit,
+    onBrowsePeer: (ClusterPeer) -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
     val connected = status.phase == TunnelPhase.CONNECTED
@@ -414,7 +419,10 @@ private fun ConnectHero(
             Spacer(Modifier.height(18.dp))
             LanAccessRow(status = status)
             Spacer(Modifier.height(10.dp))
-            ClusterSharingSection(onOpenSettings = onOpenSettings)
+            ClusterSharingSection(
+                onOpenSettings = onOpenSettings,
+                onBrowsePeer = onBrowsePeer,
+            )
         }
     }
 }

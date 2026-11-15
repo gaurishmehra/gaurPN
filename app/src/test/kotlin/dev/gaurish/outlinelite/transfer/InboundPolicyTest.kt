@@ -112,4 +112,51 @@ class InboundPolicyTest {
             InboundPolicy.shouldAccept(InboundKind.REQUEST, stable, selfId, trusted, true),
         )
     }
+
+    /**
+     * Browse and fetch are a consent capability, not the generic gate: the
+     * target serves them only to an explicitly trusted device, whatever the
+     * only-trusted toggle says. The pure rule has no toggle input on purpose.
+     */
+    @Test
+    fun browseRequiresExplicitTrustEvenWithOnlyTrustedOff() {
+        // The generic gate accepts a stranger while the toggle is off...
+        assertTrue(
+            InboundPolicy.shouldAccept(
+                InboundKind.CLIPBOARD, "stranger", selfId, trusted, onlyTrusted = false,
+            ),
+        )
+        // ...but browse/fetch is a consent capability and still denies. The
+        // pure rule has no toggle input on purpose.
+        assertFalse(InboundPolicy.shouldServeBrowse("stranger", selfId, trusted))
+        assertFalse(InboundPolicy.shouldServeBrowse("stranger", selfId, emptySet()))
+        assertTrue(InboundPolicy.shouldServeBrowse("friend-1", selfId, trusted))
+        assertFalse(InboundPolicy.shouldServeBrowse(selfId, selfId, trusted))
+        assertFalse(InboundPolicy.shouldServeBrowse("", selfId, trusted))
+        assertFalse(InboundPolicy.shouldServeBrowse("  ", selfId, trusted))
+    }
+
+    /**
+     * The claimed origin id decides: a desktop asks under an ephemeral
+     * reqdev- id and carries its stable id in origin_id. The trust list holds
+     * the stable id, so the fallback is what makes the check meaningful.
+     */
+    @Test
+    fun browseTrustUsesTheClaimedOriginId() {
+        val browse = BrowseEnvelope(
+            requestId = "req-0011223344556677",
+            requesterId = "reqdev-4242-a1b2",
+            originId = "laptop-1",
+            requesterName = "Laptop",
+            targetId = selfId,
+            path = "",
+            ts = 1L,
+        )
+        assertTrue(
+            InboundPolicy.shouldServeBrowse(browse.trustId, selfId, setOf("laptop-1")),
+        )
+        assertFalse(
+            InboundPolicy.shouldServeBrowse(browse.requesterId, selfId, setOf("laptop-1")),
+        )
+    }
 }

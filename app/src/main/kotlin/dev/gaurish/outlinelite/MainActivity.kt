@@ -27,9 +27,11 @@ import androidx.compose.material3.windowsizeclass.ExperimentalMaterial3WindowSiz
 import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -49,11 +51,13 @@ import dev.gaurish.outlinelite.data.ThemeMode
 import dev.gaurish.outlinelite.data.isValid
 import dev.gaurish.outlinelite.data.maskedToken
 import dev.gaurish.outlinelite.transfer.ClipboardSyncManager
+import dev.gaurish.outlinelite.transfer.ClusterPeer
 import dev.gaurish.outlinelite.transfer.MediaSessionBridge
 import dev.gaurish.outlinelite.transfer.NotificationMirrorManager
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelService
 import dev.gaurish.outlinelite.tunnel.TunnelState
+import dev.gaurish.outlinelite.ui.BrowseScreen
 import dev.gaurish.outlinelite.ui.HistoryScreen
 import dev.gaurish.outlinelite.ui.HomeScreen
 import dev.gaurish.outlinelite.ui.OutlineTheme
@@ -143,8 +147,24 @@ class MainActivity : ComponentActivity() {
                     val scope = rememberCoroutineScope()
                     val widthClass = calculateWindowSizeClass(this).widthSizeClass
                     var screen by rememberSaveable { mutableIntStateOf(Screens.HOME) }
+                    var browsePeer by remember { mutableStateOf<ClusterPeer?>(null) }
 
                     when (screen) {
+                        Screens.BROWSE -> {
+                            val peer = browsePeer
+                            if (peer == null) {
+                                // A process restart can restore the screen id
+                                // without the in-memory peer; go home instead
+                                // of rendering an empty browser.
+                                LaunchedEffect(Unit) { screen = Screens.HOME }
+                            } else {
+                                BackHandler { screen = Screens.HOME }
+                                BrowseScreen(
+                                    peer = peer,
+                                    onBack = { screen = Screens.HOME },
+                                )
+                            }
+                        }
                         Screens.TRANSFERS -> {
                             BackHandler { screen = Screens.SETTINGS }
                             TransfersScreen(
@@ -228,6 +248,10 @@ class MainActivity : ComponentActivity() {
                                     scope.launch { KeyRepository.removeKey(applicationContext, key.id) }
                                 },
                                 onOpenSettings = { screen = Screens.SETTINGS },
+                                onBrowsePeer = { peer ->
+                                    browsePeer = peer
+                                    screen = Screens.BROWSE
+                                },
                             )
                         }
                     }

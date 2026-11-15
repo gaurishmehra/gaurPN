@@ -85,16 +85,16 @@ internal class OutboundSender(
         deviceId: String,
         request: RequestContext? = null,
         releaseUriGrants: Boolean = false,
-    ) {
+    ): Job? {
         val appCtx = context.applicationContext
         if (targets.isEmpty() || uris.isEmpty()) {
             if (releaseUriGrants) releaseReadGrants(appCtx, uris)
-            return
+            return null
         }
         if (!RelayConnection.isConnected) {
             if (releaseUriGrants) releaseReadGrants(appCtx, uris)
             transferState.value = TransferState.Error("File sharing not connected")
-            return
+            return null
         }
         sendJob?.cancel()
         val job = scope.launch {
@@ -172,6 +172,7 @@ internal class OutboundSender(
             // send, whether it completes, fails, or is cancelled.
             job.invokeOnCompletion { releaseReadGrants(appCtx, uris) }
         }
+        return job
     }
 
     /**

@@ -7,6 +7,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Screenshot requests read the newest capture from MediaStore. -->
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!-- Browsing a peer's view of this phone's media collections. Each grant
+         is optional: an ungranted collection simply lists empty. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
@@ -79,15 +83,6 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity>
-
-        <!-- Consent screen for a peer's file request; opened only from the
-             app's own notification. -->
-        <activity
-            android:name=".transfer.RequestPickerActivity"
-            android:exported="false"
-            android:launchMode="singleTask"
-            android:excludeFromRecents="true"
-            android:theme="@style/AppTheme" />
 
         <service
             android:name=".tunnel.TunnelService"

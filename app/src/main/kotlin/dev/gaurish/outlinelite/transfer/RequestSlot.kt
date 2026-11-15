@@ -5,15 +5,19 @@ import java.util.concurrent.atomic.AtomicReference
 /**
  * The single request lease.
  *
- * A file request parks in a notification until the user answers it, so the
- * phone serves at most one at a time. The lease also holds the notification
- * id: the id must stay allocated until the request is answered (picked,
- * declined, or reclaimed after expiry), otherwise a crafted transfer id could
- * steal the notification slot while the request is still pending.
+ * The phone serves at most one pull at a time: a screenshot request holds the
+ * slot from acceptance until the send finishes or its lease expires; a browse
+ * fetch holds it until its send job completes. The lease can also hold a
+ * notification id (the old picker flow did); the id must stay allocated until
+ * the request is answered, otherwise a crafted transfer id could steal the
+ * notification slot while the request is still pending.
  *
  * Expiry is lazy — there is no timer. An expired lease is displaced by the
- * next request, which then releases the stale notification id. Pure Kotlin so
- * the reclaim and re-validation rules are JVM-testable.
+ * next request, which then releases the stale notification id. A fetch lease
+ * is different: it uses [HELD_UNTIL_RELEASED] and stays live until its send
+ * job releases it, because a 4 GiB send can outlive the five-minute grant;
+ * the grant's expiry only gates whether a *new* fetch is accepted. Pure
+ * Kotlin so the reclaim and re-validation rules are JVM-testable.
  */
 internal class RequestSlot {
 
@@ -56,7 +60,18 @@ internal class RequestSlot {
     fun isActive(requestId: String, now: Long = System.currentTimeMillis()): Boolean =
         activeLease(now)?.id == requestId
 
-    /** The trust id of [requestId] while it is the live lease, else null. */
+    /**
+     * The trust id of [requestId] while it is the live lease, else null.
+     */
     fun trustIdIfActive(requestId: String, now: Long = System.currentTimeMillis()): String? =
         activeLease(now)?.takeIf { it.id == requestId }?.trustId
+
+    companion object {
+        /**
+         * Lease expiry for work that may outlive its grant. A fetch lease is
+         * held until its send job completes; the grant's own expiry only
+         * gates new fetches. No wall clock reaches this value.
+         */
+        const val HELD_UNTIL_RELEASED = Long.MAX_VALUE
+    }
 }

@@ -123,6 +123,22 @@ class CryptoTest {
     }
 
     @Test
+    fun testFilenameSanitizationStripsFormatCharacters() {
+        // A malicious target must not smuggle bidi overrides, zero-width
+        // joiners, or a BOM into the Downloads name. Unicode Cf is stripped
+        // with the same rule the display sanitizer uses.
+        assertEquals("photo.exe", Crypto.sanitizeFileName("photo\u202E.exe"))
+        assertEquals("photo.png", Crypto.sanitizeFileName("pho\u200Dto.png"))
+        assertEquals("invoice.pdf", Crypto.sanitizeFileName("\u202Ainvoice\u202C.pdf"))
+        assertEquals("notes.txt", Crypto.sanitizeFileName("\uFEFFnotes.txt"))
+        // A name that is nothing but format characters falls back like a
+        // blank one.
+        org.junit.Assert.assertTrue(
+            Crypto.sanitizeFileName("\u202E\u200D").startsWith("download_"),
+        )
+    }
+
+    @Test
     fun testSafeCollisionResolution() {
         val tempDir = java.nio.file.Files.createTempDirectory("gaurpn_test_collision").toFile()
         try {
