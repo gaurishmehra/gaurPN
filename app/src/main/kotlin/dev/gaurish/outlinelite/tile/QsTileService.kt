@@ -2,6 +2,7 @@ package dev.gaurish.outlinelite.tile
 
 import android.app.PendingIntent
 import android.content.Intent
+import android.graphics.drawable.Icon
 import android.net.VpnService
 import android.os.Build
 import android.service.quicksettings.Tile
@@ -32,6 +33,7 @@ class QsTileService : TileService() {
     override fun onClick() {
         val tile = qsTile ?: return
         val running = TunnelState.status.phase != TunnelPhase.DISCONNECTED
+        tile.icon = Icon.createWithResource(this, R.drawable.ic_tile_logo)
 
         // Check if VPN consent has ever been granted
         val consentIntent = VpnService.prepare(this)
@@ -66,6 +68,7 @@ class QsTileService : TileService() {
     private fun refresh() {
         val tile = qsTile ?: return
         val s = TunnelState.status
+        tile.icon = Icon.createWithResource(this, R.drawable.ic_tile_logo)
         tile.state = when (s.phase) {
             TunnelPhase.CONNECTED, TunnelPhase.CONNECTING -> Tile.STATE_ACTIVE
             else -> Tile.STATE_INACTIVE
