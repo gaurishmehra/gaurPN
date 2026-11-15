@@ -208,7 +208,17 @@ class TunnelService : VpnService() {
         }
         tunPfd = pfd
         // Go does not own the fd: the caller closes it (see the AAR docs).
-        val tunnel = Outlinev.connectTunnel(pfd.getFd().toLong(), configJson, protector, true)
+        // Probe the SS UDP relay before connecting: carrier CGNATs often drop
+        // it, and with UDP force-enabled DNS dies (the engine relays resolver
+        // traffic over UDP). When the relay is dead, connect with UDP off so
+        // the engine's DNS-over-TCP fallback serves queries instead.
+        val udpWorks = runCatching {
+            Outlinev.checkUDPConnectivity(configJson, protector)
+        }.getOrDefault(true)
+        if (!udpWorks) {
+            Log.i(TAG, "udp relay unreachable — enabling dns-over-tcp fallback")
+        }
+        val tunnel = Outlinev.connectTunnel(pfd.getFd().toLong(), configJson, protector, udpWorks)
         if (gen != generation || userStopped) {
             Log.i(TAG, "connect superseded (gen $gen) — releasing, current gen $generation")
             runCatching { tunnel.disconnect() }
