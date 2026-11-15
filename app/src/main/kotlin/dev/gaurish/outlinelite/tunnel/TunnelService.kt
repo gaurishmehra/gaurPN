@@ -188,6 +188,7 @@ class TunnelService : VpnService() {
                 builder,
                 TunnelState.status.allowLanAccess,
                 dnsServers,
+                connectedSubnets(),
             )
 
             // Per-app split tunneling
@@ -524,6 +525,32 @@ class TunnelService : VpnService() {
                 .map { it.trim() }
                 .filter { it.isNotEmpty() }
         }
+    }
+
+    /**
+     * Directly-connected subnets of the underlying (non-VPN) networks. These
+     * are ALWAYS kept out of the tunnel: a phone running a hotspot (or on any
+     * 10.x/100.64.x network) black-holes its tethered clients and local
+     * gateway the moment the TUN claims 0/0. Loopback and link-local are
+     * skipped (they are never routed into the TUN anyway).
+     */
+    private fun connectedSubnets(): List<Pair<String, Int>> {
+        val out = mutableListOf<Pair<String, Int>>()
+        runCatching {
+            val cm = getSystemService(ConnectivityManager::class.java) ?: return emptyList()
+            cm.allNetworks.forEach { network ->
+                val caps = cm.getNetworkCapabilities(network) ?: return@forEach
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return@forEach
+                val lp = cm.getLinkProperties(network) ?: return@forEach
+                lp.linkAddresses.forEach { la ->
+                    val addr = la.address ?: return@forEach
+                    if (addr.isLoopbackAddress || addr.isLinkLocalAddress) return@forEach
+                    val host = addr.hostAddress?.substringBefore("%") ?: return@forEach
+                    out += host to la.prefixLength
+                }
+            }
+        }
+        return out.distinct()
     }
 
     /** Comma-separated system DNS list for the Go resolver (excluding VPN virtual interface). */

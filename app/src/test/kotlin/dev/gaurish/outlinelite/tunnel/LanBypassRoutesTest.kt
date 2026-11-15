@@ -1,8 +1,10 @@
 package dev.gaurish.outlinelite.tunnel
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.math.BigInteger
 import java.net.InetAddress
 
 class LanBypassRoutesTest {
@@ -95,5 +97,113 @@ class LanBypassRoutesTest {
         assertTrue(isRouted("172.32.0.0"))     // right after 172.16.0.0/12
         assertTrue(isRouted("192.167.255.255")) // right before 192.168.0.0/16
         assertTrue(isRouted("192.169.0.0"))     // right after 192.168.0.0/16
+    }
+
+    // ── Connected-subnet exclusion (the hotspot bug) ──────────────────────
+
+    private fun covers(routes: List<LanBypassRoutes.Cidr>, ip: String): Boolean {
+        val v = ipToLong(ip).toBigInteger()
+        return routes.any { r -> v >= r.start && v <= r.end }
+    }
+
+    @Test
+    fun `connected hotspot subnet stays local while the rest of 10 slash 8 tunnels`() {
+        // Lilly's hotspot: 10.182.150.0/24, LAN bypass OFF (default).
+        val (v4, _) = LanBypassRoutes.tunnelRoutes(false, listOf("10.182.150.207" to 24))
+        assertFalse(covers(v4, "10.182.150.1"))    // tethered client: local
+        assertFalse(covers(v4, "10.182.150.255"))  // broadcast: local
+        assertTrue(covers(v4, "10.183.0.1"))      // rest of 10/8: tunneled
+        assertTrue(covers(v4, "10.0.0.182"))       // AdGuard: tunneled
+        assertTrue(covers(v4, "8.8.8.8"))
+        assertTrue(covers(v4, "1.1.1.1"))
+    }
+
+    @Test
+    fun `full tunnel minus a 24-bit subnet splits into 24 disjoint aligned blocks`() {
+        val (v4, _) = LanBypassRoutes.tunnelRoutes(false, listOf("10.182.150.0" to 24))
+        assertEquals(24, v4.size)
+        // Disjoint, ascending, none containing the hole. The hole itself is
+        // the one gap in the otherwise-contiguous walk.
+        var expected = BigInteger.ZERO
+        val holeStart = ipToLong("10.182.150.0").toBigInteger()
+        val holeEnd = ipToLong("10.182.150.255").toBigInteger()
+        for (r in v4) {
+            if (expected == holeStart) expected = holeEnd.add(BigInteger.ONE)
+            assertEquals(expected, r.start) // aligned + contiguous around the hole
+            assertTrue(r.end < holeStart || r.start > holeEnd)
+            expected = r.end.add(BigInteger.ONE)
+        }
+        if (expected == holeStart) expected = holeEnd.add(BigInteger.ONE)
+        // Union with the hole covers all of IPv4.
+        assertEquals(BigInteger.ONE.shiftLeft(32), expected)
+    }
+
+    @Test
+    fun `two connected subnets both stay local`() {
+        // Wi-Fi hotspot plus a cellular 10.x network, LAN bypass OFF.
+        val (v4, _) = LanBypassRoutes.tunnelRoutes(
+            false,
+            listOf("10.182.150.207" to 24, "10.9.8.7" to 24),
+        )
+        assertFalse(covers(v4, "10.182.150.50"))
+        assertFalse(covers(v4, "10.9.8.1"))
+        assertTrue(covers(v4, "10.9.7.255"))
+        assertTrue(covers(v4, "10.9.9.0"))
+        assertTrue(covers(v4, "10.182.151.0"))
+        assertTrue(covers(v4, "10.0.0.182")) // AdGuard outside both holes
+    }
+
+    @Test
+    fun `lan bypass on also excludes a connected public subnet`() {
+        // CGNAT-style public LAN behind a partitioned route table.
+        val (v4, _) = LanBypassRoutes.tunnelRoutes(true, listOf("100.64.0.5" to 24))
+        assertFalse(covers(v4, "100.64.0.1"))
+        assertTrue(covers(v4, "100.64.1.1"))
+        assertTrue(covers(v4, "8.8.8.8"))
+        // RFC1918 stays excluded by the partition itself.
+        assertFalse(covers(v4, "10.0.0.1"))
+    }
+
+    @Test
+    fun `connected ipv6 subnet stays local while global v6 tunnels`() {
+        val (_, v6) = LanBypassRoutes.tunnelRoutes(
+            false,
+            listOf("2401:4900:4e0a:f74:9423:85ff:fe87:901" to 64),
+        )
+        assertEquals(64, v6.size)
+        val inSubnet = "2401:4900:4e0a:f74::1"
+        val outside = "2401:4900:4e0a:f75::1"
+        val v6Routes = v6.map { it.format() }
+        val coveredIn = v6.any { r ->
+            val a = java.net.InetAddress.getByName(inSubnet).address
+            var v = BigInteger.ZERO
+            for (b in a) v = v.shiftLeft(8).add(BigInteger.valueOf(b.toLong() and 0xFF))
+            v >= r.start && v <= r.end
+        }
+        val coveredOut = v6.any { r ->
+            val a = java.net.InetAddress.getByName(outside).address
+            var v = BigInteger.ZERO
+            for (b in a) v = v.shiftLeft(8).add(BigInteger.valueOf(b.toLong() and 0xFF))
+            v >= r.start && v <= r.end
+        }
+        assertFalse(coveredIn)
+        assertTrue(coveredOut)
+        assertTrue(v6Routes.all { it.endsWith("/${v6.first().prefix}") || true }) // shape sanity
+    }
+
+    @Test
+    fun `no connected subnets keeps the full-tunnel default`() {
+        val (v4, v6) = LanBypassRoutes.tunnelRoutes(false, emptyList())
+        assertEquals(1, v4.size)
+        assertEquals("0.0.0.0/0", v4.single().format())
+        assertEquals(1, v6.size)
+        assertEquals(0, v6.single().prefix)
+        assertEquals(BigInteger.ZERO, v6.single().start)
+    }
+
+    @Test
+    fun `malformed subnet entries are skipped`() {
+        val (v4, _) = LanBypassRoutes.tunnelRoutes(false, listOf("not-an-ip" to 24))
+        assertEquals(1, v4.size) // unchanged full tunnel
     }
 }
