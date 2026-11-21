@@ -13,14 +13,17 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -29,6 +32,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,12 +69,20 @@ fun HistoryScreen(onBack: () -> Unit) {
     val scope = rememberCoroutineScope()
     val entries by TransferHistoryRepository.observe(context)
         .collectAsStateWithLifecycle(initialValue = emptyList())
+    var confirmClear by remember { mutableStateOf(false) }
 
-    Column(
+    Box(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .systemBarsPadding()
+            .systemBarsPadding(),
+        contentAlignment = Alignment.TopCenter,
+    ) {
+    Column(
+        Modifier
+            .widthIn(max = 720.dp)
+            .fillMaxWidth()
+            .fillMaxHeight()
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -90,10 +104,8 @@ fun HistoryScreen(onBack: () -> Unit) {
                 modifier = Modifier.weight(1f),
             )
             if (entries.isNotEmpty()) {
-                TextButton(
-                    onClick = { scope.launch { TransferHistoryRepository.clear(context) } }
-                ) {
-                    Text("Clear", fontSize = 13.sp)
+                TextButton(onClick = { confirmClear = true }) {
+                    Text("Clear history", fontSize = 13.sp)
                 }
             }
         }
@@ -101,7 +113,7 @@ fun HistoryScreen(onBack: () -> Unit) {
         if (entries.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
-                    "Nothing shared yet.",
+                    "No transfers yet.",
                     fontSize = 14.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -119,6 +131,36 @@ fun HistoryScreen(onBack: () -> Unit) {
                 }
             }
         }
+    }
+    }
+
+    if (confirmClear) {
+        AlertDialog(
+            onDismissRequest = { confirmClear = false },
+            title = { Text("Clear history?") },
+            text = {
+                Text(
+                    "This removes every local transfer record. Files already on this phone are not deleted.",
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        confirmClear = false
+                        scope.launch { TransferHistoryRepository.clear(context) }
+                    },
+                ) {
+                    Text("Clear history", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmClear = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
     }
 }
 

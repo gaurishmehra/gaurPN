@@ -121,7 +121,7 @@ fun TrustedDevicesScreen(onBack: () -> Unit) {
                     },
                     colors = SwitchDefaults.colors(
                         checkedTrackColor = MaterialTheme.colorScheme.primary,
-                        checkedThumbColor = Color(0xFF0B111B),
+                        checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
                     ),
                 )
             }

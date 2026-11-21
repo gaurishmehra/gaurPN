@@ -7,13 +7,16 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
@@ -25,6 +28,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -43,7 +47,7 @@ fun GaurSwitch(
         onCheckedChange = onCheckedChange,
         colors = SwitchDefaults.colors(
             checkedTrackColor = MaterialTheme.colorScheme.primary,
-            checkedThumbColor = Color(0xFF0B111B),
+            checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
         ),
     )
 }
@@ -86,17 +90,25 @@ fun SettingsFootnote(text: String) {
 
 /** Back arrow + title header shared by every settings screen. */
 @Composable
-fun ScreenHeader(title: String, onBack: () -> Unit) {
+fun ScreenHeader(
+    title: String,
+    onBack: () -> Unit,
+    showBack: Boolean = true,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.padding(vertical = 10.dp),
     ) {
-        IconButton(onClick = onBack) {
-            Icon(
-                painter = painterResource(R.drawable.ic_back),
-                contentDescription = "Back",
-                tint = MaterialTheme.colorScheme.onBackground,
-            )
+        if (showBack) {
+            IconButton(onClick = onBack) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_back),
+                    contentDescription = "Back",
+                    tint = MaterialTheme.colorScheme.onBackground,
+                )
+            }
+        } else {
+            Spacer(Modifier.width(12.dp))
         }
         Spacer(Modifier.width(2.dp))
         Text(
@@ -116,21 +128,25 @@ fun ScreenHeader(title: String, onBack: () -> Unit) {
 fun SettingsScaffold(
     title: String,
     onBack: () -> Unit,
+    showBack: Boolean = true,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     Box(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .systemBarsPadding()
+            .systemBarsPadding(),
+        contentAlignment = Alignment.TopCenter,
     ) {
         Column(
             Modifier
-                .fillMaxSize()
+                .widthIn(max = 720.dp)
+                .fillMaxWidth()
+                .fillMaxHeight()
                 .padding(horizontal = 20.dp)
                 .verticalScroll(rememberScrollState())
         ) {
-            ScreenHeader(title, onBack)
+            ScreenHeader(title, onBack, showBack)
             content()
         }
     }
@@ -144,43 +160,37 @@ fun SettingsRow(
     onClick: (() -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
 ) {
-    Box(
-        Modifier
+    val clickableMod =
+        if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 10.dp)
+            .clip(MaterialTheme.shapes.large)
+            .background(MaterialTheme.colorScheme.surface)
+            .then(clickableMod)
+            .heightIn(min = 56.dp)
+            .padding(16.dp),
     ) {
-        val clickableMod =
-            if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(
-                    MaterialTheme.colorScheme.surface,
-                    MaterialTheme.shapes.large,
-                )
-                .padding(16.dp)
-                .then(clickableMod),
-        ) {
-            Column(Modifier.weight(1f)) {
-                Text(
-                    title,
-                    fontSize = 15.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = MaterialTheme.colorScheme.onBackground,
-                )
-                Spacer(Modifier.height(3.dp))
-                Text(
-                    summary,
-                    fontSize = 12.sp,
-                    lineHeight = 17.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (trailing != null) {
-                Spacer(Modifier.width(12.dp))
-                trailing()
-            }
+        Column(Modifier.weight(1f)) {
+            Text(
+                title,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(3.dp))
+            Text(
+                summary,
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (trailing != null) {
+            Spacer(Modifier.width(12.dp))
+            trailing()
         }
     }
 }

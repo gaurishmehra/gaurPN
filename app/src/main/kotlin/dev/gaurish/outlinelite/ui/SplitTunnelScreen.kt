@@ -164,7 +164,7 @@ fun SplitTunnelScreen(onBack: () -> Unit) {
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
                 modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("Search installed apps…", fontSize = 14.sp) },
+                placeholder = { Text("Search apps", fontSize = 14.sp) },
                 singleLine = true,
                 shape = RoundedCornerShape(14.dp),
             )
@@ -277,7 +277,7 @@ private fun AppRow(
             onCheckedChange = { onToggle() },
             colors = SwitchDefaults.colors(
                 checkedTrackColor = scheme.primary,
-                checkedThumbColor = Color(0xFF0B111B),
+                checkedThumbColor = scheme.onPrimary,
             ),
         )
     }

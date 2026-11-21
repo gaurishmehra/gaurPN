@@ -9,6 +9,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -31,6 +32,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -95,7 +97,7 @@ fun LanAccessRow(
                 color = scheme.onSurface,
             )
             Text(
-                "Bypass VPN for local printers and smart devices",
+                "Reach printers and smart devices on your Wi-Fi without the VPN.",
                 fontSize = 11.sp,
                 color = scheme.onSurfaceVariant,
             )
@@ -111,7 +113,7 @@ fun LanAccessRow(
             },
             colors = SwitchDefaults.colors(
                 checkedTrackColor = scheme.primary,
-                checkedThumbColor = Color(0xFF0B111B),
+                checkedThumbColor = scheme.onPrimary,
             ),
         )
     }
@@ -119,11 +121,10 @@ fun LanAccessRow(
     if (showWarningDialog) {
         AlertDialog(
             onDismissRequest = { showWarningDialog = false },
-            title = { Text("Security Warning: LAN Access") },
+            title = { Text("Turn on LAN access?") },
             text = {
                 Text(
-                    "Enabling LAN access allows local network devices (printers, routers, and other machines on this Wi-Fi) to communicate directly with your phone outside the encrypted VPN tunnel.\n\n" +
-                    "This may expose your local IP address on untrusted networks. This setting is strictly per-session and resets to OFF automatically when the VPN disconnects."
+                    "Local devices on this Wi-Fi can reach your phone without the VPN. This setting turns off when the VPN disconnects."
                 )
             },
             confirmButton = {
@@ -134,7 +135,7 @@ fun LanAccessRow(
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = scheme.error),
                 ) {
-                    Text("Enable Anyway", color = scheme.onError)
+                    Text("Turn on LAN access", color = scheme.onError)
                 }
             },
             dismissButton = {
@@ -151,6 +152,8 @@ fun ClusterSharingSection(
     onOpenSettings: () -> Unit,
     onBrowsePeer: (ClusterPeer) -> Unit,
     modifier: Modifier = Modifier,
+    embedded: Boolean = false,
+    showHeader: Boolean = true,
 ) {
     val context = LocalContext.current
     val scheme = MaterialTheme.colorScheme
@@ -178,94 +181,110 @@ fun ClusterSharingSection(
         )
     }
 
-        Box(
-            modifier = Modifier
+        val containerModifier = if (embedded) {
+            Modifier.fillMaxWidth()
+        } else {
+            Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(16.dp))
+                .clip(MaterialTheme.shapes.medium)
                 .background(scheme.surface)
-                .border(1.dp, scheme.outlineVariant.copy(alpha = 0.5f), RoundedCornerShape(16.dp))
-                .padding(14.dp),
-        ) {
+                .border(1.dp, scheme.outlineVariant, MaterialTheme.shapes.medium)
+                .padding(16.dp)
+        }
+        Box(modifier = containerModifier) {
             if (token.isBlank()) {
                 Column {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(scheme.outline),
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            "In-Tunnel File Sharing",
-                            fontSize = 13.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = scheme.onSurface,
-                        )
-                    }
-                    Spacer(Modifier.height(6.dp))
-                    Text(
-                        "Paste your cluster token in Settings to share encrypted files directly between your devices inside the VPN tunnel.",
-                        fontSize = 11.sp,
-                        color = scheme.onSurfaceVariant,
-                    )
-                    Spacer(Modifier.height(10.dp))
-                    OutlinedButton(
-                        onClick = onOpenSettings,
-                        modifier = Modifier.height(34.dp),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
-                    ) {
-                        Text("Configure Token", fontSize = 12.sp)
-                    }
-                }
-            } else {
-                val otherPeers = remember(peers) { peers.filter { !it.isSelf } }
-                Column {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
+                    if (showHeader) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Box(
                                 modifier = Modifier
                                     .size(8.dp)
                                     .clip(CircleShape)
-                                    .background(Color(0xFF00C853)),
+                                    .background(scheme.outline),
                             )
                             Spacer(Modifier.width(8.dp))
                             Text(
-                                "Cluster Devices (In-Tunnel)",
-                                fontSize = 13.sp,
+                                "Devices",
+                                fontSize = 15.sp,
                                 fontWeight = FontWeight.SemiBold,
                                 color = scheme.onSurface,
                             )
                         }
-                        Text(
-                            "${otherPeers.size} online",
-                            fontSize = 11.sp,
-                            color = scheme.onSurfaceVariant,
-                        )
+                        Spacer(Modifier.height(6.dp))
                     }
-
-                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Add your sharing key in Settings to send files between your devices. Files stay encrypted inside the VPN tunnel.",
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        color = scheme.onSurfaceVariant,
+                    )
+                    Spacer(Modifier.height(10.dp))
+                    OutlinedButton(
+                        onClick = onOpenSettings,
+                        modifier = Modifier.heightIn(min = 40.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+                    ) {
+                        Text("Open settings", fontSize = 13.sp)
+                    }
+                }
+            } else {
+                val otherPeers = remember(peers) { peers.filter { !it.isSelf } }
+                Column {
+                    if (showHeader) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(8.dp)
+                                        .clip(CircleShape)
+                                        .background(
+                                            if (otherPeers.isEmpty()) scheme.outline else scheme.primary
+                                        ),
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    "Devices",
+                                    fontSize = 15.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = scheme.onSurface,
+                                )
+                            }
+                            Text(
+                                "${otherPeers.size} online",
+                                fontSize = 12.sp,
+                                color = scheme.onSurfaceVariant,
+                            )
+                        }
+                        Spacer(Modifier.height(8.dp))
+                    }
 
                     if (otherPeers.isEmpty()) {
                         Text(
-                            "No other cluster devices currently connected. Start gaur-share on your laptop/server.",
-                            fontSize = 11.sp,
+                            "No other devices are online. Connect the VPN on the device you want to reach.",
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp,
                             color = scheme.onSurfaceVariant,
                         )
                     } else {
-                        otherPeers.forEach { peer ->
+                        otherPeers.forEachIndexed { index, peer ->
                             PeerRow(
                                 peer = peer,
                                 onSendClick = {
                                     targetPeerForPicker = peer
                                     filePickerLauncher.launch("*/*")
                                 },
-                                onLongClick = { browsePeer = peer },
+                                onBrowseClick = { browsePeer = peer },
                             )
+                            if (index != otherPeers.lastIndex) {
+                                HorizontalDivider(
+                                    color = scheme.outlineVariant,
+                                    thickness = 1.dp,
+                                )
+                            }
                         }
                     }
                 }
@@ -390,7 +409,7 @@ fun ShareTargetDialog(
                     otherPeers.forEach { peer ->
                         PeerRow(
                             peer = peer,
-                            actionLabel = if (text != null) "Send" else "Send Files",
+                            actionLabel = if (text != null) "Send" else "Send",
                             onSendClick = {
                                 if (text != null) {
                                     scope.launch {
@@ -435,7 +454,7 @@ fun ShareTargetDialog(
                 if (isVpnConnected && offlineTrusted.isNotEmpty()) {
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "Offline — queued until they reconnect",
+                        "Offline. Queued until it reconnects.",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -443,7 +462,7 @@ fun ShareTargetDialog(
                     offlineTrusted.forEach { device ->
                         PeerRow(
                             peer = ClusterPeer(device.id, device.name),
-                            actionLabel = "Queue",
+                            actionLabel = "Send when online",
                             onSendClick = {
                                 if (text != null) {
                                     val kind = if (text.startsWith("http://") ||
@@ -503,71 +522,66 @@ fun ShareTargetDialog(
     )
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PeerRow(
     peer: ClusterPeer,
-    actionLabel: String = "Send Files",
+    actionLabel: String = "Send",
     onSendClick: () -> Unit,
-    onLongClick: (() -> Unit)? = null,
+    onBrowseClick: (() -> Unit)? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .heightIn(min = 56.dp)
             .then(
-                if (onLongClick != null) {
-                    Modifier.combinedClickable(onClick = {}, onLongClick = onLongClick)
+                if (onBrowseClick != null) {
+                    Modifier.clickable(
+                        onClickLabel = "Browse files",
+                        onClick = onBrowseClick,
+                    )
                 } else {
                     Modifier
                 }
             )
-            .padding(vertical = 6.dp),
+            .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Column(modifier = Modifier.weight(1f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    peer.name,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = scheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
-                )
-                val battery = peer.battery
+            Text(
+                peer.name,
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium,
+                color = scheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            val battery = peer.battery
+            val meta = buildString {
                 if (battery != null) {
-                    Spacer(Modifier.width(6.dp))
-                    Text(
-                        buildString {
-                            append(battery)
-                            append('%')
-                            if (peer.charging == true) append(" \u26A1")
-                        },
-                        fontSize = 10.sp,
-                        color = scheme.onSurfaceVariant,
-                    )
+                    append(battery)
+                    append('%')
+                    if (peer.charging == true) append(" charging")
+                } else {
+                    append("Online")
                 }
             }
             Text(
-                peer.id,
-                fontSize = 10.sp,
+                meta,
+                fontSize = 11.sp,
                 color = scheme.onSurfaceVariant,
             )
         }
 
-        Button(
+        OutlinedButton(
             onClick = onSendClick,
-            modifier = Modifier.height(30.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = scheme.primary,
-                contentColor = Color(0xFF04231A),
-            ),
+            modifier = Modifier.heightIn(min = 40.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+            border = BorderStroke(1.dp, scheme.outline),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = scheme.primary),
         ) {
-            Text(actionLabel, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+            Text(actionLabel, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -588,17 +602,17 @@ private fun TransferDialog(
         title = {
             val titleText = when (state) {
                 is TransferState.Idle -> ""
-                is TransferState.Sending -> "Sending File"
-                is TransferState.Receiving -> "Receiving File"
-                is TransferState.Completed -> "Transfer Complete"
-                is TransferState.Error -> "Transfer Error"
+                is TransferState.Sending -> "Sending file"
+                is TransferState.Receiving -> "Receiving file"
+                is TransferState.Completed -> "Transfer complete"
+                is TransferState.Error -> "Transfer failed"
             }
             Text(
                 titleText,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
                 color = when (state) {
-                    is TransferState.Completed -> Color(0xFF00C853)
+                    is TransferState.Completed -> scheme.primary
                     is TransferState.Error -> scheme.error
                     else -> scheme.onSurface
                 },
@@ -642,7 +656,7 @@ private fun TransferDialog(
                         onClick = onDismiss,
                         colors = ButtonDefaults.buttonColors(containerColor = scheme.primary),
                     ) {
-                        Text("Done", color = Color(0xFF04231A))
+                        Text("Done", color = scheme.onPrimary)
                     }
                 }
                 is TransferState.Error -> {

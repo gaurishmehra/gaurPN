@@ -1,6 +1,7 @@
 package dev.gaurish.outlinelite
 
 import android.Manifest
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -14,12 +15,27 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -28,6 +44,7 @@ import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -36,10 +53,15 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import dev.gaurish.outlinelite.data.AccessKey
@@ -60,7 +82,9 @@ import dev.gaurish.outlinelite.tunnel.TunnelState
 import dev.gaurish.outlinelite.ui.BrowseScreen
 import dev.gaurish.outlinelite.ui.HistoryScreen
 import dev.gaurish.outlinelite.ui.HomeScreen
+import dev.gaurish.outlinelite.ui.Motion
 import dev.gaurish.outlinelite.ui.OutlineTheme
+import dev.gaurish.outlinelite.ui.ServersScreen
 import dev.gaurish.outlinelite.ui.ShareTargetDialog
 import dev.gaurish.outlinelite.ui.Screens
 import dev.gaurish.outlinelite.ui.SplitTunnelScreen
@@ -138,27 +162,70 @@ class MainActivity : ComponentActivity() {
             }
 
             OutlineTheme(darkTheme = isDark) {
-                Surface(modifier = androidx.compose.ui.Modifier.fillMaxSize()) {
+                val view = LocalView.current
+                SideEffect {
+                    val activity = view.context as? Activity ?: return@SideEffect
+                    val controller = WindowCompat.getInsetsController(activity.window, view)
+                    controller.isAppearanceLightStatusBars = !isDark
+                    controller.isAppearanceLightNavigationBars = !isDark
+                }
+                Surface(
+                    modifier = Modifier.fillMaxSize(),
+                    color = MaterialTheme.colorScheme.background,
+                ) {
                     val status by TunnelState.flow.collectAsStateWithLifecycle()
-                    val keys by KeyRepository.observeKeys(applicationContext)
-                        .collectAsStateWithLifecycle(emptyList())
+                    val keysState by KeyRepository.observeKeys(applicationContext)
+                        .collectAsStateWithLifecycle(initialValue = null)
+                    val keys = keysState.orEmpty()
                     val activeId by KeyRepository.observeActiveId(applicationContext)
                         .collectAsStateWithLifecycle(null)
                     val scope = rememberCoroutineScope()
-                    val widthClass = calculateWindowSizeClass(this).widthSizeClass
+                    val configuration = LocalConfiguration.current
+                    val windowSize = calculateWindowSizeClass(this)
+                    val widthClass = windowSize.widthSizeClass
+                    val useRail = widthClass != WindowWidthSizeClass.Compact
+                    val homeCompact =
+                        widthClass != WindowWidthSizeClass.Expanded ||
+                            configuration.screenHeightDp < 560
                     var screen by rememberSaveable { mutableIntStateOf(Screens.HOME) }
                     var browsePeer by remember { mutableStateOf<ClusterPeer?>(null) }
+                    val displayedScreen =
+                        if (screen == Screens.BROWSE && browsePeer == null) Screens.HOME else screen
+                    val showNavigation = displayedScreen != Screens.BROWSE
+                    val selectedTab = tabOf(displayedScreen)
 
-                    when (screen) {
+                    BackHandler(
+                        enabled = displayedScreen != Screens.HOME && displayedScreen != Screens.BROWSE,
+                    ) {
+                        screen = when (displayedScreen) {
+                            Screens.SETTINGS, Screens.SERVERS -> Screens.HOME
+                            else -> Screens.SETTINGS
+                        }
+                    }
+
+                    val content: @Composable () -> Unit = {
+                    AnimatedContent(
+                        targetState = displayedScreen,
+                        transitionSpec = {
+                            (
+                                fadeIn(tween(Motion.Screen, easing = Motion.Decelerate)) +
+                                    scaleIn(
+                                        initialScale = 0.985f,
+                                        animationSpec = tween(Motion.Screen, easing = Motion.Decelerate),
+                                    )
+                                ).togetherWith(
+                                fadeOut(tween(90, easing = Motion.Accelerate)),
+                            )
+                        },
+                        label = "screen",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clipToBounds(),
+                    ) { current ->
+                        when (current) {
                         Screens.BROWSE -> {
                             val peer = browsePeer
-                            if (peer == null) {
-                                // A process restart can restore the screen id
-                                // without the in-memory peer; go home instead
-                                // of rendering an empty browser.
-                                LaunchedEffect(Unit) { screen = Screens.HOME }
-                            } else {
-                                BackHandler { screen = Screens.HOME }
+                            if (peer != null) {
                                 BrowseScreen(
                                     peer = peer,
                                     onBack = { screen = Screens.HOME },
@@ -166,42 +233,65 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         Screens.TRANSFERS -> {
-                            BackHandler { screen = Screens.SETTINGS }
                             TransfersScreen(
                                 onBack = { screen = Screens.SETTINGS },
                                 onOpenHistory = { screen = Screens.HISTORY },
                             )
                         }
                         Screens.MEDIA -> {
-                            BackHandler { screen = Screens.SETTINGS }
                             MediaScreen(onBack = { screen = Screens.SETTINGS })
                         }
                         Screens.NOTIFICATIONS -> {
-                            BackHandler { screen = Screens.SETTINGS }
                             NotificationsScreen(onBack = { screen = Screens.SETTINGS })
                         }
                         Screens.CLIPBOARD_SYNC -> {
-                            BackHandler { screen = Screens.SETTINGS }
                             ClipboardSyncScreen(onBack = { screen = Screens.SETTINGS })
                         }
                         Screens.DNS -> {
-                            BackHandler { screen = Screens.SETTINGS }
                             DnsScreen(onBack = { screen = Screens.SETTINGS })
                         }
                         Screens.TRUSTED_DEVICES -> {
-                            BackHandler { screen = Screens.SETTINGS }
                             TrustedDevicesScreen(onBack = { screen = Screens.SETTINGS })
                         }
                         Screens.HISTORY -> {
-                            BackHandler { screen = Screens.SETTINGS }
-                            HistoryScreen(onBack = { screen = Screens.SETTINGS })
+                            HistoryScreen(onBack = { screen = Screens.HOME })
                         }
                         Screens.SPLIT_TUNNEL -> {
-                            BackHandler { screen = Screens.SETTINGS }
                             SplitTunnelScreen(onBack = { screen = Screens.SETTINGS })
                         }
+                        Screens.SERVERS -> {
+                            ServersScreen(
+                                keys = keys,
+                                loading = keysState == null,
+                                activeId = activeId,
+                                onBack = { screen = Screens.HOME },
+                                onAddKey = { key ->
+                                    scope.launch {
+                                        val added = KeyRepository.addKey(applicationContext, key)
+                                        if (added) {
+                                            KeyRepository.setActive(applicationContext, key.id)
+                                        }
+                                        Toast.makeText(
+                                            applicationContext,
+                                            getString(
+                                                if (added) R.string.key_added else R.string.key_exists
+                                            ),
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                },
+                                onSelect = { key ->
+                                    scope.launch { KeyRepository.setActive(applicationContext, key.id) }
+                                },
+                                onRename = { key, newName ->
+                                    scope.launch { KeyRepository.renameKey(applicationContext, key.id, newName) }
+                                },
+                                onDelete = { key ->
+                                    scope.launch { KeyRepository.removeKey(applicationContext, key.id) }
+                                },
+                            )
+                        }
                         Screens.SETTINGS -> {
-                            BackHandler { screen = Screens.HOME }
                             SettingsScreen(
                                 onBack = { screen = Screens.HOME },
                                 onOpenSplitTunnel = { screen = Screens.SPLIT_TUNNEL },
@@ -216,9 +306,10 @@ class MainActivity : ComponentActivity() {
                         }
                         else -> {
                             HomeScreen(
-                                compact = widthClass == WindowWidthSizeClass.Compact,
+                                compact = homeCompact,
                                 status = status,
                                 keys = keys,
+                                keysLoaded = keysState != null,
                                 activeId = activeId,
                                 onConnectToggle = {
                                     when (status.phase) {
@@ -235,24 +326,43 @@ class MainActivity : ComponentActivity() {
                                                 prepareAndStart(key)
                                             }
                                         }
-                                        else -> TunnelService.stop(this)
+                                        else -> TunnelService.stop(this@MainActivity)
                                     }
                                 },
-                                onSelect = { key ->
-                                    scope.launch { KeyRepository.setActive(applicationContext, key.id) }
-                                },
-                                onRename = { key, newName ->
-                                    scope.launch { KeyRepository.renameKey(applicationContext, key.id, newName) }
-                                },
-                                onDelete = { key ->
-                                    scope.launch { KeyRepository.removeKey(applicationContext, key.id) }
-                                },
+                                onOpenServers = { screen = Screens.SERVERS },
+                                onOpenHistory = { screen = Screens.HISTORY },
                                 onOpenSettings = { screen = Screens.SETTINGS },
                                 onBrowsePeer = { peer ->
                                     browsePeer = peer
                                     screen = Screens.BROWSE
                                 },
                             )
+                        }
+                        }
+                    }
+                    }
+
+                    if (useRail) {
+                        Row(Modifier.fillMaxSize()) {
+                            if (showNavigation) {
+                                AppNavigation(
+                                    selected = selectedTab,
+                                    useRail = true,
+                                    onSelect = { screen = it },
+                                )
+                            }
+                            Box(Modifier.weight(1f).fillMaxHeight()) { content() }
+                        }
+                    } else {
+                        Column(Modifier.fillMaxSize()) {
+                            Box(Modifier.weight(1f).fillMaxSize()) { content() }
+                            if (showNavigation) {
+                                AppNavigation(
+                                    selected = selectedTab,
+                                    useRail = false,
+                                    onSelect = { screen = it },
+                                )
+                            }
                         }
                     }
 
@@ -548,4 +658,70 @@ private fun PairingRow(label: String, value: String) {
     )
     Text(value, fontSize = 14.sp)
     Spacer(Modifier.height(8.dp))
+}
+
+private data class NavItem(val screen: Int, val label: String, val icon: Int)
+
+private val navItems = listOf(
+    NavItem(Screens.HOME, "Home", R.drawable.ic_home),
+    NavItem(Screens.SERVERS, "Servers", R.drawable.ic_server),
+    NavItem(Screens.HISTORY, "History", R.drawable.ic_activity),
+    NavItem(Screens.SETTINGS, "Settings", R.drawable.ic_settings),
+)
+
+private fun tabOf(screen: Int): Int = when (screen) {
+    Screens.HOME, Screens.BROWSE -> Screens.HOME
+    Screens.SERVERS -> Screens.SERVERS
+    Screens.HISTORY -> Screens.HISTORY
+    else -> Screens.SETTINGS
+}
+
+@Composable
+private fun AppNavigation(
+    selected: Int,
+    useRail: Boolean,
+    onSelect: (Int) -> Unit,
+) {
+    if (useRail) {
+        NavigationRail(
+            modifier = Modifier
+                .fillMaxHeight()
+                .width(96.dp),
+            containerColor = MaterialTheme.colorScheme.surface,
+        ) {
+            Spacer(Modifier.height(12.dp))
+            navItems.forEach { item ->
+                NavigationRailItem(
+                    selected = selected == item.screen,
+                    onClick = { onSelect(item.screen) },
+                    icon = {
+                        Icon(
+                            painter = painterResource(item.icon),
+                            contentDescription = item.label,
+                        )
+                    },
+                    label = { Text(item.label) },
+                    alwaysShowLabel = true,
+                )
+            }
+        }
+    } else {
+        NavigationBar(
+            containerColor = MaterialTheme.colorScheme.surface,
+        ) {
+            navItems.forEach { item ->
+                NavigationBarItem(
+                    selected = selected == item.screen,
+                    onClick = { onSelect(item.screen) },
+                    icon = {
+                        Icon(
+                            painter = painterResource(item.icon),
+                            contentDescription = item.label,
+                        )
+                    },
+                    label = { Text(item.label) },
+                )
+            }
+        }
+    }
 }

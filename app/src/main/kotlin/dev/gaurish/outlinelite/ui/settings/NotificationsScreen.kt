@@ -62,9 +62,9 @@ fun NotificationsScreen(onBack: () -> Unit) {
         SettingsRow(
             title = "Share notifications",
             summary = when {
-                !notificationSync -> "Off — mirror notifications to other cluster devices"
+                !notificationSync -> "Off. Notifications are not shared."
                 !notificationAccess -> "Grant notification access to start mirroring"
-                else -> "On — notifications from this device appear on every cluster device"
+                else -> "On. Notifications appear on every device."
             },
         ) {
             GaurSwitch(notificationSync) { enabled ->

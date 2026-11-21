@@ -1,33 +1,18 @@
 package dev.gaurish.outlinelite.ui
 
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.Context
 import android.net.TrafficStats
 import android.os.Process
 import android.os.SystemClock
-import android.widget.Toast
 import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.Spring
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInVertically
-import androidx.compose.animation.slideOutVertically
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -38,23 +23,23 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.AlertDialog
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.ColorScheme
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -63,31 +48,27 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.AccessKey
-import dev.gaurish.outlinelite.data.KeyRepository
-import dev.gaurish.outlinelite.data.SsKeyParser
+import dev.gaurish.outlinelite.data.TransferHistoryEntry
+import dev.gaurish.outlinelite.data.TransferHistoryRepository
 import dev.gaurish.outlinelite.transfer.ClusterPeer
+import dev.gaurish.outlinelite.transfer.RelayManager
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelStatus
 import kotlinx.coroutines.Dispatchers
@@ -96,19 +77,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.net.InetSocketAddress
 import java.net.Socket
-
-private fun phaseColor(phase: TunnelPhase, scheme: ColorScheme): Color = when (phase) {
-    TunnelPhase.CONNECTED -> scheme.primary
-    TunnelPhase.CONNECTING -> scheme.secondary
-    TunnelPhase.STOPPING -> scheme.onSurfaceVariant
-    TunnelPhase.DISCONNECTED -> scheme.outlineVariant
-}
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 private fun phaseLabel(phase: TunnelPhase): String = when (phase) {
     TunnelPhase.CONNECTED -> "Connected"
-    TunnelPhase.CONNECTING -> "Connecting…"
-    TunnelPhase.STOPPING -> "Stopping…"
-    TunnelPhase.DISCONNECTED -> "Idle"
+    TunnelPhase.CONNECTING -> "Connecting"
+    TunnelPhase.STOPPING -> "Disconnecting"
+    TunnelPhase.DISCONNECTED -> "Not connected"
 }
 
 @Composable
@@ -116,516 +93,398 @@ fun HomeScreen(
     compact: Boolean,
     status: TunnelStatus,
     keys: List<AccessKey>,
+    keysLoaded: Boolean,
     activeId: String?,
     onConnectToggle: () -> Unit,
-    onSelect: (AccessKey) -> Unit,
-    onRename: (AccessKey, String) -> Unit,
-    onDelete: (AccessKey) -> Unit,
+    onOpenServers: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenHistory: () -> Unit,
     onBrowsePeer: (ClusterPeer) -> Unit,
 ) {
+    val scheme = MaterialTheme.colorScheme
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
-    var showAdd by remember { mutableStateOf(false) }
-    var keyToDelete by remember { mutableStateOf<AccessKey?>(null) }
-    var keyToRename by remember { mutableStateOf<AccessKey?>(null) }
-
     val activeKey = remember(keys, activeId) {
         keys.firstOrNull { it.id == activeId } ?: keys.firstOrNull()
     }
-
-    val copyKeyToClipboard: (AccessKey) -> Unit = { key ->
-        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-        val clip = ClipData.newPlainText("Shadowsocks Key", key.toSsUri())
-        clip.description.extras = android.os.PersistableBundle().apply {
-            putBoolean("android.content.extra.IS_SENSITIVE", true)
-        }
-        cm?.setPrimaryClip(clip)
-        Toast.makeText(context, "Key copied to clipboard", Toast.LENGTH_SHORT).show()
-    }
+    val history by TransferHistoryRepository.observe(context)
+        .collectAsStateWithLifecycle(initialValue = null)
+    val peers by RelayManager.peers.collectAsStateWithLifecycle()
+    val connected = status.phase == TunnelPhase.CONNECTED
+    val onlineCount = remember(peers) { peers.count { !it.isSelf } }
+    val activityLimit = if (compact) 1 else 6
 
     Box(
         Modifier
             .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
+            .background(scheme.background)
     ) {
-        Column(
-            Modifier
-                .fillMaxSize()
-                .systemBarsPadding()
-                .padding(horizontal = 20.dp, vertical = 16.dp)
-        ) {
-            HomeHeader(onAdd = { showAdd = true }, onSettings = onOpenSettings)
-            Spacer(Modifier.height(10.dp))
-            status.lastError?.let { err ->
-                Text(
-                    err,
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.error,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(Modifier.height(8.dp))
-            }
-            if (compact) {
-                Column(
-                    Modifier
-                        .fillMaxSize()
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    ConnectHero(
-                        Modifier.fillMaxWidth(),
+        if (compact) {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .widthIn(max = 640.dp)
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter)
+                    .systemBarsPadding(),
+                contentPadding = PaddingValues(horizontal = 20.dp, vertical = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(24.dp),
+            ) {
+                item { HomeHeader(onAdd = onOpenServers) }
+                item {
+                    ConnectionPanel(
+                        compact = true,
                         status = status,
                         activeKey = activeKey,
+                        hasKey = keys.isNotEmpty(),
+                        keysLoaded = keysLoaded,
                         onConnectToggle = onConnectToggle,
-                        onOpenSettings = onOpenSettings,
-                        onBrowsePeer = onBrowsePeer,
+                        onOpenServers = onOpenServers,
                     )
-                    ServersSection(
-                        Modifier.fillMaxWidth(),
-                        phase = status.phase,
-                        keys = keys,
-                        activeId = activeId,
-                        onSelect = onSelect,
-                        onRenameRequest = { keyToRename = it },
-                        onDeleteRequest = { keyToDelete = it },
-                        onShare = copyKeyToClipboard,
-                    )
-                    Spacer(Modifier.height(16.dp))
                 }
-            } else {
-                Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    ConnectHero(
-                        Modifier
-                            .weight(0.54f)
-                            .fillMaxHeight()
-                            .verticalScroll(rememberScrollState()),
-                        status = status,
-                        activeKey = activeKey,
-                        onConnectToggle = onConnectToggle,
+                item { RouteRow(activeKey, !keysLoaded, onOpenServers) }
+                item {
+                    DevicesSection(
+                        connected = connected,
+                        onlineCount = onlineCount,
                         onOpenSettings = onOpenSettings,
                         onBrowsePeer = onBrowsePeer,
                     )
-                    ServersSection(
-                        Modifier
+                }
+                item {
+                    ActivitySection(
+                        entries = history.orEmpty().take(activityLimit),
+                        loading = history == null,
+                        compact = true,
+                        onOpenHistory = onOpenHistory,
+                    )
+                }
+                item { Spacer(Modifier.height(16.dp)) }
+            }
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .widthIn(max = 1200.dp)
+                    .fillMaxWidth()
+                    .align(Alignment.TopCenter)
+                    .systemBarsPadding()
+                    .padding(horizontal = 32.dp, vertical = 20.dp),
+            ) {
+                HomeHeader(onAdd = onOpenServers)
+                Spacer(Modifier.height(16.dp))
+                HorizontalDivider(color = scheme.outlineVariant, thickness = 1.dp)
+                Spacer(Modifier.height(20.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                    horizontalArrangement = Arrangement.spacedBy(32.dp),
+                ) {
+                    Column(
+                        modifier = Modifier
                             .weight(0.46f)
                             .fillMaxHeight()
                             .verticalScroll(rememberScrollState()),
-                        phase = status.phase,
-                        keys = keys,
-                        activeId = activeId,
-                        onSelect = onSelect,
-                        onRenameRequest = { keyToRename = it },
-                        onDeleteRequest = { keyToDelete = it },
-                        onShare = copyKeyToClipboard,
-                    )
+                        verticalArrangement = Arrangement.spacedBy(24.dp),
+                    ) {
+                        ConnectionPanel(
+                            compact = false,
+                            status = status,
+                            activeKey = activeKey,
+                            hasKey = keys.isNotEmpty(),
+                            keysLoaded = keysLoaded,
+                            onConnectToggle = onConnectToggle,
+                            onOpenServers = onOpenServers,
+                        )
+                        RouteRow(activeKey, !keysLoaded, onOpenServers)
+                        Spacer(Modifier.height(8.dp))
+                    }
+                    Column(
+                        modifier = Modifier
+                            .weight(0.54f)
+                            .fillMaxHeight()
+                            .verticalScroll(rememberScrollState()),
+                        verticalArrangement = Arrangement.spacedBy(24.dp),
+                    ) {
+                        DevicesSection(
+                            connected = connected,
+                            onlineCount = onlineCount,
+                            onOpenSettings = onOpenSettings,
+                            onBrowsePeer = onBrowsePeer,
+                        )
+                        ActivitySection(
+                            entries = history.orEmpty().take(activityLimit),
+                            loading = history == null,
+                            compact = false,
+                            onOpenHistory = onOpenHistory,
+                        )
+                        Spacer(Modifier.height(8.dp))
+                    }
                 }
             }
-        }
-
-        AddKeyDialog(
-            visible = showAdd,
-            onDismiss = { showAdd = false },
-            onImport = { key ->
-                showAdd = false
-                scope.launch {
-                    val added = KeyRepository.addKey(context, key)
-                    if (added) KeyRepository.setActive(context, key.id)
-                    Toast.makeText(
-                        context,
-                        context.getString(if (added) R.string.key_added else R.string.key_exists),
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            },
-        )
-
-        // Delete Confirmation Dialog
-        keyToDelete?.let { targetKey ->
-            AlertDialog(
-                onDismissRequest = { keyToDelete = null },
-                title = { Text("Delete server?", fontWeight = FontWeight.SemiBold) },
-                text = {
-                    Text(
-                        "Are you sure you want to remove \"${targetKey.name}\"? This action cannot be undone.",
-                        fontSize = 14.sp,
-                        lineHeight = 20.sp,
-                    )
-                },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            onDelete(targetKey)
-                            keyToDelete = null
-                        },
-                        colors = ButtonDefaults.textButtonColors(
-                            contentColor = MaterialTheme.colorScheme.error
-                        ),
-                    ) {
-                        Text("Delete")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { keyToDelete = null }) {
-                        Text("Cancel")
-                    }
-                },
-            )
-        }
-
-        // Rename Server Dialog
-        keyToRename?.let { targetKey ->
-            var draftName by remember(targetKey) { mutableStateOf(targetKey.name) }
-            AlertDialog(
-                onDismissRequest = { keyToRename = null },
-                title = { Text("Rename server", fontWeight = FontWeight.SemiBold) },
-                text = {
-                    Column {
-                        OutlinedTextField(
-                            value = draftName,
-                            onValueChange = { draftName = it },
-                            label = { Text("Server name") },
-                            singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
-                            shape = RoundedCornerShape(12.dp),
-                        )
-                    }
-                },
-                confirmButton = {
-                    TextButton(
-                        enabled = draftName.isNotBlank(),
-                        onClick = {
-                            onRename(targetKey, draftName.trim())
-                            keyToRename = null
-                        },
-                    ) {
-                        Text("Save")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { keyToRename = null }) {
-                        Text("Cancel")
-                    }
-                },
-            )
         }
     }
 }
 
-// ---------- header ----------
-
 @Composable
-private fun HomeHeader(onAdd: () -> Unit, onSettings: () -> Unit) {
-    val scheme = MaterialTheme.colorScheme
+private fun HomeHeader(onAdd: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Icon(
-            painter = painterResource(R.drawable.ic_key),
-            contentDescription = null,
-            tint = scheme.primary,
-            modifier = Modifier.size(24.dp),
-        )
-        Spacer(Modifier.width(12.dp))
         Text(
-            stringResource(R.string.app_name),
+            "gaurPN",
             fontSize = 20.sp,
             fontWeight = FontWeight.SemiBold,
-            letterSpacing = 0.3.sp,
-            color = scheme.onBackground,
+            letterSpacing = 0.2.sp,
+            color = MaterialTheme.colorScheme.onBackground,
+            modifier = Modifier.weight(1f),
         )
-        Spacer(Modifier.weight(1f))
-        IconButton(onClick = onAdd) {
+        IconButton(onClick = onAdd, modifier = Modifier.size(48.dp)) {
             Icon(
                 painter = painterResource(R.drawable.ic_add),
                 contentDescription = "Add server",
-                tint = scheme.onSurfaceVariant,
-                modifier = Modifier.size(22.dp),
-            )
-        }
-        IconButton(onClick = onSettings) {
-            Icon(
-                painter = painterResource(R.drawable.ic_settings),
-                contentDescription = "Settings",
-                tint = scheme.onSurfaceVariant,
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(22.dp),
             )
         }
     }
 }
 
-// ---------- hero ----------
-
 @Composable
-private fun ConnectHero(
-    modifier: Modifier,
+private fun ConnectionPanel(
+    compact: Boolean,
     status: TunnelStatus,
     activeKey: AccessKey?,
+    hasKey: Boolean,
+    keysLoaded: Boolean,
     onConnectToggle: () -> Unit,
-    onOpenSettings: () -> Unit,
-    onBrowsePeer: (ClusterPeer) -> Unit,
+    onOpenServers: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
-    val connected = status.phase == TunnelPhase.CONNECTED
-
-    val btnBgColor by animateColorAsState(
-        targetValue = if (connected) scheme.surface else scheme.primary,
-        animationSpec = tween(350, easing = FastOutSlowInEasing),
-        label = "btn_bg"
-    )
-    val btnContentColor by animateColorAsState(
-        targetValue = if (connected) scheme.onSurface else scheme.onPrimary,
-        animationSpec = tween(350, easing = FastOutSlowInEasing),
-        label = "btn_content"
-    )
-
-    Column(
-        modifier = modifier,
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        StatusRing(status = status, activeKey = activeKey)
-        Spacer(Modifier.height(26.dp))
-        Button(
-            onClick = onConnectToggle,
-            modifier = Modifier
-                .height(52.dp)
-                .widthIn(min = 164.dp),
-            shape = RoundedCornerShape(26.dp),
-            elevation = ButtonDefaults.buttonElevation(defaultElevation = 0.dp),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = btnBgColor,
-                contentColor = btnContentColor,
-            ),
-            contentPadding = PaddingValues(horizontal = 32.dp),
+    Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            AnimatedContent(
-                targetState = connected,
-                transitionSpec = {
-                    (fadeIn(tween(220)) + slideInVertically(tween(220)) { it / 2 })
-                        .togetherWith(fadeOut(tween(140)) + slideOutVertically(tween(140)) { -it / 2 })
-                },
-                label = "btn_anim"
-            ) { isConn ->
+            GaitRing(
+                phase = status.phase,
+                modifier = Modifier.size(if (compact) 88.dp else 128.dp),
+            )
+            Column(Modifier.weight(1f)) {
                 Text(
-                    if (isConn) "Disconnect" else "Connect",
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 15.sp,
-                    letterSpacing = 0.2.sp,
+                    "VPN",
+                    style = BenchType.Micro,
+                    color = scheme.onSurfaceVariant,
                 )
-            }
-        }
-
-        if (connected) {
-            Spacer(Modifier.height(18.dp))
-            LanAccessRow(status = status)
-            Spacer(Modifier.height(10.dp))
-            ClusterSharingSection(
-                onOpenSettings = onOpenSettings,
-                onBrowsePeer = onBrowsePeer,
-            )
-        }
-    }
-}
-
-@Composable
-private fun StatusRing(
-    status: TunnelStatus,
-    activeKey: AccessKey?,
-) {
-    val scheme = MaterialTheme.colorScheme
-    val connected = status.phase == TunnelPhase.CONNECTED
-    val connecting = status.phase == TunnelPhase.CONNECTING || status.phase == TunnelPhase.STOPPING
-
-    val ringColor by animateColorAsState(
-        targetValue = phaseColor(status.phase, scheme),
-        animationSpec = tween(450, easing = FastOutSlowInEasing),
-        label = "ring_color"
-    )
-
-    val fillProgress = remember { Animatable(if (connected) 1f else 0f) }
-    val rippleRadius = remember { Animatable(0f) }
-    val rippleAlpha = remember { Animatable(0f) }
-    val iconScale = remember { Animatable(1f) }
-
-    LaunchedEffect(status.phase) {
-        when (status.phase) {
-            TunnelPhase.CONNECTED -> {
-                launch {
-                    fillProgress.animateTo(
-                        1f,
-                        animationSpec = tween(550, easing = FastOutSlowInEasing)
-                    )
-                }
-                launch {
-                    rippleRadius.snapTo(0f)
-                    rippleAlpha.snapTo(0.42f)
-                    launch {
-                        rippleRadius.animateTo(16f, tween(650, easing = FastOutSlowInEasing))
-                    }
-                    launch {
-                        rippleAlpha.animateTo(0f, tween(650, easing = FastOutSlowInEasing))
-                    }
-                }
-                launch {
-                    iconScale.snapTo(0.93f)
-                    iconScale.animateTo(
-                        1f,
-                        animationSpec = spring(
-                            dampingRatio = Spring.DampingRatioMediumBouncy,
-                            stiffness = Spring.StiffnessLow
-                        )
-                    )
-                }
-            }
-            TunnelPhase.CONNECTING -> {
-                launch {
-                    fillProgress.animateTo(0f, tween(200))
-                }
-            }
-            else -> {
-                launch {
-                    fillProgress.animateTo(
-                        0f,
-                        animationSpec = tween(400, easing = FastOutSlowInEasing)
-                    )
-                }
-            }
-        }
-    }
-
-    val infinite = rememberInfiniteTransition(label = "ring_spin")
-    val spinAngle by infinite.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(1400, easing = LinearEasing)),
-        label = "spin_angle"
-    )
-
-    Box(contentAlignment = Alignment.Center, modifier = Modifier.size(224.dp)) {
-        Canvas(Modifier.size(212.dp)) {
-            val strokeWidthPx = 8.dp.toPx()
-            val stroke = Stroke(width = strokeWidthPx, cap = StrokeCap.Round)
-            val centerOffset = center
-            val baseRadius = (size.minDimension - strokeWidthPx) / 2
-
-            // Background subtle track
-            drawCircle(
-                color = scheme.outlineVariant.copy(alpha = 0.35f),
-                radius = baseRadius,
-                center = centerOffset,
-                style = stroke
-            )
-
-            // Ripple wave on connection lock-in
-            if (rippleAlpha.value > 0.01f) {
-                drawCircle(
-                    color = ringColor.copy(alpha = rippleAlpha.value),
-                    radius = baseRadius + rippleRadius.value.dp.toPx(),
-                    center = centerOffset,
-                    style = Stroke(width = 2.dp.toPx())
-                )
-            }
-
-            // Connecting animated arc
-            if (connecting) {
-                val connectingBrush = Brush.sweepGradient(
-                    listOf(ringColor.copy(alpha = 0.05f), ringColor.copy(alpha = 0.4f), ringColor)
-                )
-                rotate(degrees = spinAngle) {
-                    drawArc(
-                        brush = connectingBrush,
-                        startAngle = 0f,
-                        sweepAngle = 110f,
-                        useCenter = false,
-                        style = stroke,
-                    )
-                }
-            }
-
-            // Connected or retiring sweep
-            if (fillProgress.value > 0.01f) {
-                val connectedBrush = Brush.sweepGradient(
-                    listOf(ringColor.copy(alpha = 0.6f), ringColor, ringColor)
-                )
-                drawArc(
-                    brush = connectedBrush,
-                    startAngle = 270f,
-                    sweepAngle = 360f * fillProgress.value,
-                    useCenter = false,
-                    style = stroke,
-                )
-            }
-        }
-
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-            modifier = Modifier.padding(horizontal = 16.dp)
-        ) {
-            Icon(
-                painter = painterResource(R.drawable.ic_key),
-                contentDescription = null,
-                tint = if (status.phase == TunnelPhase.DISCONNECTED) {
-                    scheme.onSurfaceVariant.copy(alpha = 0.75f)
-                } else {
-                    ringColor
-                },
-                modifier = Modifier
-                    .size(42.dp)
-                    .graphicsLayer {
-                        scaleX = iconScale.value
-                        scaleY = iconScale.value
+                AnimatedContent(
+                    targetState = status.phase,
+                    transitionSpec = {
+                        fadeIn(tween(140, easing = Motion.Decelerate))
+                            .togetherWith(fadeOut(tween(90, easing = Motion.Accelerate)))
                     },
-            )
-            Spacer(Modifier.height(8.dp))
-            AnimatedContent(
-                targetState = status.phase,
-                transitionSpec = {
-                    (fadeIn(tween(250)) + slideInVertically(tween(250)) { it / 3 })
-                        .togetherWith(fadeOut(tween(180)) + slideOutVertically(tween(180)) { -it / 3 })
-                },
-                label = "phase_label"
-            ) { phase ->
+                    label = "phase_label",
+                ) { phase ->
+                    Text(
+                        phaseLabel(phase),
+                        fontSize = if (compact) 24.sp else 28.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = scheme.onBackground,
+                    )
+                }
                 Text(
-                    phaseLabel(phase),
-                    fontSize = 22.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = scheme.onBackground,
-                )
-            }
-            status.activeName?.let { name ->
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    name,
+                    when {
+                        activeKey != null -> activeKey.name
+                        keysLoaded -> "No server selected"
+                        else -> "Loading servers"
+                    },
                     fontSize = 13.sp,
                     color = scheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                Spacer(Modifier.height(12.dp))
+                LiveStatsLine(status, activeKey)
             }
-            if (connected && status.connectedAt > 0) {
-                LiveStatsLine(status.connectedAt, activeKey)
-            }
+        }
+
+        PrimaryAction(
+            phase = status.phase,
+            hasKey = hasKey,
+            keysLoaded = keysLoaded,
+            compact = compact,
+            onConnectToggle = onConnectToggle,
+            onOpenServers = onOpenServers,
+        )
+
+        status.lastError?.let { error ->
+            ErrorLine(error)
         }
     }
 }
 
 @Composable
-private fun LiveStatsLine(
-    connectedAt: Long,
-    activeKey: AccessKey?,
+private fun PrimaryAction(
+    phase: TunnelPhase,
+    hasKey: Boolean,
+    keysLoaded: Boolean,
+    compact: Boolean,
+    onConnectToggle: () -> Unit,
+    onOpenServers: () -> Unit,
 ) {
-    var tick by remember(connectedAt) { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-    var rxSpeed by remember { mutableLongStateOf(0L) }
-    var txSpeed by remember { mutableLongStateOf(0L) }
+    val scheme = MaterialTheme.colorScheme
+    val label = when (phase) {
+        TunnelPhase.CONNECTED -> "Disconnect"
+        TunnelPhase.CONNECTING, TunnelPhase.STOPPING -> "Cancel"
+        TunnelPhase.DISCONNECTED -> "Connect"
+    }
+    val enabled = keysLoaded && (hasKey || phase != TunnelPhase.DISCONNECTED)
+    val modifier = if (compact) {
+        Modifier.fillMaxWidth()
+    } else {
+        Modifier.widthIn(min = 220.dp)
+    }
+
+    if (phase == TunnelPhase.CONNECTED) {
+        OutlinedButton(
+            onClick = onConnectToggle,
+            modifier = modifier.heightIn(min = 52.dp),
+            shape = MaterialTheme.shapes.medium,
+            border = androidx.compose.foundation.BorderStroke(1.dp, scheme.outline),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = scheme.onBackground),
+        ) {
+            Text(label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        }
+    } else {
+        Button(
+            onClick = onConnectToggle,
+            enabled = enabled,
+            modifier = modifier.heightIn(min = 52.dp),
+            shape = MaterialTheme.shapes.medium,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = scheme.primary,
+                contentColor = scheme.onPrimary,
+                disabledContainerColor = scheme.surfaceVariant,
+                disabledContentColor = scheme.onSurfaceVariant,
+            ),
+        ) {
+            Text(label, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        }
+    }
+
+    if (keysLoaded && !hasKey) {
+        TextButton(onClick = onOpenServers) {
+            Text("Add a server", fontSize = 13.sp)
+        }
+    }
+}
+
+@Composable
+private fun ErrorLine(message: String) {
+    val scheme = MaterialTheme.colorScheme
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(MaterialTheme.shapes.small)
+            .background(scheme.errorContainer.copy(alpha = 0.35f))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .size(3.dp, 20.dp)
+                .clip(CircleShape)
+                .background(scheme.error)
+        )
+        Spacer(Modifier.width(10.dp))
+        Text(
+            message,
+            fontSize = 12.sp,
+            lineHeight = 17.sp,
+            color = scheme.onErrorContainer,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+}
+
+@Composable
+private fun GaitRing(
+    phase: TunnelPhase,
+    modifier: Modifier = Modifier,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val progress = remember {
+        Animatable(if (phase == TunnelPhase.CONNECTED) 8f else 0f)
+    }
+
+    LaunchedEffect(phase) {
+        when (phase) {
+            TunnelPhase.CONNECTING -> {
+                progress.snapTo(0f)
+                while (true) {
+                    progress.animateTo(8f, tween(1600, easing = LinearEasing))
+                    progress.snapTo(0f)
+                }
+            }
+            TunnelPhase.CONNECTED -> progress.animateTo(
+                8f,
+                tween(Motion.Settle, easing = Motion.Decelerate),
+            )
+            else -> progress.animateTo(
+                0f,
+                tween(Motion.Base, easing = Motion.Standard),
+            )
+        }
+    }
+
+    Canvas(modifier) {
+        val strokeWidth = 6.dp.toPx()
+        val radius = (size.minDimension - strokeWidth) / 2f
+        val topLeft = Offset(center.x - radius, center.y - radius)
+        val arcSize = Size(radius * 2f, radius * 2f)
+        val stroke = Stroke(width = strokeWidth, cap = StrokeCap.Round)
+
+        for (index in 0 until 8) {
+            val fill = (progress.value - index).coerceIn(0f, 1f)
+            val color = if (fill <= 0f) {
+                scheme.outlineVariant.copy(alpha = 0.70f)
+            } else {
+                scheme.primary.copy(alpha = 0.30f + 0.70f * fill)
+            }
+            drawArc(
+                color = color,
+                startAngle = -90f + index * 45f + 6.5f,
+                sweepAngle = 32f,
+                useCenter = false,
+                topLeft = topLeft,
+                size = arcSize,
+                style = stroke,
+            )
+        }
+    }
+}
+
+@Composable
+private fun LiveStatsLine(status: TunnelStatus, activeKey: AccessKey?) {
+    val scheme = MaterialTheme.colorScheme
+    val connected = status.phase == TunnelPhase.CONNECTED && status.connectedAt > 0
+    var tick by remember(status.connectedAt) {
+        mutableLongStateOf(SystemClock.elapsedRealtime())
+    }
+    var rxBytes by remember { mutableLongStateOf(0L) }
+    var txBytes by remember { mutableLongStateOf(0L) }
     var pingMs by remember { mutableStateOf<Long?>(null) }
 
-    LaunchedEffect(connectedAt, activeKey?.id) {
+    LaunchedEffect(connected, status.connectedAt, activeKey?.id) {
+        if (!connected) {
+            rxBytes = 0L
+            txBytes = 0L
+            pingMs = null
+            return@LaunchedEffect
+        }
         if (activeKey != null) {
             launch {
                 while (true) {
                     pingMs = measurePing(activeKey.host, activeKey.port)
-                    delay(4000)
+                    delay(15_000)
                 }
             }
         }
@@ -634,68 +493,249 @@ private fun LiveStatsLine(
         while (true) {
             delay(1000)
             tick = SystemClock.elapsedRealtime()
-            val currentRx = TrafficStats.getUidRxBytes(Process.myUid())
-            val currentTx = TrafficStats.getUidTxBytes(Process.myUid())
-            if (lastRx > 0 && currentRx >= lastRx) {
-                rxSpeed = currentRx - lastRx
-            }
-            if (lastTx > 0 && currentTx >= lastTx) {
-                txSpeed = currentTx - lastTx
-            }
-            lastRx = currentRx
-            lastTx = currentTx
+            val nowRx = TrafficStats.getUidRxBytes(Process.myUid())
+            val nowTx = TrafficStats.getUidTxBytes(Process.myUid())
+            if (lastRx > 0 && nowRx >= lastRx) rxBytes = nowRx - lastRx
+            if (lastTx > 0 && nowTx >= lastTx) txBytes = nowTx - lastTx
+            lastRx = nowRx
+            lastTx = nowTx
         }
     }
 
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Spacer(Modifier.height(5.dp))
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center,
-        ) {
-            if (pingMs != null) {
-                val pingColor = when {
-                    pingMs!! < 100 -> Color(0xFF4CAF50)
-                    pingMs!! < 250 -> Color(0xFFFFB300)
-                    else -> Color(0xFFF44336)
-                }
-                Box(
-                    Modifier
-                        .size(6.dp)
-                        .clip(CircleShape)
-                        .background(pingColor)
-                )
-                Spacer(Modifier.width(5.dp))
-                Text(
-                    "${pingMs}ms",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = pingColor,
-                )
-                Spacer(Modifier.width(6.dp))
-                Text(
-                    "·",
-                    fontSize = 12.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
-                )
-                Spacer(Modifier.width(6.dp))
-            }
+    Row(verticalAlignment = Alignment.Bottom) {
+        Text(
+            if (connected) formatUptime(tick - status.connectedAt) else "--:--",
+            style = BenchType.Readout,
+            color = if (connected) scheme.onBackground else scheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.width(18.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text("PING", style = BenchType.Micro, color = scheme.onSurfaceVariant)
             Text(
-                "up ${formatUptime(tick - connectedAt)}",
-                fontSize = 12.sp,
+                if (connected && pingMs != null) "$pingMs ms" else "--",
+                style = BenchType.Data,
+                color = scheme.onSurfaceVariant,
+            )
+        }
+    }
+    Spacer(Modifier.height(6.dp))
+    Text(
+        "IN ${formatSpeed(rxBytes)}   OUT ${formatSpeed(txBytes)}",
+        style = BenchType.Data,
+        color = scheme.onSurfaceVariant,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
+@Composable
+private fun RouteRow(key: AccessKey?, loading: Boolean, onOpen: () -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Column {
+        HorizontalDivider(color = scheme.outlineVariant, thickness = 1.dp)
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = !loading, onClick = onOpen)
+                .padding(vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("SERVER", style = BenchType.Micro, color = scheme.onSurfaceVariant)
+                Text(
+                    when {
+                        key != null -> key.name
+                        loading -> "Loading servers"
+                        else -> "Add a server"
+                    },
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = scheme.onBackground,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (!loading && key != null) {
+                    Text(
+                        key.displayAddress(),
+                        style = BenchType.Data,
+                        color = scheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Icon(
+                painter = painterResource(R.drawable.ic_chevron_right),
+                contentDescription = null,
+                tint = scheme.onSurfaceVariant,
+            )
+        }
+        HorizontalDivider(color = scheme.outlineVariant, thickness = 1.dp)
+    }
+}
+
+@Composable
+private fun DevicesSection(
+    connected: Boolean,
+    onlineCount: Int,
+    onOpenSettings: () -> Unit,
+    onBrowsePeer: (ClusterPeer) -> Unit,
+) {
+    Column {
+        SectionHeader(
+            title = "DEVICES",
+            trailing = if (connected) "$onlineCount online" else null,
+        )
+        if (connected) {
+            ClusterSharingSection(
+                onOpenSettings = onOpenSettings,
+                onBrowsePeer = onBrowsePeer,
+                embedded = true,
+                showHeader = false,
+            )
+        } else {
+            Text(
+                "No devices online. Connect to find your other devices.",
+                fontSize = 13.sp,
+                lineHeight = 19.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        if (rxSpeed > 0 || txSpeed > 0) {
-            Spacer(Modifier.height(3.dp))
+    }
+}
+
+@Composable
+private fun ActivitySection(
+    entries: List<TransferHistoryEntry>,
+    loading: Boolean,
+    compact: Boolean,
+    onOpenHistory: () -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val formatter = remember { SimpleDateFormat("HH:mm", Locale.getDefault()) }
+    Column {
+        SectionHeader("ACTIVITY", trailing = "History", onTrailingClick = onOpenHistory)
+        when {
+            loading -> {
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(56.dp)
+                        .clip(MaterialTheme.shapes.small)
+                        .background(scheme.surfaceVariant.copy(alpha = 0.35f))
+                )
+            }
+            entries.isEmpty() -> {
+                Text(
+                    "No transfers yet.",
+                    fontSize = 13.sp,
+                    color = scheme.onSurfaceVariant,
+                )
+            }
+            else -> {
+                entries.forEachIndexed { index, entry ->
+                    ActivityRow(entry, formatter, onOpenHistory)
+                    if (index != entries.lastIndex) {
+                        HorizontalDivider(color = scheme.outlineVariant, thickness = 1.dp)
+                    }
+                }
+                if (compact) {
+                    Spacer(Modifier.height(4.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActivityRow(
+    entry: TransferHistoryEntry,
+    formatter: SimpleDateFormat,
+    onOpenHistory: () -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val statusColor = when (entry.status) {
+        "completed" -> scheme.primary
+        "failed" -> scheme.error
+        else -> scheme.onSurfaceVariant
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onOpenHistory)
+            .padding(vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(24.dp)
+                .clip(CircleShape)
+                .background(statusColor.copy(alpha = 0.14f)),
+            contentAlignment = Alignment.Center,
+        ) {
             Text(
-                "↓ ${formatSpeed(rxSpeed)}  ↑ ${formatSpeed(txSpeed)}",
-                fontSize = 11.sp,
+                if (entry.direction == "sent") "\u2191" else "\u2193",
+                style = BenchType.Data,
+                color = statusColor,
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                entry.label,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.Medium,
-                color = MaterialTheme.colorScheme.primary,
+                color = scheme.onBackground,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                "${entry.peerName}  ${formatter.format(Date(entry.timestamp))}",
+                style = BenchType.Data,
+                color = scheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Text(
+            when (entry.status) {
+                "completed" -> "Done"
+                "failed" -> "Failed"
+                "active" -> "In progress"
+                else -> entry.status
+            },
+            style = BenchType.Micro,
+            color = statusColor,
+        )
+    }
+}
+
+@Composable
+private fun SectionHeader(
+    title: String,
+    trailing: String? = null,
+    onTrailingClick: (() -> Unit)? = null,
+) {
+    val scheme = MaterialTheme.colorScheme
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title, style = BenchType.Micro, color = scheme.onSurfaceVariant)
+        Spacer(Modifier.weight(1f))
+        if (trailing != null) {
+            Text(
+                trailing,
+                style = BenchType.Micro,
+                color = if (onTrailingClick != null) scheme.primary else scheme.onSurfaceVariant,
+                modifier = if (onTrailingClick != null) {
+                    Modifier.clickable(onClick = onTrailingClick)
+                } else {
+                    Modifier
+                },
             )
         }
     }
@@ -717,177 +757,6 @@ private fun formatUptime(ms: Long): String {
     return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
 }
 
-// ---------- servers ----------
-
-@Composable
-private fun ServersSection(
-    modifier: Modifier,
-    phase: TunnelPhase,
-    keys: List<AccessKey>,
-    activeId: String?,
-    onSelect: (AccessKey) -> Unit,
-    onRenameRequest: (AccessKey) -> Unit,
-    onDeleteRequest: (AccessKey) -> Unit,
-    onShare: (AccessKey) -> Unit,
-) {
-    val scheme = MaterialTheme.colorScheme
-    Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                stringResource(R.string.section_servers).uppercase(),
-                fontSize = 11.sp,
-                letterSpacing = 1.6.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = scheme.onSurfaceVariant,
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                "${keys.size}",
-                fontSize = 11.sp,
-                color = scheme.onSurfaceVariant.copy(alpha = 0.65f),
-            )
-            Spacer(Modifier.weight(1f))
-            if (phase == TunnelPhase.CONNECTED) {
-                Text(
-                    "connected",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = scheme.primary,
-                )
-            }
-        }
-        Surface(
-            shape = RoundedCornerShape(22.dp),
-            color = scheme.surface,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            when {
-                keys.isEmpty() ->
-                    Box(
-                        Modifier
-                            .fillMaxWidth()
-                            .padding(20.dp),
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        Text(
-                            stringResource(R.string.empty_servers),
-                            fontSize = 13.sp,
-                            lineHeight = 19.sp,
-                            color = scheme.onSurfaceVariant,
-                            modifier = Modifier.fillMaxWidth(),
-                            textAlign = TextAlign.Center,
-                        )
-                    }
-                else -> Column(
-                    Modifier
-                        .fillMaxWidth()
-                        .padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    keys.forEach { key ->
-                        ServerRow(
-                            key = key,
-                            selected = key.id == activeId,
-                            onSelect = onSelect,
-                            onRenameRequest = onRenameRequest,
-                            onDeleteRequest = onDeleteRequest,
-                            onShare = onShare,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ServerRow(
-    key: AccessKey,
-    selected: Boolean,
-    onSelect: (AccessKey) -> Unit,
-    onRenameRequest: (AccessKey) -> Unit,
-    onDeleteRequest: (AccessKey) -> Unit,
-    onShare: (AccessKey) -> Unit,
-) {
-    val scheme = MaterialTheme.colorScheme
-
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(15.dp))
-            .clickable { onSelect(key) }
-            .background(if (selected) scheme.primary.copy(alpha = 0.10f) else Color.Transparent)
-            .padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
-    ) {
-        Box(
-            Modifier
-                .size(34.dp)
-                .clip(CircleShape)
-                .background(
-                    if (selected) scheme.primary.copy(alpha = 0.18f)
-                    else scheme.outlineVariant.copy(alpha = 0.30f)
-                ),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                painter = painterResource(R.drawable.ic_key),
-                contentDescription = null,
-                tint = if (selected) scheme.primary else scheme.onSurfaceVariant,
-                modifier = Modifier.size(17.dp),
-            )
-        }
-        Spacer(Modifier.width(12.dp))
-        Column(Modifier.weight(1f)) {
-            Text(
-                key.name.ifBlank { key.displayAddress() },
-                fontSize = 15.sp,
-                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
-                color = scheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                key.displayAddress(),
-                fontSize = 12.sp,
-                color = scheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-        }
-
-        // Rename Action
-        IconButton(onClick = { onRenameRequest(key) }, modifier = Modifier.size(38.dp)) {
-            Icon(
-                painter = painterResource(R.drawable.ic_edit),
-                contentDescription = "Rename",
-                tint = scheme.onSurfaceVariant.copy(alpha = 0.75f),
-                modifier = Modifier.size(16.dp),
-            )
-        }
-
-        // Share Action
-        IconButton(onClick = { onShare(key) }, modifier = Modifier.size(38.dp)) {
-            Icon(
-                painter = painterResource(R.drawable.ic_share),
-                contentDescription = "Share",
-                tint = scheme.onSurfaceVariant.copy(alpha = 0.75f),
-                modifier = Modifier.size(16.dp),
-            )
-        }
-
-        // Delete Action
-        IconButton(onClick = { onDeleteRequest(key) }, modifier = Modifier.size(38.dp)) {
-            Icon(
-                painter = painterResource(R.drawable.ic_delete),
-                contentDescription = "Delete",
-                tint = scheme.onSurfaceVariant.copy(alpha = 0.75f),
-                modifier = Modifier.size(16.dp),
-            )
-        }
-    }
-}
-
 private suspend fun measurePing(host: String, port: Int): Long? = withContext(Dispatchers.IO) {
     runCatching {
         val start = SystemClock.elapsedRealtime()
@@ -897,71 +766,4 @@ private suspend fun measurePing(host: String, port: Int): Long? = withContext(Di
         }
         SystemClock.elapsedRealtime() - start
     }.getOrNull()
-}
-
-// ---------- add dialog ----------
-
-@Composable
-private fun AddKeyDialog(
-    visible: Boolean,
-    onDismiss: () -> Unit,
-    onImport: (AccessKey) -> Unit,
-) {
-    if (!visible) return
-    val context = LocalContext.current
-    var draft by rememberSaveable { mutableStateOf("") }
-    val parsed = remember(draft) { SsKeyParser.parse(draft) }
-    val scheme = MaterialTheme.colorScheme
-
-    // Auto-detect ss:// link on clipboard when dialog opens
-    LaunchedEffect(visible) {
-        if (draft.isBlank()) {
-            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-            val clipText = cm?.primaryClip?.getItemAt(0)?.text?.toString()?.trim()
-            if (clipText != null && clipText.startsWith("ss://", ignoreCase = true)) {
-                draft = clipText
-            }
-        }
-    }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text("Add server", fontWeight = FontWeight.SemiBold) },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = { draft = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    placeholder = { Text("ss://…") },
-                    minLines = 2,
-                    isError = draft.isNotBlank() && parsed == null,
-                    shape = RoundedCornerShape(12.dp),
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    when {
-                        draft.isBlank() -> "Paste an ss:// access key."
-                        parsed != null -> "✓ OK — ${parsed.name}"
-                        else -> "Not recognized as an ss:// key"
-                    },
-                    fontSize = 12.sp,
-                    color = when {
-                        draft.isBlank() -> scheme.onSurfaceVariant.copy(alpha = 0.7f)
-                        parsed != null -> scheme.primary
-                        else -> scheme.error
-                    },
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                enabled = parsed != null,
-                onClick = { parsed?.let(onImport) },
-            ) { Text("Import") }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-    )
 }

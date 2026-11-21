@@ -115,7 +115,7 @@ fun TransfersScreen(
         }
 
         SettingsRow(
-            title = "Allow remote open",
+            title = "Let devices open files here",
             summary = "Let trusted devices open links, files, and apps on this phone",
         ) {
             GaurSwitch(allowRemoteOpen) { enabled ->
@@ -124,7 +124,7 @@ fun TransfersScreen(
         }
 
         SettingsRow(
-            title = "Allow file requests",
+            title = "Let devices browse this phone",
             summary = "Let cluster devices browse this phone's shared folders and download what they pick",
         ) {
             GaurSwitch(allowFileRequests) { enabled ->
@@ -152,11 +152,11 @@ fun TransfersScreen(
                 }
             }
             SettingsRow(
-                title = "All files access",
+                title = "Full file access",
                 summary = if (allFilesAccess) {
-                    "Complete — all shared-storage files are browsable by trusted devices"
+                    "Complete. Trusted devices can browse every file."
                 } else {
-                    "Limited — trusted devices can only browse media collections. " +
+                    "Limited. Trusted devices can browse photos, video, and audio only. " +
                         "Grant for full file visibility."
                 },
                 trailing = grantAction,

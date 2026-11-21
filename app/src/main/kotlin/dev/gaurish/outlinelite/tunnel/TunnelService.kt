@@ -257,7 +257,7 @@ class TunnelService : VpnService() {
                 val t = goTunnel
                 val alive = t != null && runCatching { t.isConnected() }.getOrDefault(false)
                 if (!alive) {
-                    fail("Tunnel dropped — reconnecting…")
+                    fail("Tunnel dropped. Reconnecting.")
                     return@launch
                 }
                 tick += 1
@@ -463,7 +463,7 @@ class TunnelService : VpnService() {
             probeFailures += 1
             if (probeFailures >= PROBE_FAILURES_LIMIT) {
                 probeFailures = 0
-                fail("Server unreachable — reconnecting…")
+                fail("Server unreachable. Reconnecting.")
             }
         }
     }

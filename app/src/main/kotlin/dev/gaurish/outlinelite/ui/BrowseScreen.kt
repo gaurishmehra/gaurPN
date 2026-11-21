@@ -162,12 +162,12 @@ fun BrowseScreen(
             val requestId = RelayManager.requestFetch(context, peer, paths)
             fetching = false
             if (requestId == null) {
-                snackbar.showSnackbar("Not connected — couldn't send the download")
+                snackbar.showSnackbar("Not connected. The download did not start.")
             } else {
                 fetchRequestId = requestId
                 selected.clear()
                 selectMode = false
-                snackbar.showSnackbar("Sent to downloads")
+                snackbar.showSnackbar("Download requested")
             }
         }
     }
@@ -221,7 +221,7 @@ fun BrowseScreen(
                                 selectMode = false
                             },
                         ) {
-                            Text("Clear", fontSize = 12.sp)
+                            Text("Clear selection", fontSize = 12.sp)
                         }
                         Spacer(Modifier.width(6.dp))
                         Button(
@@ -230,12 +230,12 @@ fun BrowseScreen(
                             contentPadding = PaddingValues(horizontal = 16.dp),
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = MaterialTheme.colorScheme.primary,
-                                contentColor = Color(0xFF04231A),
+                                contentColor = MaterialTheme.colorScheme.onPrimary,
                             ),
                         ) {
                             Text(
                                 if (fetching) {
-                                    "Sending…"
+                                    "Requesting"
                                 } else {
                                     "Download (${selected.size}) · ${formatBytes(selectedBytes)}"
                                 },

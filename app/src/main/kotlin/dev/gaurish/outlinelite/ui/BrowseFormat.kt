@@ -58,7 +58,7 @@ internal fun fileKind(name: String): FileKind {
  * decimal below 100, none above, and a trailing ".0" is dropped.
  */
 internal fun formatBytes(bytes: Long): String {
-    if (bytes < 0L) return "—"
+    if (bytes < 0L) return "Unknown"
     if (bytes < 1024L) return "$bytes B"
     val units = arrayOf("KB", "MB", "GB", "TB")
     var value = bytes.toDouble()
@@ -101,7 +101,7 @@ internal fun browseEntryKeys(entries: List<BrowseEntry>): List<String> {
 internal fun browseErrorMessage(error: BrowseError): String = when (error) {
     BrowseError.DENIED -> "Device refused the request"
     BrowseError.NOT_FOUND -> "Path not found"
-    BrowseError.RATE_LIMITED -> "Too many requests — slow down"
+    BrowseError.RATE_LIMITED -> "Too many requests. Slow down."
     BrowseError.UNSUPPORTED -> "This device can't browse files"
 }
 
@@ -114,5 +114,5 @@ internal fun declineMessage(reason: DeclineReason): String = when (reason) {
     DeclineReason.PICKER_UNAVAILABLE -> "The other device couldn't open its files"
     DeclineReason.NOT_ALLOWED -> "The other device doesn't allow downloads"
     DeclineReason.NOT_FOUND -> "Some files no longer exist"
-    DeclineReason.TOO_LARGE -> "Too large — the batch is over 4 GB"
+    DeclineReason.TOO_LARGE -> "Too large. The batch is over 4 GB."
 }

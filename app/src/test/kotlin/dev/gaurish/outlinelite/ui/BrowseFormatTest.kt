@@ -17,7 +17,7 @@ class BrowseFormatTest {
         assertEquals("1.5 KB", formatBytes(1536L))
         assertEquals("12.4 MB", formatBytes(13_002_342L))
         assertEquals("4 GB", formatBytes(4L * 1024 * 1024 * 1024))
-        assertEquals("—", formatBytes(-1L))
+        assertEquals("Unknown", formatBytes(-1L))
     }
 
     @Test
@@ -47,7 +47,7 @@ class BrowseFormatTest {
     fun listingErrorsMapToFriendlyText() {
         assertEquals("Device refused the request", browseErrorMessage(BrowseError.DENIED))
         assertEquals("Path not found", browseErrorMessage(BrowseError.NOT_FOUND))
-        assertEquals("Too many requests — slow down", browseErrorMessage(BrowseError.RATE_LIMITED))
+        assertEquals("Too many requests. Slow down.", browseErrorMessage(BrowseError.RATE_LIMITED))
         assertEquals("This device can't browse files", browseErrorMessage(BrowseError.UNSUPPORTED))
     }
 
@@ -57,7 +57,7 @@ class BrowseFormatTest {
             assertTrue(declineMessage(reason).isNotBlank())
         }
         assertEquals(
-            "Too large — the batch is over 4 GB",
+            "Too large. The batch is over 4 GB.",
             declineMessage(DeclineReason.TOO_LARGE),
         )
         assertEquals(

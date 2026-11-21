@@ -56,13 +56,13 @@ fun MediaScreen(onBack: () -> Unit) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    SettingsScaffold(title = "Media Controls", onBack = onBack) {
+    SettingsScaffold(title = "Media controls", onBack = onBack) {
         SettingsRow(
             title = "Share media controls",
             summary = when {
-                !mediaSync -> "Off — control this device's media from other cluster devices"
+                !mediaSync -> "Off. Other devices cannot control playback."
                 !notificationAccess -> "Grant notification access to read media sessions"
-                else -> "On — now-playing and transport controls are shared"
+                else -> "On. Playback controls are shared."
             },
         ) {
             GaurSwitch(mediaSync) { enabled ->
@@ -86,7 +86,7 @@ fun MediaScreen(onBack: () -> Unit) {
             title = "Media session",
             summary = when {
                 !mediaSync -> "Off"
-                mediaState.active -> "${mediaState.title ?: "Unknown"} — ${mediaState.app ?: ""}"
+                mediaState.active -> "${mediaState.title ?: "Unknown"} · ${mediaState.app ?: ""}"
                 mediaState.error != null -> mediaState.error!!
                 else -> "No active media session"
             },

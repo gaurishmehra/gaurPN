@@ -63,17 +63,17 @@ fun ClipboardSyncScreen(onBack: () -> Unit) {
     }
 
     val clipboardSummary = when {
-        !clipboardSync -> "Off — copy on one device, paste on another"
+        !clipboardSync -> "Off. Copy on one device, paste on another."
         !overlayGranted ->
             "Grant \"Display over other apps\" to read the clipboard in the background"
         clipboardState.phase == ClipboardSyncPhase.WAITING_FOR_VPN ->
             "Waiting for the VPN connection"
         clipboardState.phase == ClipboardSyncPhase.ERROR ->
             clipboardState.lastMessage ?: "Clipboard sync error"
-        else -> clipboardState.lastMessage ?: "On — text and images sync across your cluster"
+        else -> clipboardState.lastMessage ?: "On. Text and images sync across your devices."
     }
 
-    SettingsScaffold(title = "Clipboard Sync", onBack = onBack) {
+    SettingsScaffold(title = "Clipboard sync", onBack = onBack) {
         SettingsRow(
             title = "Sync clipboard",
             summary = clipboardSummary,

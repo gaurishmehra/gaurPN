@@ -50,6 +50,8 @@ import dev.gaurish.outlinelite.data.DnsMode
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.SplitTunnelRepository
 import dev.gaurish.outlinelite.data.ThemeMode
+import dev.gaurish.outlinelite.tunnel.TunnelState
+import dev.gaurish.outlinelite.ui.LanAccessRow
 import kotlinx.coroutines.launch
 
 /**
@@ -110,6 +112,7 @@ fun SettingsScreen(
     // Battery-optimization state lives in the OS, so re-check after returning
     // from the system dialog (every ON_RESUME).
     var batteryExempt by remember { mutableStateOf(false) }
+    val tunnelStatus by TunnelState.flow.collectAsStateWithLifecycle()
     val powerManager = remember { context.getSystemService(PowerManager::class.java) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
@@ -123,7 +126,7 @@ fun SettingsScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    SettingsScaffold(title = "Settings", onBack = onBack) {
+    SettingsScaffold(title = "Settings", onBack = onBack, showBack = false) {
         SectionLabel("Appearance")
         SettingsRow(
             title = "Theme",
@@ -139,7 +142,7 @@ fun SettingsScreen(
         SectionLabel("Connection")
         SettingsRow(
             title = "Keep connection alive",
-            summary = "Reconnect automatically if the tunnel drops (fast retries first, then every few minutes)",
+            summary = "Reconnect automatically when the connection drops.",
         ) {
             GaurSwitch(autoReconnect) { enabled ->
                 scope.launch { KeyRepository.setAutoReconnect(context, enabled) }
@@ -155,7 +158,7 @@ fun SettingsScreen(
         }
         SettingsRow(
             title = "Block traffic while reconnecting",
-            summary = "Drop packets instead of leaking direct when the tunnel drops",
+            summary = "Block traffic when the VPN drops instead of sending it unprotected.",
         ) {
             GaurSwitch(blockOnReconnect) { enabled ->
                 scope.launch { KeyRepository.setBlockOnReconnect(context, enabled) }
@@ -164,26 +167,26 @@ fun SettingsScreen(
         SettingsRow(
             title = "Ignore battery optimizations",
             summary = if (batteryExempt) {
-                "Unrestricted — the VPN may run freely in the background"
+                "Unrestricted. The VPN can run in the background."
             } else {
-                "Restricted — Android may kill the VPN to save battery"
+                "Restricted. Android may stop the VPN to save battery."
             },
             onClick = { openBatterySettings(context, batteryExempt) },
             trailing = {
                 Button(
                     onClick = { openBatterySettings(context, batteryExempt) },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = if (batteryExempt) androidx.compose.ui.graphics.Color(0xFF232F3E)
+                        containerColor = if (batteryExempt) MaterialTheme.colorScheme.surfaceVariant
                         else MaterialTheme.colorScheme.primary,
                         contentColor = if (batteryExempt) MaterialTheme.colorScheme.onBackground
-                        else androidx.compose.ui.graphics.Color(0xFF04231A),
+                        else MaterialTheme.colorScheme.onPrimary,
                     ),
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(
                         horizontal = 14.dp, vertical = 6.dp
                     ),
                 ) {
                     Text(
-                        if (batteryExempt) "Exempt ✓" else "Allow",
+                        if (batteryExempt) "Allowed" else "Allow",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.SemiBold,
                     )
@@ -191,12 +194,14 @@ fun SettingsScreen(
             },
         )
 
+        LanAccessRow(status = tunnelStatus)
+
         SectionLabel("Network & DNS")
         SettingsRow(
             title = "DNS resolver",
             summary = when (dnsMode) {
                 DnsMode.ADGUARD ->
-                    "AdGuard Home through the tunnel (${dnsServers.ifBlank { KeyRepository.DEFAULT_DNS_SERVERS }})"
+                    "AdGuard Home through the tunnel, ${dnsServers.ifBlank { KeyRepository.DEFAULT_DNS_SERVERS }}"
                 DnsMode.SYSTEM -> "System resolvers through the tunnel"
                 DnsMode.CUSTOM -> dnsServers.ifBlank { "No custom servers set" }
             },
@@ -214,9 +219,9 @@ fun SettingsScreen(
             trailing = { Chevron() },
         )
 
-        SectionLabel("Cluster")
+        SectionLabel("Devices")
         SettingsRow(
-            title = "Device Name",
+            title = "Device name",
             summary = deviceName,
             onClick = {
                 draftDeviceName = deviceName
@@ -224,15 +229,15 @@ fun SettingsScreen(
             },
         )
         SettingsRow(
-            title = "Cluster Secret Key",
-            summary = if (clusterToken.isNotBlank()) "Configured" else "Not set — tap to paste the cluster token",
+            title = "Sharing key",
+            summary = if (clusterToken.isNotBlank()) "Configured" else "Not set. Tap to paste the cluster token.",
             onClick = {
                 draftToken = clusterToken
                 showTokenDialog = true
             },
         )
         SettingsRow(
-            title = "Relay Address",
+            title = "Relay server",
             summary = relayAddress,
             onClick = {
                 draftRelay = relayAddress
@@ -256,9 +261,9 @@ fun SettingsScreen(
         SettingsRow(
             title = "Clipboard sync",
             summary = if (clipboardSync) {
-                "On — text and images sync across your cluster"
+                "On. Text and images sync across your devices."
             } else {
-                "Off — copy on one device, paste on another"
+                "Off. Copy on one device, paste on another."
             },
             onClick = onOpenClipboardSync,
             trailing = { Chevron() },
@@ -266,9 +271,9 @@ fun SettingsScreen(
         SettingsRow(
             title = "Notifications",
             summary = if (notificationSync) {
-                "On — notifications from this device appear on every cluster device"
+                "On. Notifications appear on every device."
             } else {
-                "Off — mirror notifications to other cluster devices"
+                "Off. Notifications are not shared."
             },
             onClick = onOpenNotifications,
             trailing = { Chevron() },
@@ -276,9 +281,9 @@ fun SettingsScreen(
         SettingsRow(
             title = "Media controls",
             summary = if (mediaSync) {
-                "On — now-playing and transport controls are shared"
+                "On. Playback controls are shared."
             } else {
-                "Off — control this device's media from other cluster devices"
+                "Off. Other devices cannot control playback."
             },
             onClick = onOpenMedia,
             trailing = { Chevron() },
@@ -300,7 +305,7 @@ fun SettingsScreen(
     if (showDeviceNameDialog) {
         AlertDialog(
             onDismissRequest = { showDeviceNameDialog = false },
-            title = { Text("Device Name", fontWeight = FontWeight.SemiBold) },
+            title = { Text("Device name", fontWeight = FontWeight.SemiBold) },
             text = {
                 Column {
                     Text(
@@ -340,7 +345,7 @@ fun SettingsScreen(
     if (showTokenDialog) {
         AlertDialog(
             onDismissRequest = { showTokenDialog = false },
-            title = { Text("Cluster Secret Key", fontWeight = FontWeight.SemiBold) },
+            title = { Text("Sharing key", fontWeight = FontWeight.SemiBold) },
             text = {
                 Column {
                     Text(
@@ -394,7 +399,7 @@ fun SettingsScreen(
     if (showRelayDialog) {
         AlertDialog(
             onDismissRequest = { showRelayDialog = false },
-            title = { Text("Relay Address", fontWeight = FontWeight.SemiBold) },
+            title = { Text("Relay server", fontWeight = FontWeight.SemiBold) },
             text = {
                 Column {
                     Text(
