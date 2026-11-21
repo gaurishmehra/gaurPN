@@ -137,18 +137,23 @@ func CheckConnectivity(configJSON string, p Protector) (int, error) {
 	return code.Number(), err
 }
 
-// CheckUDPConnectivity reports whether UDP packets can be relayed through the
-// proxy to a public DNS resolver under the current network. Carrier CGNATs
-// frequently drop the relay; when this returns false the caller should
-// connect the tunnel with UDP disabled so the engine's DNS-over-TCP
-// fallback keeps resolver traffic working.
-func CheckUDPConnectivity(configJSON string, p Protector) bool {
+// CheckUDPConnectivity reports whether UDP DNS queries to the given
+// resolver can be relayed through the proxy under the current network.
+// Carrier CGNATs frequently drop the relay, and some servers refuse private
+// destinations; probing the VPN's ACTUAL resolver (not a public one) is what
+// matters. When this returns false the caller should connect the tunnel with
+// UDP disabled so the engine's DNS-over-TCP fallback keeps resolver traffic
+// working.
+func CheckUDPConnectivity(configJSON string, p Protector, resolver string) bool {
 	client, err := makeClient(configJSON, p)
 	if err != nil {
 		return false
 	}
-	resolver := &net.UDPAddr{IP: net.ParseIP("1.1.1.1"), Port: 53}
-	return connectivity.CheckUDPConnectivityWithDNS(client.PacketListener, resolver) == nil
+	ip := net.ParseIP(resolver)
+	if ip == nil {
+		ip = net.ParseIP("1.1.1.1")
+	}
+	return connectivity.CheckUDPConnectivityWithDNS(client.PacketListener, &net.UDPAddr{IP: ip, Port: 53}) == nil
 }
 
 // CheckServerReachable tests whether the server is reachable over TCP through
