@@ -20,6 +20,7 @@ object TransferSettingsRepository {
     private val ONLY_TRUSTED = booleanPreferencesKey("only_trusted_devices_v1")
     private val ALLOW_FILE_REQUESTS = booleanPreferencesKey("allow_file_requests_v1")
     private val ALLOW_SCREENSHOT_REQUESTS = booleanPreferencesKey("allow_screenshot_requests_v1")
+    private val ALLOW_REMOTE_OPEN = booleanPreferencesKey("allow_remote_open_v1")
 
     /** Whether files received over the cluster relay open automatically. Default: on. */
     fun observeAutoOpen(context: Context): Flow<Boolean> =
@@ -66,5 +67,19 @@ object TransferSettingsRepository {
 
     suspend fun setAllowScreenshotRequests(context: Context, enabled: Boolean) {
         context.transferPrefsDataStore.edit { prefs -> prefs[ALLOW_SCREENSHOT_REQUESTS] = enabled }
+    }
+
+    /**
+     * Whether a trusted device may open a URL or launch an app on this phone.
+     * On by default; the explicit trust list is the consent boundary.
+     */
+    fun observeAllowRemoteOpen(context: Context): Flow<Boolean> =
+        context.transferPrefsDataStore.data.map { it[ALLOW_REMOTE_OPEN] ?: true }
+
+    suspend fun getAllowRemoteOpen(context: Context): Boolean =
+        context.transferPrefsDataStore.data.first()[ALLOW_REMOTE_OPEN] ?: true
+
+    suspend fun setAllowRemoteOpen(context: Context, enabled: Boolean) {
+        context.transferPrefsDataStore.edit { prefs -> prefs[ALLOW_REMOTE_OPEN] = enabled }
     }
 }

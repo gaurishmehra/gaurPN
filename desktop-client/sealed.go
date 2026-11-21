@@ -227,6 +227,9 @@ func runSendV3(cfg Config, targets []string, filePaths []string, offline, openRe
 				"open":         meta.Open,
 				"offline":      offline,
 			}
+			if meta.Open {
+				inner["mime_type"] = mimeTypeForPath(meta.Path)
+			}
 			// A pull request's target echoes the request id and grant. The
 			// sender_id above is cfg.SenderID (the real device id), even
 			// though this subprocess connects under a "-out" id: the
@@ -448,10 +451,15 @@ func handleIncomingSealed(
 		status := envelopeString(inner, "status")
 		notifKey := envelopeString(inner, "notif_key")
 		log.Printf("[SEALED] Notification %s on %s: %s", notifKey, senderName, status)
-		if status != "displayed" {
+		// "suppressed" means the receiver already runs the source app and let
+		// it post its own copy. That is expected, not a delivery failure.
+		if status == "blocked" {
 			notifyUser("Notification blocked", fmt.Sprintf("%s could not display it", senderName))
 		}
 	case "notification":
+		if !cfg.Notifications {
+			return
+		}
 		if event := envelopeString(inner, "event"); event == "removed" {
 			return
 		}

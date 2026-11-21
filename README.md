@@ -55,7 +55,9 @@ Your devices should talk to each other through a server you pay for. gaurPN keep
 - **Trusted devices**: pin peers by stable ID on Android or with `gaur-share trust`. Auto-accept only from trusted peers, revoke without rotating the cluster token. The trust gate covers files, text, clipboard, notifications, and notification actions.
 - **Broadcast**: one upload reaches every online device; each recipient unwraps the shared content key. Folders send as flat batches.
 - **Offline delivery**: sealed envelopes in a TTL/byte-capped mailbox, ack-based, so a failed write re-queues instead of dropping.
-- **Notification mirroring**: Android notifications appear on every cluster device with the app icon, action buttons, and inline replies. Desktop notifications mirror back through `gaur-share notify --all`. The app ignores its own notifications to prevent loops, and shared content hides on the lock screen.
+- **Notification mirroring**: Android notifications appear on every cluster device with the app icon, action buttons, and inline replies. Desktop notifications mirror back through `gaur-share notify --all`. Mirroring is de-duplicated per receiver: if the source app is installed on an Android peer, or its process is running on the desktop, that device already posts its own copy and the mirror is dropped. Rebranded desktop clients are mapped explicitly, such as WhatsApp to ZapFast or Karere. The app ignores its own notifications to prevent loops, and shared content hides on the lock screen.
+- **Approval token**: `gaur-share ask <device> "reason"` shows an Approve/Deny prompt on a trusted phone and blocks the script until it answers. The prompt hides its reason on the lock screen, expires in two minutes, is rate-limited per device, and fails closed on denial, timeout, or lost connectivity.
+- **Handoff**: `gaur-share open <device> <url|file|package>` opens a link, transfers and opens a PDF/image/ZIP/APK/other file, or launches an installed app on a trusted phone. URLs are limited to `http`/`https`, files use a FileProvider read grant, and background opens arrive as a tap-to-open notification because Android blocks background activity starts.
 - **Media control (MPRIS)**: Android media sessions appear as local players on the desktop. Play, pause, skip, seek, volume. Position interpolates locally; commands are sealed and expire after 30 seconds.
 - **Pull transfers**: browse a trusted device's home directory (desktop) or media collections (phone; grant All files access for full shared storage) and fetch what you pick. Browsing is trusted-only and rate-limited, grants expire in five minutes, and every accepted fetch posts a notification on the target.
 - **Peer status**: battery and charging state ride inside encrypted presence updates, so you know a device can survive a transfer before you send one.
@@ -363,6 +365,13 @@ gaur-share notify "Lavander" "Build finished" "The release APK is ready"
 # Send a notification to every online device
 gaur-share notify --all "Build finished" "The release APK is ready"
 
+# Ask a trusted phone to approve a scripted action
+gaur-share ask "Lavander" "Deploy to prod?"
+
+# Hand off a link, file, or app to a phone
+gaur-share open "Lavander" https://example.com/report
+gaur-share open "Lavander" ~/Documents/report.pdf
+gaur-share open --app com.spotify.music "Lavander"
 # Browse a device's files (trusted devices only) and fetch what you pick
 gaur-share browse "Pixel 8"            # list the phone's media collections
 gaur-share fetch "Pixel 8" "Pictures/Screenshots/Screenshot_01.png"
@@ -419,6 +428,7 @@ For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.m
 - **DNS Privacy**: DNS queries are answered by AdGuard Home on the VPS through the tunnel. No public resolver sees them unless you explicitly choose System mode.
 - **Kill Switch**: While reconnecting, the TUN stays up and drops traffic instead of falling back to the physical network.
 - **Trusted Devices**: Auto-accept can be restricted to pinned device IDs on Android (Settings → Trusted devices) and on the desktop (`gaur-share trust` / `trust-mode`). Revoking removes the peer from this device's trust list; rotate the cluster token to remove its relay access entirely. The trust gate covers every inbound kind: files, text, clipboard, notifications, and notification actions.
+- **Approval and Handoff**: Approval requests, remote opens, and file handoffs require the sender to be explicitly trusted, regardless of the only-trusted toggle. Requests carry short expiries, dedupe ids, and per-device rate limits; reasons, URLs, packages, and file contents are never logged. URLs are restricted to `http`/`https`, files use read-only FileProvider grants, and background opens go through a system notification `PendingIntent` rather than a blocked background activity start.
 - **Sealed Sender**: v3 messages omit the sender from the relay-visible envelope. The relay routes by target, timestamp, and kind only, and strips sender fields even if a client includes them.
 - **Ephemeral Mailbox**: Offline messages are ciphertext with a TTL (default 1h) and byte caps (global and per-target); the relay never parses them, and delivery is ack-based so a failed write re-queues instead of dropping.
 - **Notification Privacy**: Mirrored notifications are sealed; the relay sees only that a notification event exists. The source app ignores gaurPN's own notifications to prevent loops, and shared content is hidden from the lock screen.

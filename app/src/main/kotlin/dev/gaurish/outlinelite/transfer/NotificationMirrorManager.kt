@@ -7,6 +7,7 @@ import android.app.RemoteInput as PlatformRemoteInput
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -262,9 +263,15 @@ private const val EXTRA_REPLY = "reply"
 object NotificationDisplay {
 
     fun show(context: Context, fromId: String, fromName: String, payload: JSONObject): Boolean {
-        ensureChannel(context)
         val notifKey = payload.optString("key")
         if (notifKey.isBlank()) return false
+        if (sourceAppInstalled(context, payload)) {
+            // The local install posts its own notification. Showing the
+            // mirrored copy as well would duplicate it.
+            RelayManager.sendNotificationAck(context, fromId, notifKey, "suppressed")
+            return false
+        }
+        ensureChannel(context)
         val appName = payload.optString("app").ifBlank { fromName }
         val title = payload.optString("title").ifBlank { appName }
         val text = payload.optString("text")
@@ -341,6 +348,34 @@ object NotificationDisplay {
         if (notifKey.isBlank()) return
         val id = ("$fromId:$notifKey").hashCode()
         runCatching { NotificationManagerCompat.from(context).cancel(id) }
+    }
+
+    /**
+     * True when the package named by the payload is installed on this device.
+     * That install receives the notification natively, so the mirrored copy is
+     * redundant. The manifest declares QUERY_ALL_PACKAGES so the lookup is not
+     * filtered by Android 11 package visibility.
+     */
+    private fun sourceAppInstalled(context: Context, payload: JSONObject): Boolean {
+        return NotificationDedupe.shouldSuppress(
+            packageName = payload.optString("package"),
+            selfPackage = context.packageName,
+        ) { pkg ->
+            runCatching {
+                val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    context.packageManager.getPackageInfo(
+                        pkg,
+                        PackageManager.PackageInfoFlags.of(0),
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    context.packageManager.getPackageInfo(pkg, 0)
+                }
+                // A disabled app cannot post its own notification, so keep
+                // showing the mirror in that case.
+                info.applicationInfo?.enabled != false
+            }.getOrDefault(false)
+        }
     }
 
     private fun ensureChannel(context: Context) {

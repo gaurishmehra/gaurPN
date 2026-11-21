@@ -24,6 +24,12 @@
         tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Notification de-duplication: a mirrored notification is skipped when
+         the source app is installed here, because that install posts its own
+         copy. The lookup must see non-launcher packages too. -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
     <!-- Background clipboard reads use a 1x1 focusable overlay. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
@@ -150,6 +156,10 @@
 
         <receiver
             android:name=".transfer.NotificationActionReceiver"
+            android:exported="false" />
+
+        <receiver
+            android:name=".transfer.ApprovalActionReceiver"
             android:exported="false" />
 
         <receiver

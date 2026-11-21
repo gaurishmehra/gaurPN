@@ -111,6 +111,20 @@ func displayMirroredNotification(
 	fromID, fromName string,
 	payload mirroredNotification,
 ) {
+	// The app is already running here, so it posts this notification itself.
+	// Showing the mirror on top would duplicate it.
+	if notificationAppRunning(payload) {
+		label := payload.App
+		if label == "" {
+			label = payload.Package
+		}
+		log.Printf(
+			"[NOTIF] Suppressed %s notification: the app is running on this desktop",
+			singleLineDisplayName(label),
+		)
+		return
+	}
+
 	appName := payload.App
 	if appName == "" {
 		appName = fromName

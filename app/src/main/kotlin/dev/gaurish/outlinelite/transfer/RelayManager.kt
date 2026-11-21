@@ -29,6 +29,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -87,6 +88,18 @@ object RelayManager {
 
     /** Duplicate suppression for request payloads. */
     private val requestDeduper = RequestDeduper()
+
+    /** Bounded set of approval/open request ids already acted on. */
+    private val controlDeduper = RequestDeduper()
+
+    /** Live approval prompts and their held notification ids. */
+    private val approvalRegistry = ApprovalRegistry()
+
+    /** One approval prompt per origin every 30 seconds. */
+    private val approvalRateLimiter = ScreenshotRateLimiter(minIntervalMs = 30_000L)
+
+    /** One URL/package handoff per origin every 2 seconds. */
+    private val openRateLimiter = ScreenshotRateLimiter(minIntervalMs = 2_000L)
 
     /**
      * The single request currently being served. Held from acceptance until
@@ -682,6 +695,93 @@ object RelayManager {
         return sendSealed(context, targetId, "notification_action", inner)
     }
 
+    /** Answers one approval prompt. Routing uses the ephemeral requester id. */
+    private suspend fun sendApprovalResponse(
+        context: Context,
+        targetId: String,
+        requestId: String,
+        approved: Boolean,
+        reason: String,
+        grant: String,
+    ) {
+        if (!RelayConnection.isConnected) return
+        val inner = ControlCodec.buildApprovalResponse(
+            requestId = requestId,
+            responderId = deviceId,
+            decision = if (approved) "approved" else "denied",
+            reason = reason,
+            grant = grant,
+            ts = System.currentTimeMillis(),
+        )
+        sendSealed(context, targetId, "ask_response", inner)
+    }
+
+    /**
+     * Resolves an approval notification action. The registry entry is
+     * removed synchronously so a second tap cannot answer the same request,
+     * then the sealed response is sent from the manager scope.
+     */
+    internal fun resolveApproval(context: Context, requestId: String, approved: Boolean) {
+        val pending = approvalRegistry.take(requestId) ?: return
+        ApprovalNotifications.cancel(context, pending.notifId)
+        NotificationIds.release(pending.notifId)
+
+        val expired = RequestCodec.isExpired(pending.expiresTs)
+        val reason = when {
+            expired -> "expired"
+            approved -> ""
+            else -> "user_denied"
+        }
+        if (!RelayConnection.isConnected) {
+            showOneShotNotification(
+                context,
+                key = "approval-offline-${pending.requestId}",
+                sending = false,
+                title = "Approval not sent",
+                message = "The cluster tunnel is offline",
+            )
+            return
+        }
+        scope.launch {
+            sendApprovalResponse(
+                context.applicationContext,
+                pending.requesterId,
+                pending.requestId,
+                approved = approved && !expired,
+                reason = reason,
+                grant = pending.grant,
+            )
+        }
+    }
+
+    private fun releaseApprovalNotification(context: Context, pending: PendingApproval) {
+        ApprovalNotifications.cancel(context, pending.notifId)
+        NotificationIds.release(pending.notifId)
+    }
+
+    /** Sealed handoff result for the URL/package and file-open paths. */
+    internal suspend fun sendOpenResult(
+        context: Context,
+        targetId: String,
+        requestId: String,
+        transferId: String,
+        status: String,
+        reason: String,
+        grant: String,
+    ) {
+        if (!RelayConnection.isConnected) return
+        val inner = ControlCodec.buildOpenResult(
+            requestId = requestId,
+            responderId = deviceId,
+            transferId = transferId,
+            status = status,
+            reason = reason,
+            grant = grant,
+            ts = System.currentTimeMillis(),
+        )
+        sendSealed(context, targetId, "open_result", inner)
+    }
+
     /** Publishes the current media session to every peer. */
     fun broadcastMediaState(context: Context, inner: JSONObject) {
         scope.launch {
@@ -870,6 +970,14 @@ object RelayManager {
                 handleIncomingFetch(context, peerCryptoKey, inner)
                 return
             }
+            "ask" -> {
+                handleApprovalRequest(context, peerCryptoKey, inner)
+                return
+            }
+            "open" -> {
+                handleOpenRequest(context, peerCryptoKey, inner)
+                return
+            }
         }
 
         val senderId = inner.optString("sender_id")
@@ -930,6 +1038,198 @@ object RelayManager {
                 MediaSessionBridge.handleCommand(context, inner, relayTs)
             }
         }
+    }
+
+    /**
+     * Sealed `ask`: show a high-priority Approve/Deny prompt. The requester
+     * must be an explicitly trusted device, the grant must verify, and the
+     * prompt is bounded by one live request per origin plus a short cooldown.
+     * Every refusal is answered so the CLI never hangs.
+     */
+    private suspend fun handleApprovalRequest(
+        context: Context,
+        peerCryptoKey: ByteArray,
+        inner: JSONObject,
+    ) {
+        val request = ControlCodec.parseApproval(inner) ?: return
+        if (request.targetId != deviceId || request.trustId == deviceId) return
+
+        if (!isTrustedBrowser(context, request.trustId)) {
+            sendApprovalResponse(
+                context, request.requesterId, request.requestId,
+                approved = false, reason = "not_allowed", grant = request.grant,
+            )
+            return
+        }
+        if (controlDeduper.seen(request.requestId)) return
+        if (RequestCodec.isExpired(request.expiresTs)) {
+            sendApprovalResponse(
+                context, request.requesterId, request.requestId,
+                approved = false, reason = "expired", grant = request.grant,
+            )
+            return
+        }
+        if (!ClusterCrypto.verifyRequestGrant(
+                peerCryptoKey,
+                request.requestId,
+                request.requesterId,
+                request.targetId,
+                request.expiresTs,
+                request.grant,
+            )
+        ) {
+            sendApprovalResponse(
+                context, request.requesterId, request.requestId,
+                approved = false, reason = "not_allowed", grant = request.grant,
+            )
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        approvalRegistry.removeExpired(now).forEach {
+            releaseApprovalNotification(context, it)
+        }
+        if (!approvalRateLimiter.isAllowed(request.trustId, now) ||
+            approvalRegistry.hasActiveFor(request.trustId, now)
+        ) {
+            sendApprovalResponse(
+                context, request.requesterId, request.requestId,
+                approved = false, reason = "busy", grant = request.grant,
+            )
+            return
+        }
+        // Spend the cooldown as soon as the request is accepted, including
+        // when the notification cannot be shown, so a peer cannot spam.
+        approvalRateLimiter.record(request.trustId, now)
+
+        val notifId = NotificationIds.acquire(request.requestId, sending = false)
+        val pending = PendingApproval(
+            requestId = request.requestId,
+            requesterId = request.requesterId,
+            requesterName = request.requesterName,
+            trustId = request.trustId,
+            expiresTs = request.expiresTs,
+            grant = request.grant,
+            notifId = notifId,
+        )
+        approvalRegistry.add(pending)?.let { releaseApprovalNotification(context, it) }
+        if (!ApprovalNotifications.show(context, request, notifId)) {
+            approvalRegistry.take(request.requestId)
+            NotificationIds.release(notifId)
+            sendApprovalResponse(
+                context, request.requesterId, request.requestId,
+                approved = false, reason = "notifications_blocked", grant = request.grant,
+            )
+            return
+        }
+        // One-shot cleanup: the notification times out on the system side; this
+        // releases the held notification id and drops the registry entry
+        // without a periodic timer.
+        scope.launch {
+            delay((request.expiresTs - System.currentTimeMillis()).coerceAtLeast(0L))
+            approvalRegistry.take(request.requestId)?.let {
+                releaseApprovalNotification(context, it)
+            }
+        }
+    }
+
+    /**
+     * Sealed `open`: open a validated URL or launch an installed app. A
+     * trusted origin is required; the handoff display decides between a
+     * direct launch (app visible) and a tap-to-open notification (background).
+     */
+    private suspend fun handleOpenRequest(
+        context: Context,
+        peerCryptoKey: ByteArray,
+        inner: JSONObject,
+    ) {
+        val request = ControlCodec.parseOpen(inner) ?: return
+        if (request.targetId != deviceId || request.trustId == deviceId) return
+
+        if (!isTrustedBrowser(context, request.trustId)) {
+            sendOpenResult(
+                context, request.requesterId, request.requestId, "",
+                status = "denied", reason = "not_allowed", grant = request.grant,
+            )
+            return
+        }
+        if (controlDeduper.seen(request.requestId)) return
+        if (RequestCodec.isExpired(request.expiresTs)) {
+            sendOpenResult(
+                context, request.requesterId, request.requestId, "",
+                status = "denied", reason = "expired", grant = request.grant,
+            )
+            return
+        }
+        if (!ClusterCrypto.verifyRequestGrant(
+                peerCryptoKey,
+                request.requestId,
+                request.requesterId,
+                request.targetId,
+                request.expiresTs,
+                request.grant,
+            )
+        ) {
+            sendOpenResult(
+                context, request.requesterId, request.requestId, "",
+                status = "denied", reason = "not_allowed", grant = request.grant,
+            )
+            return
+        }
+        if (!TransferSettingsRepository.getAllowRemoteOpen(context)) {
+            sendOpenResult(
+                context, request.requesterId, request.requestId, "",
+                status = "denied", reason = "not_allowed", grant = request.grant,
+            )
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (!openRateLimiter.isAllowed(request.trustId, now)) {
+            sendOpenResult(
+                context, request.requesterId, request.requestId, "",
+                status = "busy", reason = "busy", grant = request.grant,
+            )
+            return
+        }
+        // Spend the cooldown on every accepted request, including
+        // unsupported ones, so a peer cannot spam handoff attempts.
+        openRateLimiter.record(request.trustId, now)
+
+        val label = requesterLabel(request.requesterName, request.trustId)
+        val status: String
+        val reason: String
+        when (request.openKind) {
+            "url" -> {
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(request.value))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                status = HandoffDisplay.open(
+                    context, intent, "Handoff from $label", "Open link", request.requestId,
+                )
+                reason = ""
+            }
+            "package" -> {
+                val launch = context.packageManager.getLaunchIntentForPackage(request.value)
+                if (launch == null) {
+                    status = "unsupported"
+                    reason = "no_handler"
+                } else {
+                    launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    status = HandoffDisplay.open(
+                        context, launch, "Handoff from $label", "Open app", request.requestId,
+                    )
+                    reason = ""
+                }
+            }
+            else -> {
+                status = "unsupported"
+                reason = "invalid"
+            }
+        }
+        sendOpenResult(
+            context, request.requesterId, request.requestId, "",
+            status = status, reason = reason, grant = request.grant,
+        )
     }
 
     /**
@@ -1608,6 +1908,14 @@ object RelayManager {
         }
         return allowed
     }
+
+    /**
+     * Approval and handoff are control capabilities, not passive receive:
+     * they use the same explicit-trust boundary as browse/fetch regardless
+     * of the only-trusted toggle.
+     */
+    internal suspend fun isTrustedControl(context: Context, trustId: String): Boolean =
+        isTrustedBrowser(context, trustId)
 
     private fun sealedInboundKind(kind: String): InboundKind = when (kind) {
         "offer", "complete" -> InboundKind.OFFER

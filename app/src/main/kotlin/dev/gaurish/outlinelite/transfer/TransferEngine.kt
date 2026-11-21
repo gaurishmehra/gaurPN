@@ -1,16 +1,9 @@
 package dev.gaurish.outlinelite.transfer
 
-import android.app.NotificationManager
-import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
-import android.net.Uri
 import android.os.Environment
 import android.util.Base64
 import android.util.Log
-import androidx.core.app.NotificationCompat
-import androidx.core.content.FileProvider
-import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.TransferHistoryEntry
 import dev.gaurish.outlinelite.data.TransferHistoryRepository
@@ -81,12 +74,21 @@ internal class TransferEngine(
         val chunkSize = inner.optInt("chunk_size", 0)
         val chunkCount = inner.optInt("chunk_count", 0)
         val chunkHashesArray = inner.optJSONArray("chunk_hashes")
+        val openOnArrival = inner.optBoolean("open", false)
+        val openRequestId = inner.optString("open_request_id")
+        val replyTo = inner.optString("reply_to")
+        val mimeHint = inner.optString("mime_type")
         if (!Crypto.isTransferId(transferId) || sessionId.isBlank() || rawName.isBlank() ||
             fileHash.isBlank() || chunkSize <= 0 || chunkCount < 0 ||
             chunkHashesArray == null || chunkHashesArray.length() != chunkCount
         ) {
             return
         }
+        // reply_to is a routing hint for a one-shot requester, never a trust
+        // claim. It lives inside the sealed offer, so the relay cannot alter
+        // it; a malformed value rejects the offer rather than falling back.
+        if (replyTo.isNotBlank() && !RequestCodec.isDeviceId(replyTo)) return
+        val replyTarget = replyTo.ifBlank { senderId }
         val chunkHashes = ArrayList<String>(chunkCount)
         for (i in 0 until chunkCount) chunkHashes.add(chunkHashesArray.getString(i))
 
@@ -191,7 +193,41 @@ internal class TransferEngine(
                 put("file_hash", fileHash)
                 put("file_name", finalFile.name)
             }
-            RelayManager.sendSealed(context, senderId, "complete", completion)
+            RelayManager.sendSealed(context, replyTarget, "complete", completion)
+
+            if (openOnArrival) {
+                val mime = TransferOfferCodec.resolveMimeType(
+                    mimeHint.ifBlank { null },
+                    RelayManager.mimeFromExtension(finalFile.name),
+                )
+                val explicit = RequestCodec.isRequestId(openRequestId)
+                val senderLabel = singleLineDisplayName(senderName).ifEmpty {
+                    singleLineDisplayName(senderId)
+                }
+                val status = when {
+                    explicit && !RelayManager.isTrustedControl(context, senderId) -> "denied"
+                    explicit -> HandoffDisplay.openFile(
+                        context, finalFile, mime,
+                        "Handoff from $senderLabel", finalFile.name, openRequestId,
+                    )
+                    TransferSettingsRepository.getAutoOpen(context) -> HandoffDisplay.openFile(
+                        context, finalFile, mime,
+                        "File received", finalFile.name, transferId,
+                    )
+                    else -> "notification"
+                }
+                if (explicit) {
+                    RelayManager.sendOpenResult(
+                        context,
+                        replyTarget,
+                        openRequestId,
+                        transferId,
+                        status = status,
+                        reason = if (status == "denied") "not_allowed" else "",
+                        grant = "",
+                    )
+                }
+            }
         } catch (c: CancellationException) {
             // Keep .part/.state for resume; the tunnel stop or a superseding
             // offer cancelled the download mid-flight.
@@ -201,6 +237,12 @@ internal class TransferEngine(
             // failure above clears them, since that state is poisoned.
             Log.e(TAG, "v3 receive failed: ${t.message}", t)
             RelayManager.showNotification(context, notifId, "Transfer Failed", "Failed to receive $cleanName")
+            if (RequestCodec.isRequestId(openRequestId)) {
+                RelayManager.sendOpenResult(
+                    context, replyTarget, openRequestId, transferId,
+                    status = "failed", reason = "invalid", grant = "",
+                )
+            }
         } finally {
             registration.remove()
             NotificationIds.release(notifId)
@@ -738,59 +780,9 @@ internal class TransferEngine(
                 offerMime.ifBlank { null },
                 RelayManager.mimeFromExtension(finalFile.name),
             )
-            openReceivedFile(context, finalFile, mime)
-        }
-    }
-
-    /**
-     * Opens a freshly received file for the user. Starts an ACTION_VIEW
-     * activity directly; if Android blocks the background activity launch,
-     * falls back to a notification with an "Open" action carrying the same
-     * intent.
-     */
-    private fun openReceivedFile(context: Context, file: File, mime: String) {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, mime)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            context.startActivity(viewIntent)
-        } catch (t: Throwable) {
-            Log.w(TAG, "Could not auto-open ${file.name}: ${t.message}")
-            showOpenNotification(context, file.name, uri, mime)
-        }
-    }
-
-    private fun showOpenNotification(context: Context, fileName: String, uri: Uri, mime: String) {
-        try {
-            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return
-            RelayManager.ensureNotificationChannel(context)
-            val viewIntent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(uri, mime)
-                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-            val openPi = PendingIntent.getActivity(
-                context, fileName.hashCode(), viewIntent,
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            HandoffDisplay.openFile(
+                context, finalFile, mime, "File received", finalFile.name, transferId,
             )
-            val notification = NotificationCompat.Builder(context, RelayManager.CHANNEL_ID)
-                .setSmallIcon(R.drawable.ic_key)
-                .setContentTitle("Transfer Complete")
-                .setContentText("Saved $fileName to Downloads")
-                .setContentIntent(openPi)
-                .setAutoCancel(true)
-                .setGroup(RelayManager.NOTIF_GROUP)
-                .addAction(0, "Open", openPi)
-                .build()
-            val notifId = NotificationIds.acquire(fileName, sending = false)
-            try {
-                nm.notify(notifId, notification)
-            } finally {
-                NotificationIds.release(notifId)
-            }
-        } catch (t: Throwable) {
-            Log.w(TAG, "Open notification error: ${t.message}")
         }
     }
 

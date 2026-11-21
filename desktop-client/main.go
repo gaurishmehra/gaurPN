@@ -69,6 +69,8 @@ func main() {
 		fmt.Println("  gaur-share ui [--open] [-addr 127.0.0.1:9877] Local browser UI for peers, browsing, and files")
 		fmt.Println("  gaur-share notify <device> <title> [body]   Send a notification to a device")
 		fmt.Println("  gaur-share notify --all <title> [body]      Send a notification to every online device")
+		fmt.Println("  gaur-share ask <device> <reason...>         Ask a device to approve an action")
+		fmt.Println("  gaur-share open <device> <url|file|pkg>     Open a URL, file, or app on a device")
 		fmt.Println("  gaur-share trust <device>                   Trust a device by id or name")
 		fmt.Println("  gaur-share untrust <device>                 Revoke a trusted device")
 		fmt.Println("  gaur-share trusted                          List trusted devices and mode")
@@ -83,6 +85,7 @@ func main() {
 	go func() {
 		<-sigChan
 		fmt.Println("\nShutting down gaur-share...")
+		code := 130
 		if args[0] == "daemon" {
 			writePeersFile(cfg, nil)
 			stopDaemonStatus()
@@ -95,8 +98,9 @@ func main() {
 			if cfg.Clipboard && cfg.ClipboardSource == "socket" {
 				removeClipboardSocket(cfg)
 			}
+			code = 0
 		}
-		os.Exit(0)
+		os.Exit(code)
 	}()
 
 	switch args[0] {
@@ -270,6 +274,52 @@ func main() {
 			}
 			runNotify(cfg, rest[0], rest[1], strings.Join(rest[2:], " "), *notifyIcon)
 		}
+	case "ask":
+		askFlags := flag.NewFlagSet("ask", flag.ExitOnError)
+		askJSON := askFlags.Bool("json", false, "Output the result as JSON")
+		askTimeoutFlag := askFlags.Duration("timeout", 0, "Approval wait, default 2m, range 5s-5m")
+		if err := askFlags.Parse(args[1:]); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		rest := askFlags.Args()
+		if len(rest) < 2 {
+			fmt.Fprintln(os.Stderr, "Usage: gaur-share ask [--timeout 2m] <device> <reason...>")
+			os.Exit(2)
+		}
+		if *askTimeoutFlag > 0 {
+			askTimeout = *askTimeoutFlag
+		}
+		jsonOut := *askJSON || jsonOutput
+		if err := runAsk(cfg, rest[0], strings.Join(rest[1:], " "), jsonOut); err != nil {
+			printControlError(err, jsonOut)
+		}
+	case "open":
+		openFlags := flag.NewFlagSet("open", flag.ExitOnError)
+		openJSON := openFlags.Bool("json", false, "Output the result as JSON")
+		openApp := openFlags.String("app", "", "Launch this Android package instead of autodetecting")
+		head, tail := splitDoubleDash(args[1:])
+		if err := openFlags.Parse(head); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		rest := append(append([]string(nil), openFlags.Args()...), tail...)
+		jsonOut := *openJSON || jsonOutput
+		if *openApp != "" {
+			if len(rest) != 1 {
+				fmt.Fprintln(os.Stderr, "Usage: gaur-share open --app <package> <device>")
+				os.Exit(2)
+			}
+			if err := runOpen(cfg, rest[0], "", *openApp, jsonOut); err != nil {
+				printControlError(err, jsonOut)
+			}
+		} else {
+			if len(rest) != 2 {
+				fmt.Fprintln(os.Stderr, "Usage: gaur-share open <device> <url|file|package>")
+				os.Exit(2)
+			}
+			if err := runOpen(cfg, rest[0], rest[1], "", jsonOut); err != nil {
+				printControlError(err, jsonOut)
+			}
+		}
 	case "trust":
 		if len(args) < 2 {
 			log.Fatalf("Usage: gaur-share trust <device-id-or-name>")
@@ -319,6 +369,6 @@ func main() {
 		}
 		fmt.Printf("Only trusted devices: %s\n", args[1])
 	default:
-		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, browse, fetch, screenshot, send-text, pair, ui, notify, trust, untrust, trusted, trust-mode", args[0])
+		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, browse, fetch, screenshot, send-text, pair, ui, notify, ask, open, trust, untrust, trusted, trust-mode", args[0])
 	}
 }

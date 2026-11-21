@@ -488,7 +488,7 @@ v3 messages use a sealed envelope:
   "target_id": "device-id",
   "msg_id": "seal-<uuid>",
   "ts": 1730000000000,
-  "kind": "offer" | "complete" | "text" | "notification" | "notification_action",
+  "kind": "offer" | "complete" | "text" | "notification" | "notification_action" | "media_state" | "media_command" | "browse" | "browse_listing" | "fetch" | "request" | "request_declined" | "ask" | "ask_response" | "open" | "open_result",
   "nonce": "<base64>",
   "data": "<base64>"
 }
@@ -599,6 +599,20 @@ so they are never re-broadcast.
 - Android requires **Notification access** (Settings → Notifications → Share
   notifications). The desktop daemon uses `notify-send`.
 - Group summaries are skipped to avoid duplicate notifications.
+- A receiver drops a mirrored notification when the source app already lives
+  on it: Android checks whether the package is installed and enabled, and the
+  desktop checks whether a matching process is running. Either way the local
+  app posts the notification itself, so the mirrored copy would be a duplicate.
+  Desktop-originated payloads carry no package name and are never dropped this
+  way. A suppressed Android notification answers with `notification_ack`
+  status `suppressed`; that is expected, not a delivery failure.
+- Rebranded desktop clients are matched by an explicit alias table because the
+  process name shares nothing with the Android label. WhatsApp
+  (`com.whatsapp`, including `com.whatsapp.w4b`) maps to the Linux clients
+  ZapFast (`zapfast`) and Karere (`karere`).
+- Presence is app-level. A notification from a second account that exists only
+  on the source device is also skipped on a receiver that has the app
+  installed or running.
 - The relay sees only that a sealed `notification` envelope exists; the payload
   is encrypted.
 
@@ -759,3 +773,145 @@ Shared text that validates as a URL gets an open action:
 - Android: the existing Open action on text-share notifications opens the
   validated canonical URL via `ACTION_VIEW` and is hidden when validation
   fails (Copy still works).
+
+---
+
+## 17. Approval Requests
+
+`gaur-share ask <device> <reason...>` sends a sealed `ask` to one explicitly
+trusted device. The phone shows a high-importance notification with **Approve**
+and **Deny** actions. The requester keeps its ephemeral `reqdev-…` connection
+open and waits for the sealed `ask_response`.
+
+```json
+{
+  "request_id": "req-<16 hex>",
+  "requester_id": "reqdev-<pid>-<hex>",
+  "origin_id": "<stable desktop id>",
+  "requester_name": "Laptop",
+  "target_id": "<phone id>",
+  "reason": "Deploy to prod?",
+  "expires_ts": 1730000000000,
+  "grant": "<v3.2 request grant>",
+  "ts": 1730000000000
+}
+```
+
+```json
+{
+  "request_id": "req-<16 hex>",
+  "responder_id": "<phone id>",
+  "decision": "approved" | "denied",
+  "reason": "user_denied" | "expired" | "busy" | "not_allowed" | "notifications_blocked",
+  "grant": "<echo>",
+  "ts": 1730000000000
+}
+```
+
+- The response is addressed to `requester_id`, not the stable origin. The
+  grant is verified against the request id, requester, target, and expiry.
+- `origin_id` is the trust-list key. The phone requires that device to be
+  explicitly trusted; an untrusted requester gets a `not_allowed` response
+  rather than silence.
+- The reason is trimmed, limited to 200 characters, and rejected if it
+  contains control characters. It is never logged.
+- Default lifetime is 120 s (`--timeout`, clamp 5 s–5 min). The notification
+  uses `setTimeoutAfter` for its remaining lifetime; the registry also drops
+  expired entries lazily. The relay mailbox's 1 h TTL is not a security
+  boundary.
+- Android keeps one live approval per origin, a 30 s per-origin cooldown, and
+  a bounded pending map. A concurrent request is answered `busy`.
+- The prompt is `VISIBILITY_PRIVATE` with a generic public version, so the
+  reason is hidden until unlock. Approve/Deny are immutable broadcast
+  `PendingIntent`s; the receiver never starts an activity.
+- The approval is advisory. It authorizes the caller's next action; it is not
+  a cryptographic capability bound to a specific command.
+
+Exit codes: `0` approved, `1` denied, `2` usage, `3` timeout, `4`
+transport/unsupported/busy, `130` interrupted.
+
+---
+
+## 18. Handoff (Remote Open)
+
+`gaur-share open <device> <url|file|package>` hands one actionable target to
+an explicitly trusted device. URLs and package names use a sealed `open`;
+files use the existing v3 chunk upload and sealed `offer` with an open
+request.
+
+### URL / package
+
+```json
+{
+  "request_id": "req-<16 hex>",
+  "requester_id": "reqdev-<pid>-<hex>",
+  "origin_id": "<stable desktop id>",
+  "requester_name": "Laptop",
+  "target_id": "<phone id>",
+  "open_kind": "url" | "package",
+  "value": "https://example.com/x" | "com.example.app",
+  "expires_ts": 1730000000000,
+  "grant": "<grant>",
+  "ts": 1730000000000
+}
+```
+
+```json
+{
+  "request_id": "req-<16 hex>",
+  "responder_id": "<phone id>",
+  "status": "opened" | "notification" | "denied" | "unsupported" | "busy" | "failed",
+  "reason": "not_allowed" | "expired" | "no_handler" | "invalid",
+  "grant": "<echo>",
+  "ts": 1730000000000
+}
+```
+
+- URL values must pass the shared `http`/`https` validator (§16). No other
+  scheme reaches an intent.
+- Package values must match the Android package grammar and resolve to a
+  launch intent; otherwise the result is `unsupported`.
+- `ALLOW_REMOTE_OPEN` is on by default for explicitly trusted devices and can
+  be disabled in Settings → Transfers.
+- Requests are deduped by `request_id` and rate-limited to one per origin per
+  2 s. Lifetime is 60 s.
+
+### Files
+
+The file is uploaded once through the v3 chunk path, then a sealed `offer`
+adds:
+
+- `open: true`
+- `open_request_id: "req-…"`
+- `reply_to: "reqdev-…"`
+- `mime_type` (extension-derived, parameters stripped)
+
+`sender_id` remains the stable origin so the existing offer trust gate is
+unchanged; `reply_to` is a routing hint for the one-shot requester and is
+validated as a device id. The target saves the file to `Downloads` exactly as
+it does for any other transfer, sends `complete` to `reply_to`, then reports
+`open_result` to the same id.
+
+- Files are opened with a `FileProvider` `content://` URI,
+  `ACTION_VIEW`, `setDataAndType`, `FLAG_GRANT_READ_URI_PERMISSION`, and
+  `ClipData`. `file://` is never used.
+- Android 10+ silently blocks background activity starts, and a foreground
+  `VpnService` is not an exemption. When the app is not visible the handoff is
+  delivered as a high-importance notification whose content intent and
+  **Open** action are a system-sent `PendingIntent.getActivity`; that is the
+  supported background path. The result status is `notification` and the CLI
+  exits `0`.
+- Android 15 no longer treats non-visible overlay windows as a launch
+  exemption, so the handoff path does not rely on the clipboard overlay or
+  `SYSTEM_ALERT_WINDOW`.
+- If no viewer is installed, the notification still offers Open/Share; the
+  open result is `notification` rather than a silent no-op.
+- APKs are ordinary files. The system installer always requires user
+  confirmation; gaurPN never auto-installs.
+- Directories and multi-file batches are rejected by `open`; use `send`.
+- This also fixes the v3 `send --to/--all -open` path: its `open` bit was
+  previously ignored by Android, and MIME types are now carried in the offer.
+  The legacy v2 `send -open` path uses the same background-safe display.
+
+Exit codes: `0` opened or tap-to-open notification, `1` denied, `2` usage,
+`3` timeout, `4` transport/unsupported/failure, `130` interrupted.

@@ -45,6 +45,8 @@ fun TransfersScreen(
 
     val autoOpenReceived by TransferSettingsRepository.observeAutoOpen(context)
         .collectAsStateWithLifecycle(initialValue = true)
+    val allowRemoteOpen by TransferSettingsRepository.observeAllowRemoteOpen(context)
+        .collectAsStateWithLifecycle(initialValue = true)
     val allowFileRequests by TransferSettingsRepository.observeAllowFileRequests(context)
         .collectAsStateWithLifecycle(initialValue = true)
     val allowScreenshotRequests by TransferSettingsRepository.observeAllowScreenshotRequests(context)
@@ -109,6 +111,15 @@ fun TransfersScreen(
         ) {
             GaurSwitch(autoOpenReceived) { enabled ->
                 scope.launch { TransferSettingsRepository.setAutoOpen(context, enabled) }
+            }
+        }
+
+        SettingsRow(
+            title = "Allow remote open",
+            summary = "Let trusted devices open links, files, and apps on this phone",
+        ) {
+            GaurSwitch(allowRemoteOpen) { enabled ->
+                scope.launch { TransferSettingsRepository.setAllowRemoteOpen(context, enabled) }
             }
         }
 
