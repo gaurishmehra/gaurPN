@@ -33,6 +33,12 @@
     <!-- Background clipboard reads use a 1x1 focusable overlay. -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <!-- Live camera streaming for trusted cluster devices. The runtime grant
+         is requested from Settings -> Camera before the toggle can persist;
+         the foreground service below holds the camera while a desktop is
+         viewing it. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
 
     <!-- Query launchable apps for per-app split tunneling -->
     <queries>
@@ -161,6 +167,15 @@
         <receiver
             android:name=".transfer.ApprovalActionReceiver"
             android:exported="false" />
+
+        <receiver
+            android:name=".transfer.CameraActionReceiver"
+            android:exported="false" />
+
+        <service
+            android:name=".transfer.CameraStreamService"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
 
         <receiver
             android:name=".transfer.RemoteMediaActionReceiver"

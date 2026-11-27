@@ -50,4 +50,18 @@
     <string name="share_relay_connecting">Connecting to the relay. Devices will appear when it is up.</string>
     <string name="share_refresh_devices">Refresh devices</string>
     <string name="share_cancel">Cancel</string>
+
+    <!-- Camera streaming: accept prompt, stream notification, settings. -->
+    <string name="camera_channel_requests">Camera requests</string>
+    <string name="camera_channel_stream">Camera streaming</string>
+    <string name="camera_prompt_title">Camera requested</string>
+    <string name="camera_prompt_body">%1$s wants to view your camera</string>
+    <string name="camera_prompt_public">Unlock to review</string>
+    <string name="camera_action_accept">Accept</string>
+    <string name="camera_action_decline">Decline</string>
+    <string name="camera_action_stop">Stop</string>
+    <string name="camera_stream_title">Camera streaming</string>
+    <string name="camera_stream_body">%1$s is viewing your camera</string>
+    <string name="camera_stream_offline">The cluster tunnel is offline</string>
+    <string name="camera_permission_needed">Camera requests need camera access</string>
 </resources>

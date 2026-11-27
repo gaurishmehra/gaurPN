@@ -72,6 +72,7 @@ fun SettingsScreen(
     onOpenNotifications: () -> Unit,
     onOpenMedia: () -> Unit,
     onOpenTransfers: () -> Unit,
+    onOpenCamera: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -258,6 +259,12 @@ fun SettingsScreen(
             title = "Transfers",
             summary = "Auto-open received files and review transfer history",
             onClick = onOpenTransfers,
+            trailing = { Chevron() },
+        )
+        SettingsRow(
+            title = "Camera",
+            summary = "Let trusted devices view this phone's camera as a live stream",
+            onClick = onOpenCamera,
             trailing = { Chevron() },
         )
 

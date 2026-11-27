@@ -294,7 +294,9 @@ type flushWriter struct {
 
 // Write forwards the chunk and flushes at most once per interval. Flushing on
 // every 64 KiB chunk forced a syscall and a chunk boundary per write; a short
-// interval keeps progress responsive without that per-chunk cost.
+// interval keeps progress responsive without that per-chunk cost. A zero
+// interval drops the throttle so every write flushes immediately; /pipe
+// receivers opt into that with flush=1 for live camera streaming.
 func (fw *flushWriter) Write(p []byte) (n int, err error) {
 	n, err = fw.w.Write(p)
 	if fw.flusher != nil && n > 0 {
@@ -815,6 +817,12 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 	if token == "" {
 		token = strings.TrimSpace(r.Header.Get("X-Gaur-Token"))
 	}
+	// flush=1 opts a receiver into low-latency streaming: the response
+	// flushes after every write instead of at most once per
+	// pipeFlushInterval. Live camera frames ride that; file receivers omit
+	// the param and keep the throttled cadence, so v1 clients are
+	// unaffected.
+	lowLatency := strings.TrimSpace(r.URL.Query().Get("flush")) == "1"
 
 	if transferID == "" || (role != "sender" && role != "receiver") || !h.authGate(w, r, token) {
 		http.Error(w, "Unauthorized or invalid params", http.StatusUnauthorized)
@@ -877,7 +885,11 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 
-		fw := &flushWriter{w: w, flusher: flusher, interval: pipeFlushInterval}
+		flushInterval := pipeFlushInterval
+		if lowLatency {
+			flushInterval = 0 // flushWriter flushes after every write
+		}
+		fw := &flushWriter{w: w, flusher: flusher, interval: flushInterval}
 		buf := make([]byte, pipeCopyBufferSize)
 		_, err := io.CopyBuffer(fw, session.pipe, buf)
 		if isFlusher {

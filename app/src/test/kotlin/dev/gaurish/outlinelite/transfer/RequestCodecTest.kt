@@ -222,6 +222,51 @@ class RequestCodecTest {
     }
 
     @Test
+    fun cameraKindParsesAndUnknownKindsAreRecoveredForADecline() {
+        // The camera request is a first-class kind on the wire.
+        val camera = parse(JSONObject(validRequest().toString()).put("kind", "camera"))
+        assertEquals(RequestKind.CAMERA, camera!!.kind)
+        assertEquals("camera", RequestKind.CAMERA.wire)
+
+        // A kind this build does not know still parses strictly to null, but
+        // the routing fields are recovered so the requester gets an
+        // "unsupported" decline instead of silence.
+        val unknown = JSONObject(validRequest().toString()).put("kind", "screen_mirror")
+        assertNull(parse(unknown))
+        val recovered = RequestCodec.parseUnknownKindRequest(unknown)
+        assertNotNull(recovered)
+        assertEquals(requestId, recovered!!.requestId)
+        assertEquals(requesterId, recovered.requesterId)
+        assertEquals(targetId, recovered.targetId)
+        assertNull(recovered.originId)
+        assertEquals(requesterId, recovered.trustId)
+
+        // A desktop origin_id drives the trust id the same as a request.
+        val desktop = JSONObject(unknown.toString())
+            .put("requester_id", "reqdev-4242-a1b2")
+            .put("origin_id", "laptop-1")
+        val recoveredDesktop = RequestCodec.parseUnknownKindRequest(desktop)
+        assertEquals("laptop-1", recoveredDesktop!!.trustId)
+
+        // Known kinds never enter the helper, and malformed payloads stay
+        // silent: no id, no decline.
+        assertNull(
+            RequestCodec.parseUnknownKindRequest(JSONObject(validRequest().toString())),
+        )
+        assertNull(RequestCodec.parseUnknownKindRequest(JSONObject(unknown.toString()).put("kind", "")))
+        assertNull(RequestCodec.parseUnknownKindRequest(JSONObject(unknown.toString()).put("kind", "screenshot")))
+        assertNull(RequestCodec.parseUnknownKindRequest(JSONObject(unknown.toString()).put("request_id", "req-nope")))
+        assertNull(
+            RequestCodec.parseUnknownKindRequest(JSONObject(unknown.toString()).put("requester_id", "two words")),
+        )
+        assertNull(
+            RequestCodec.parseUnknownKindRequest(
+                JSONObject(unknown.toString()).put("origin_id", "two words"),
+            ),
+        )
+    }
+
+    @Test
     fun expiresTsAcceptsLongAndWholeFloat() {
         val asLong = parse(validRequest())
         assertEquals(expiresTs, asLong!!.expiresTs)

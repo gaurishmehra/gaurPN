@@ -1,11 +1,13 @@
 package dev.gaurish.outlinelite.transfer
 
+import android.Manifest
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.BatteryManager
 import android.util.Base64
@@ -51,6 +53,16 @@ import java.util.concurrent.ConcurrentHashMap
  * cluster key or cannot be reached at all.
  */
 enum class RelayLinkPhase { DISABLED, CONNECTING, ONLINE, AUTH_FAILED, UNREACHABLE }
+
+/**
+ * One camera accept prompt waiting for the user's tap. The notification id is
+ * held until the prompt is answered or expires, the same ownership rule as
+ * [PendingApproval].
+ */
+internal data class PendingCameraPrompt(
+    val request: RequestEnvelope,
+    val notifId: Int,
+)
 
 /**
  * Facade for the cluster relay: owns the device identity, the peer and
@@ -110,6 +122,16 @@ object RelayManager {
 
     /** One URL/package handoff per origin every 2 seconds. */
     private val openRateLimiter = ScreenshotRateLimiter(minIntervalMs = 2_000L)
+
+    /** One camera prompt per origin every 2 seconds. */
+    private val cameraRateLimiter = ScreenshotRateLimiter(minIntervalMs = 2_000L)
+
+    /**
+     * Live camera accept prompts, keyed by request id. The notification id
+     * is held until the prompt is answered or expires so a concurrent post
+     * cannot take it while the notification is visible. Guarded by itself.
+     */
+    private val pendingCameraPrompts = LinkedHashMap<String, PendingCameraPrompt>()
 
     /**
      * The single request currently being served. Held from acceptance until
@@ -171,6 +193,17 @@ object RelayManager {
     @Volatile
     private var allowScreenshotRequests = false
 
+    /**
+     * Camera toggles, cached the same way as the other request toggles: the
+     * collectors in [start] keep them current and both default fail closed —
+     * camera requests are off, and auto-accept is off.
+     */
+    @Volatile
+    private var allowCameraRequests = false
+
+    @Volatile
+    private var cameraAutoAcceptTrusted = false
+
     /** Battery receiver registered while the relay socket is open. */
     private var statusReceiver: BroadcastReceiver? = null
     private var statusContext: Context? = null
@@ -215,6 +248,16 @@ object RelayManager {
                 TransferSettingsRepository.observeAllowScreenshotRequests(appCtx)
                     .catch { Log.w(TAG, "Screenshot-request setting unavailable: ${it.message}") }
                     .collect { allowScreenshotRequests = it }
+            }
+            launch {
+                TransferSettingsRepository.observeAllowCameraRequests(appCtx)
+                    .catch { Log.w(TAG, "Camera-request setting unavailable: ${it.message}") }
+                    .collect { allowCameraRequests = it }
+            }
+            launch {
+                TransferSettingsRepository.observeCameraAutoAcceptTrusted(appCtx)
+                    .catch { Log.w(TAG, "Camera auto-accept setting unavailable: ${it.message}") }
+                    .collect { cameraAutoAcceptTrusted = it }
             }
             deviceId = KeyRepository.getOrCreateDeviceId(appCtx)
             Log.i(TAG, "Relay identity: $deviceId")
@@ -1029,6 +1072,15 @@ object RelayManager {
                 handleOpenRequest(context, peerCryptoKey, inner)
                 return
             }
+            "cam_control" -> {
+                // Camera controls ride the existing sealed envelope. They
+                // carry their own gate — the request id and session id must
+                // match the live camera lease — and are dropped silently
+                // otherwise, so they bypass the generic sender_id gate the
+                // way requests do.
+                handleCameraControl(context, inner)
+                return
+            }
         }
 
         val senderId = inner.optString("sender_id")
@@ -1284,10 +1336,10 @@ object RelayManager {
     }
 
     /**
-     * Sealed `request`: a peer asks this phone for files or the latest
-     * screenshot. Every refusal answers with a sealed `request_declined` so
-     * the requester is never left hanging; the log line carries the request
-     * id and reason only, never the grant.
+     * Sealed `request`: a peer asks this phone for files, the latest
+     * screenshot, or a live camera view. Every refusal answers with a sealed
+     * `request_declined` so the requester is never left hanging; the log
+     * line carries the request id and reason only, never the grant.
      */
     @Suppress("UNUSED_PARAMETER")
     private suspend fun handleIncomingRequest(
@@ -1296,7 +1348,14 @@ object RelayManager {
         peerCryptoKey: ByteArray,
         inner: JSONObject,
     ) {
-        val request = RequestCodec.parseRequest(inner) ?: return
+        val request = RequestCodec.parseRequest(inner) ?: run {
+            // A newer desktop may ask for a kind this build does not know.
+            // When the routing fields parse, answer `unsupported` so the CLI
+            // is never left hanging on silence; anything malformed stays
+            // dropped, exactly as before.
+            declineUnknownKindRequest(context, inner)
+            return
+        }
         // A request addressed elsewhere (or to ourselves) is not ours to serve.
         // trustId covers a desktop requester whose stable origin_id is this
         // device even though its ephemeral requester_id is not.
@@ -1327,6 +1386,7 @@ object RelayManager {
                 context, request.requesterId, request.requestId, DeclineReason.UNSUPPORTED,
             )
             RequestKind.SCREENSHOT -> handleScreenshotRequest(context, request)
+            RequestKind.CAMERA -> handleCameraRequest(context, peerCryptoKey, request)
         }
     }
 
@@ -1380,6 +1440,267 @@ object RelayManager {
             )
         } finally {
             releaseRequest(context, request.requestId)
+        }
+    }
+
+    // ------------------------------------------------------ camera (target)
+
+    /**
+     * Answers a `request` whose kind this build does not know with a sealed
+     * `unsupported` decline. The unknown-kind helper recovers only the
+     * routing fields, so the same not-ours and trust gates as a parsed
+     * request apply before the decline is sent; a malformed payload finds
+     * nothing and stays silent.
+     */
+    private suspend fun declineUnknownKindRequest(context: Context, inner: JSONObject) {
+        val unknown = RequestCodec.parseUnknownKindRequest(inner) ?: return
+        if (unknown.targetId != deviceId || unknown.trustId == deviceId) return
+        if (!acceptsInbound(context, InboundKind.REQUEST, unknown.trustId)) {
+            sendDecline(context, unknown.requesterId, unknown.requestId, DeclineReason.NOT_ALLOWED)
+            return
+        }
+        if (requestDeduper.seen(unknown.requestId)) return
+        sendDecline(context, unknown.requesterId, unknown.requestId, DeclineReason.UNSUPPORTED)
+    }
+
+    /**
+     * Sealed `request` kind "camera": a trusted desktop asks to view this
+     * phone's camera live. The trust gate mirrors browse/fetch — only a
+     * device the user explicitly trusted is served, whatever the
+     * only-trusted toggle says — and the grant must verify. The single
+     * request slot is held from accept until the stream service releases it,
+     * so one session lives at a time. Every refusal is a sealed decline so
+     * the CLI never hangs.
+     */
+    private suspend fun handleCameraRequest(
+        context: Context,
+        peerCryptoKey: ByteArray,
+        request: RequestEnvelope,
+    ) {
+        // Camera is a consent capability like browse: trusted-only ALWAYS.
+        if (!isTrustedBrowser(context, request.trustId)) {
+            sendDecline(context, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED)
+            return
+        }
+        if (!allowCameraRequests) {
+            sendDecline(context, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED)
+            return
+        }
+        // The grant binds the request to this target and expiry; the seal
+        // proves cluster membership, this proves the request was minted for
+        // this exact ask.
+        if (!ClusterCrypto.verifyRequestGrant(
+                peerCryptoKey,
+                request.requestId,
+                request.requesterId,
+                request.targetId,
+                request.expiresTs,
+                request.grant,
+            )
+        ) {
+            sendDecline(context, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED)
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        removeExpiredCameraPrompts(context, now)
+        // One live prompt per origin and one live session phone-wide: a
+        // second ask while either exists is busy, not a stacked prompt.
+        if (!cameraRateLimiter.isAllowed(request.trustId, now) ||
+            hasLiveCameraPrompt(request.trustId, now) ||
+            requestSlot.activeLease(now) != null
+        ) {
+            sendDecline(context, request.requesterId, request.requestId, DeclineReason.BUSY)
+            return
+        }
+        // Spend the cooldown as soon as the request is accepted — including
+        // the auto-accept and blocked-notification paths — so a peer cannot
+        // spam prompts.
+        cameraRateLimiter.record(request.trustId, now)
+
+        // Auto-accept: trusted + the toggle + the camera permission. The
+        // foreground-service start restriction on Android 14+ makes the
+        // accept tap the reliable path; auto-accept still works whenever the
+        // system allows the start, and the service tears down cleanly when
+        // it does not.
+        if (cameraAutoAcceptTrusted && hasCameraPermission(context)) {
+            startCameraSession(context, request)
+            return
+        }
+
+        val notifId = NotificationIds.acquire(request.requestId, sending = false)
+        val prompt = PendingCameraPrompt(request, notifId)
+        synchronized(pendingCameraPrompts) { pendingCameraPrompts[request.requestId] = prompt }
+        if (!CameraRequestNotifications.showPrompt(context, request, notifId)) {
+            synchronized(pendingCameraPrompts) { pendingCameraPrompts.remove(request.requestId) }
+            NotificationIds.release(notifId)
+            sendDecline(
+                context, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED,
+            )
+            return
+        }
+        // One-shot cleanup: the notification times out on the system side;
+        // this releases the held notification id and drops the registry
+        // entry without a periodic timer.
+        scope.launch {
+            delay((request.expiresTs - System.currentTimeMillis()).coerceAtLeast(0L))
+            val expired = synchronized(pendingCameraPrompts) {
+                pendingCameraPrompts.remove(request.requestId)
+            }
+            if (expired != null) {
+                CameraRequestNotifications.cancelPrompt(context, expired.notifId)
+                NotificationIds.release(expired.notifId)
+            }
+        }
+    }
+
+    /**
+     * Resolves a camera Accept/Decline tap. The registry entry is removed
+     * synchronously so a second tap cannot answer the same request, then the
+     * sealed decline or the service start runs from the manager scope. The
+     * tap is the user interaction that exempts the camera foreground-service
+     * start from the Android 14+ background restriction.
+     */
+    internal fun resolveCameraRequest(context: Context, requestId: String, accepted: Boolean) {
+        val prompt = synchronized(pendingCameraPrompts) { pendingCameraPrompts.remove(requestId) }
+            ?: return
+        CameraRequestNotifications.cancelPrompt(context, prompt.notifId)
+        NotificationIds.release(prompt.notifId)
+        val request = prompt.request
+        val appCtx = context.applicationContext
+
+        scope.launch {
+            if (!accepted) {
+                // The decline path is the existing sealed request_declined.
+                sendDecline(appCtx, request.requesterId, request.requestId, DeclineReason.DECLINED)
+                return@launch
+            }
+            if (RequestCodec.isExpired(request.expiresTs)) {
+                sendDecline(appCtx, request.requesterId, request.requestId, DeclineReason.EXPIRED)
+                return@launch
+            }
+            if (!hasCameraPermission(appCtx)) {
+                // The permission was revoked after the toggle went on; a
+                // camera foreground service could never start.
+                sendDecline(
+                    appCtx, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED,
+                )
+                return@launch
+            }
+            if (!RelayConnection.isConnected) {
+                showOneShotNotification(
+                    appCtx,
+                    key = "camera-offline-${request.requestId}",
+                    sending = false,
+                    title = "Camera stream not started",
+                    message = appCtx.getString(R.string.camera_stream_offline),
+                )
+                return@launch
+            }
+            startCameraSession(appCtx, request)
+        }
+    }
+
+    /**
+     * Claims the request slot for the whole session (HELD_UNTIL_RELEASED:
+     * the lease must outlive the request's 120 s window because the desktop
+     * re-dials the pipe until then), derives the session id, and hands the
+     * stream to the foreground service. The service releases the slot when
+     * the stream ends — Stop, `cam_control` stop, or the pipe socket closing.
+     */
+    private suspend fun startCameraSession(context: Context, request: RequestEnvelope) {
+        if (!tryAcquireSlot(
+                context = context,
+                requestId = request.requestId,
+                // Held until the service releases it: the stream can outlive
+                // the grant, and expiry only gates NEW requests.
+                expiresTs = RequestSlot.HELD_UNTIL_RELEASED,
+                trustId = request.trustId,
+                notifId = null,
+            )
+        ) {
+            sendDecline(context, request.requesterId, request.requestId, DeclineReason.BUSY)
+            return
+        }
+        try {
+            val token = KeyRepository.getClusterToken(context)
+            if (token.isBlank()) {
+                sendDecline(
+                    context, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED,
+                )
+                return
+            }
+            val (_, peerCryptoKey) = Crypto.deriveSubKeys(token)
+            // Identical derivation on the desktop; doubles as the pipe's
+            // transfer id.
+            val sessionId = CameraStream.sessionId(peerCryptoKey, request.requestId)
+            val started = CameraStreamService.start(
+                context = context,
+                requestId = request.requestId,
+                sessionId = sessionId,
+                requesterId = request.requesterId,
+                requesterName = request.requesterName,
+            )
+            if (!started) {
+                sendDecline(
+                    context, request.requesterId, request.requestId, DeclineReason.UNSUPPORTED,
+                )
+                return
+            }
+        } catch (c: CancellationException) {
+            releaseRequest(context, request.requestId)
+            throw c
+        } catch (t: Throwable) {
+            Log.w(TAG, "Camera session for ${request.requestId} could not start: ${t.javaClass.simpleName}")
+            releaseRequest(context, request.requestId)
+            sendDecline(context, request.requesterId, request.requestId, DeclineReason.UNSUPPORTED)
+        }
+    }
+
+    /**
+     * Releases the stream's request lease. Called by the service exactly once
+     * per session end; the id check inside the slot keeps a late call from
+     * freeing someone else's lease.
+     */
+    internal fun onCameraSessionEnded(context: Context, requestId: String) {
+        releaseRequest(context, requestId)
+    }
+
+    /**
+     * Sealed `cam_control`: a control for a live camera session. The payload
+     * is parsed strictly, then applied only when the request id is the live
+     * lease and the session id is the one derived for it — anything else is
+     * dropped silently, as pinned.
+     */
+    private suspend fun handleCameraControl(context: Context, inner: JSONObject) {
+        val control = CameraStream.parseControl(inner) ?: return
+        val lease = requestSlot.activeLease() ?: return
+        if (lease.id != control.requestId) return
+        val token = runCatching { KeyRepository.getClusterToken(context) }.getOrDefault("")
+        if (token.isBlank()) return
+        val (_, peerCryptoKey) = Crypto.deriveSubKeys(token)
+        // The session id is deterministic, so re-deriving it for the live
+        // request and comparing is exactly the pinned live-session match.
+        if (CameraStream.sessionId(peerCryptoKey, control.requestId) != control.sessionId) return
+        CameraStreamService.dispatchControl(control)
+    }
+
+    /** True while an unexpired camera prompt for [trustId] is live. */
+    private fun hasLiveCameraPrompt(trustId: String, now: Long): Boolean =
+        synchronized(pendingCameraPrompts) {
+            pendingCameraPrompts.values.any { it.request.trustId == trustId && now < it.request.expiresTs }
+        }
+
+    /** Drops expired camera prompts and releases their notification ids. */
+    private fun removeExpiredCameraPrompts(context: Context, now: Long) {
+        val expired = synchronized(pendingCameraPrompts) {
+            val stale = pendingCameraPrompts.values.filter { now >= it.request.expiresTs }
+            stale.forEach { pendingCameraPrompts.remove(it.request.requestId) }
+            stale
+        }
+        expired.forEach {
+            CameraRequestNotifications.cancelPrompt(context, it.notifId)
+            NotificationIds.release(it.notifId)
         }
     }
 
@@ -2002,6 +2323,15 @@ object RelayManager {
         "media_state", "media_command" -> InboundKind.MEDIA
         else -> InboundKind.TEXT
     }
+
+    /**
+     * The camera runtime permission, re-checked at every accept and on the
+     * auto-accept path. The settings toggle gates its own persistence on this
+     * grant, but the grant can be revoked later while the toggle stays on.
+     */
+    private fun hasCameraPermission(context: Context): Boolean =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
 
     internal fun cancelNotification(context: Context, id: Int) {
         val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager ?: return

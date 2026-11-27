@@ -108,6 +108,7 @@ import dev.gaurish.outlinelite.ui.Screens
 import dev.gaurish.outlinelite.ui.SplitTunnelScreen
 import dev.gaurish.outlinelite.ui.TransferOverlay
 import dev.gaurish.outlinelite.ui.TrustedDevicesScreen
+import dev.gaurish.outlinelite.ui.settings.CameraScreen
 import dev.gaurish.outlinelite.ui.settings.ClipboardSyncScreen
 import dev.gaurish.outlinelite.ui.settings.DnsScreen
 import dev.gaurish.outlinelite.ui.settings.MediaScreen
@@ -267,6 +268,9 @@ class MainActivity : ComponentActivity() {
                                 },
                             )
                         }
+                        Screens.CAMERA -> {
+                            CameraScreen(onBack = { screen = Screens.SETTINGS })
+                        }
                         Screens.MEDIA -> {
                             MediaScreen(onBack = { screen = Screens.SETTINGS })
                         }
@@ -344,6 +348,7 @@ class MainActivity : ComponentActivity() {
                                 onOpenNotifications = { screen = Screens.NOTIFICATIONS },
                                 onOpenMedia = { screen = Screens.MEDIA },
                                 onOpenTransfers = { screen = Screens.TRANSFERS },
+                                onOpenCamera = { screen = Screens.CAMERA },
                             )
                         }
                         else -> {

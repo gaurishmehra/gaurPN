@@ -17,9 +17,11 @@ object Screens {
     const val TRANSFERS = 9
     const val BROWSE = 10
     const val SERVERS = 11
+    const val CAMERA = 12
 
     val ALL = listOf(
         HOME, SETTINGS, SPLIT_TUNNEL, HISTORY, TRUSTED_DEVICES,
         DNS, CLIPBOARD_SYNC, NOTIFICATIONS, MEDIA, TRANSFERS, BROWSE, SERVERS,
+        CAMERA,
     )
 }

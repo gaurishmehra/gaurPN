@@ -70,6 +70,7 @@ func main() {
 		fmt.Println("  gaur-share notify <device> <title> [body]   Send a notification to a device")
 		fmt.Println("  gaur-share notify --all <title> [body]      Send a notification to every online device")
 		fmt.Println("  gaur-share ask <device> <reason...>         Ask a device to approve an action")
+		fmt.Println("  gaur-share cam [--loopback /dev/videoN] [--player <cmd>] <device>  Stream a device's camera")
 		fmt.Println("  gaur-share open <device> <url|file|pkg>     Open a URL, file, or app on a device")
 		fmt.Println("  gaur-share trust <device>                   Trust a device by id or name")
 		fmt.Println("  gaur-share untrust <device>                 Revoke a trusted device")
@@ -310,6 +311,21 @@ func main() {
 		if err := runAsk(cfg, rest[0], strings.Join(rest[1:], " "), jsonOut); err != nil {
 			printControlError(err, jsonOut)
 		}
+	case "cam":
+		camFlags := flag.NewFlagSet("cam", flag.ExitOnError)
+		camLoopback := camFlags.String("loopback", "", "Write the stream to a v4l2 loopback device (e.g. /dev/video10) instead of a player window")
+		camPlayerFlag := camFlags.String("player", "", "Custom player command; receives the HEVC stream on stdin")
+		if err := camFlags.Parse(args[1:]); err != nil {
+			log.Fatalf("[FATAL] %v", err)
+		}
+		rest := camFlags.Args()
+		if len(rest) != 1 {
+			fmt.Fprintln(os.Stderr, "Usage: gaur-share cam [--loopback /dev/videoN] [--player <cmd>] <device>")
+			os.Exit(2)
+		}
+		if err := runCam(cfg, rest[0], *camLoopback, *camPlayerFlag); err != nil {
+			camExit(err)
+		}
 	case "open":
 		openFlags := flag.NewFlagSet("open", flag.ExitOnError)
 		openJSON := openFlags.Bool("json", false, "Output the result as JSON")
@@ -386,6 +402,6 @@ func main() {
 		}
 		fmt.Printf("Only trusted devices: %s\n", args[1])
 	default:
-		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, browse, fetch, screenshot, send-text, pair, ui, notify, ask, open, trust, untrust, trusted, trust-mode", args[0])
+		log.Fatalf("Unknown command: %s. Valid commands: daemon, list, send, browse, fetch, screenshot, send-text, pair, ui, notify, ask, cam, open, trust, untrust, trusted, trust-mode", args[0])
 	}
 }

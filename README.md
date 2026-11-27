@@ -8,7 +8,7 @@
   <strong>Your phone, your laptop, your desktop. One private network.</strong>
 </p>
 
-gaurPN turns a Shadowsocks VPS into a home for every device you carry. The Android app is the VPN. The desktop binary is the companion. The relay on your server routes ciphertext between them. Connect once and your devices find each other through the tunnel: send files, sync the clipboard, mirror notifications, control media, pull a screenshot off your phone while you sit at your desk. Every payload is end-to-end encrypted before it leaves the device, and the relay in the middle holds no keys.
+gaurPN turns a Shadowsocks VPS into a home for every device you carry. The Android app is the VPN. The desktop binary is the companion. The relay on your server routes ciphertext between them. Connect once and your devices find each other through the tunnel: send files, sync the clipboard, mirror notifications, control media, pull a screenshot off your phone, or watch its camera live while you sit at your desk. Every payload is end-to-end encrypted before it leaves the device, and the relay in the middle holds no keys.
 
 ## The pieces
 
@@ -61,6 +61,7 @@ Your devices should talk to each other through a server you pay for. gaurPN keep
 - **Media control (MPRIS)**: Android media sessions appear as local players on the desktop. Play, pause, skip, seek, volume. Position interpolates locally; commands are sealed and expire after 30 seconds.
 - **Pull transfers**: browse a trusted device's home directory (desktop) or media collections (phone; grant All files access for full shared storage) and fetch what you pick. Browsing is trusted-only and rate-limited, grants expire in five minutes, and every accepted fetch posts a notification on the target.
 - **Peer status**: battery and charging state ride inside encrypted presence updates, so you know a device can survive a transfer before you send one.
+- **Camera streaming**: `gaur-share cam <phone>` shows a trusted phone's camera live on the desktop (or feeds it to a v4l2 loopback as a system webcam). Hardware HEVC end to end, three quality tiers switchable mid-stream, torch and lens controls, accept prompt on the phone with an auto-accept opt-in.
 - **Transfer history**: local-only list of sent and received files and text, with open, retry, resend, and cancel.
 
 ### Clipboard sync
@@ -381,12 +382,19 @@ gaur-browse "Pixel 8"
 
 # Ask a phone for its latest screenshot (quick action)
 gaur-share screenshot "Pixel 8"
+
+# Watch a trusted phone's camera live in an mpv window
+gaur-share cam "Lilly"
+
+# Feed the camera into a v4l2 loopback device (system webcam)
+gaur-share cam --loopback /dev/video0 "Lilly"
 ```
 
 #### On Android (`gaurPN`)
 1. In gaurPN, edit your active server profile to set your **Cluster Token** and relay address (`198.51.100.1:9876`).
 2. When connected to the VPN, the **Cluster Devices** card displays online peers.
 3. Tap any peer to pick a file and send it. Incoming files stream straight into your device's `Downloads` folder.
+4. **Settings → Camera** enables camera requests from trusted devices, picks the default quality tier (1080p/720p/360p) and lens, and offers auto-accept for trusted devices. The camera permission is requested with the toggle.
 
 ### 4. Clipboard Sync
 

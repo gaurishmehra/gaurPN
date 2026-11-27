@@ -6,7 +6,8 @@ import org.json.JSONObject
 /** What a peer is asking for. Pinned wire values; do not rename. */
 enum class RequestKind(val wire: String) {
     FILES("files"),
-    SCREENSHOT("screenshot");
+    SCREENSHOT("screenshot"),
+    CAMERA("camera");
 
     companion object {
         fun fromWire(value: String): RequestKind? = entries.firstOrNull { it.wire == value }
@@ -69,6 +70,23 @@ internal data class DeclineEnvelope(
     val reason: DeclineReason,
     val ts: Long,
 )
+
+/**
+ * Routing fields recovered from a sealed `request` whose `kind` this build
+ * does not know. A newer desktop CLI may ask for something this phone cannot
+ * serve; the request itself is well formed, so the ids are extracted and the
+ * request is answered `unsupported` instead of leaving the CLI hanging on
+ * silence. [trustId] follows the same origin-id rule as a parsed request so
+ * the decline path runs the same not-ours and trust gates.
+ */
+internal data class UnknownKindRequest(
+    val requestId: String,
+    val requesterId: String,
+    val originId: String?,
+    val targetId: String,
+) {
+    val trustId: String get() = originId ?: requesterId
+}
 
 /**
  * Parsed sealed `browse` payload: the requester asks for one directory
@@ -255,6 +273,36 @@ internal object RequestCodec {
             grant = grant,
             ts = ts,
         )
+    }
+
+    /**
+     * [parseRequest] stays strict: an unknown `kind` rejects the whole
+     * payload. This helper recovers only the routing fields from such a
+     * request so the caller can answer a decline. It fires exclusively when
+     * the `kind` is present, non-blank, and not one this build knows — a
+     * known kind means `parseRequest` should have handled it, and anything
+     * else is a malformed payload that must stay silent.
+     */
+    fun parseUnknownKindRequest(json: JSONObject): UnknownKindRequest? {
+        val requestId = json.optString("request_id")
+        if (!isRequestId(requestId)) return null
+
+        val requesterId = json.optString("requester_id")
+        if (!isDeviceId(requesterId)) return null
+
+        val originId = when (val raw = json.opt("origin_id")) {
+            null, JSONObject.NULL -> null
+            is String -> raw.takeIf { isDeviceId(it) } ?: return null
+            else -> return null
+        }
+
+        val targetId = json.optString("target_id")
+        if (!isDeviceId(targetId)) return null
+
+        val kind = json.optString("kind")
+        if (kind.isBlank() || RequestKind.fromWire(kind) != null) return null
+
+        return UnknownKindRequest(requestId, requesterId, originId, targetId)
     }
 
     fun buildRequest(
@@ -646,8 +694,10 @@ internal object RequestCodec {
      * Positive integral JSON number. Integers arrive as Int/Long and decimals
      * as Double/BigDecimal; both are accepted when the value is a whole
      * number, so "1767225600000" and "1767225600000.0" parse identically.
+     * A quoted number is rejected: a string is not a JSON number. Internal
+     * so sibling codecs (e.g. the camera control) enforce the same rule.
      */
-    private fun positiveLong(json: JSONObject, key: String): Long? {
+    internal fun positiveLong(json: JSONObject, key: String): Long? {
         val value = json.opt(key) ?: return null
         val asDouble = when (value) {
             is Int -> return value.toLong().takeIf { it > 0L }

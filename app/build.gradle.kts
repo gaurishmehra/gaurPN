@@ -54,6 +54,12 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("androidx.media:media:1.7.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    // Camera streaming: CameraX feeds the HEVC encoder surface for the
+    // gaur-cam live view. 1.4.0 needs compileSdk 35; fall back to 1.3.4 only
+    // if resolution against the pinned repositories fails.
+    implementation("androidx.camera:camera-core:1.4.0")
+    implementation("androidx.camera:camera-camera2:1.4.0")
+    implementation("androidx.camera:camera-lifecycle:1.4.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

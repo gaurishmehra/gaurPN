@@ -488,7 +488,7 @@ v3 messages use a sealed envelope:
   "target_id": "device-id",
   "msg_id": "seal-<uuid>",
   "ts": 1730000000000,
-  "kind": "offer" | "complete" | "text" | "notification" | "notification_action" | "media_state" | "media_command" | "browse" | "browse_listing" | "fetch" | "request" | "request_declined" | "ask" | "ask_response" | "open" | "open_result",
+  "kind": "offer" | "complete" | "text" | "notification" | "notification_action" | "media_state" | "media_command" | "browse" | "browse_listing" | "fetch" | "request" | "request_declined" | "ask" | "ask_response" | "open" | "open_result" | "cam_control",
   "nonce": "<base64>",
   "data": "<base64>"
 }
@@ -931,3 +931,103 @@ it does for any other transfer, sends `complete` to `reply_to`, then reports
 
 Exit codes: `0` opened or tap-to-open notification, `1` denied, `2` usage,
 `3` timeout, `4` transport/unsupported/failure, `130` interrupted.
+
+---
+
+## 19. Camera Streaming
+
+`gaur-share cam [--loopback /dev/videoN] [--player <cmd>] <device>` asks a trusted
+Android phone for a live view of its camera and shows it on the desktop. The
+phone answers from a notification; the stream is end-to-end encrypted HEVC and
+the relay sees only the session id and ciphertext. Teardown is event-driven on
+every side: the viewer closes, the receiver GET ends, the relay closes the
+sender's pipe, and the phone stops the camera. No timers anywhere.
+
+### Request and consent
+
+- The request rides the existing sealed `request` envelope with `kind`
+  `"camera"` and a 120 s accept window. The grant is the v3.2 request grant.
+- The target serves only explicitly trusted devices (the same rule as browse,
+  fetch, ask, and open, independent of the only-trusted toggle), the setting
+  **Settings → Camera → Allow camera requests** must be on, and the CAMERA
+  runtime permission granted. Otherwise the answer is `not_allowed`.
+- The phone shows a high-importance Accept/Decline notification that expires
+  with the request. Accept starts a foreground service of type `camera`
+  (the notification action tap is the Android 14+ user-interaction exemption
+  for camera FGS start). **Auto-accept from trusted devices** is a separate
+  opt-in.
+- One live session per phone: the single request slot is held from accept
+  until the stream service releases it. A second request answers `busy`.
+  A per-origin 2 s cooldown applies.
+- A target that does not know the `camera` kind answers `unsupported` instead
+  of dropping the envelope, so new requesters never hang against old targets.
+  This decline applies to every unknown request kind, not only camera.
+
+### Session keys
+
+Both sides derive the session deterministically from the request id:
+
+- `session_id = hex(HMAC-SHA256(K_peer, "gaur-cam-session-v1:" + request_id))`
+  (64 lowercase hex chars; also the `/pipe` transfer id).
+- `K_cam = HMAC-SHA256(K_peer, "gaur-camera-v1:" + session_id)`.
+
+### Transport
+
+The stream rides the existing `/pipe` endpoint; nothing new is staged, stored,
+or logged. The phone POSTs a chunked body as `role=sender`
+(`/pipe?transfer_id=<session_id>&role=sender`); the desktop GETs as
+`role=receiver` with `&flush=1`, which opts the response into a flush after
+every write instead of the 100 ms throttle (file receivers are unaffected).
+The receiver re-dials on the relay's 60 s rendezvous timeout until the request
+expires. A stream that moves no bytes for 5 minutes is swept with the other
+idle pipes.
+
+### Frame format
+
+```
+[4-byte big-endian L][12-byte nonce][L-28 ciphertext][16-byte GCM tag]
+```
+
+- AES-256-GCM with `K_cam`, a fresh nonce per frame.
+- AAD: `cam:v1:<session_id>:<frame_index>` — the index is the count of frames
+  sent so far (equal to the count received), starting at 0.
+- Frame 0 is the HEVC parameter sets (VPS/SPS/PPS, Annex-B); frames 1+ are
+  encoder output buffers (Annex-B). `L` above 8 MiB aborts the stream.
+- The phone keeps at most two frames in flight; a full queue drops the frame
+  and requests a sync frame, so the stream recovers at the next keyframe
+  instead of queuing latency.
+
+### Live controls
+
+The desktop sends sealed `cam_control` envelopes over its WebSocket:
+`{"request_id","session_id","action","on"?,"tier"?,"ts"}` with `action`
+`torch` (on/off), `lens` (front/back), `tier` (switch quality; the encoder
+restarts, so a brief hitch is expected), or `stop`. The phone applies a
+control only when both ids match the live session. Keys while streaming:
+`t` torch, `f` flip lens, `1/2/3` tier, `q` stop.
+
+### Quality tiers
+
+| Tier | Resolution | FPS | Bitrate | Bits/pixel |
+| --- | --- | --- | --- | --- |
+| `high` (default) | 1920x1080 | 30 | 8 Mbps | 0.129 |
+| `balanced` | 1280x720 | 30 | 3.5 Mbps | 0.127 |
+| `low` | 640x360 | 30 | 500 kbps | 0.072 |
+
+The default tier and lens are phone settings (**Settings → Camera**); the
+desktop can switch the tier live. Expect roughly 85-150 ms glass-to-glass on
+a 30 ms-RTT relay path (measured on the production VPS), scaling with the
+link. Audio, recording, and a phone-side viewer UI are future work.
+
+### Desktop viewer
+
+- Default: `mpv --no-cache --profile=low-latency --demuxer-lavf-format=hevc
+  --hwdec=auto -` reading HEVC from stdin.
+- `--player <cmd>` runs your own command with the stream on stdin; a bare
+  command name gets `-` appended, an override that already names `-` is used
+  verbatim.
+- `--loopback /dev/videoN` writes through
+  `ffmpeg -f hevc -i - -pix_fmt yuv420p -f v4l2 <dev>` for use as a system
+  webcam (requires the `v4l2loopback` module).
+- Exit codes mirror `ask`: `0` clean end, `1` declined, `2` usage, `3` expired
+  without accept, `4` transport/player failure, `130` interrupted.
