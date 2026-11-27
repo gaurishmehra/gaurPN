@@ -480,7 +480,11 @@ func TestCamPlayerCommandLines(t *testing.T) {
 		{
 			name:     "mpv window default",
 			wantName: "mpv",
-			wantArgs: []string{"--no-cache", "--profile=low-latency", "--demuxer-lavf-format=hevc", "--hwdec=auto", "-"},
+			wantArgs: []string{
+				"--no-cache", "--profile=low-latency", "--untimed",
+				"--demuxer-lavf-format=hevc", "--demuxer-lavf-analyzeduration=0",
+				"--demuxer-lavf-probesize=4096", "--hwdec=auto", "-",
+			},
 		},
 		{
 			name:     "loopback",

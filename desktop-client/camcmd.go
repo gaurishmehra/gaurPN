@@ -845,7 +845,19 @@ func camPlayerArgs(loopDev, playerOverride string) (camPlayer, error) {
 	default:
 		return camPlayer{
 			name: "mpv",
-			args: []string{"--no-cache", "--profile=low-latency", "--demuxer-lavf-format=hevc", "--hwdec=auto", "-"},
+			args: []string{
+				"--no-cache",
+				"--profile=low-latency",
+				// Untimed renders each frame the moment it arrives
+				// instead of pacing to the stream's frame rate, which
+				// alone was worth tens of milliseconds of lag.
+				"--untimed",
+				"--demuxer-lavf-format=hevc",
+				"--demuxer-lavf-analyzeduration=0",
+				"--demuxer-lavf-probesize=4096",
+				"--hwdec=auto",
+				"-",
+			},
 		}, nil
 	}
 }

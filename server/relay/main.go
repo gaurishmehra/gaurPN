@@ -57,6 +57,12 @@ var (
 	wsWriteTimeout = 15 * time.Second
 )
 
+// errReceiverGone closes a pipe session whose receiver disconnected while
+// the sender was still connected. The sender's io.CopyBuffer surfaces it,
+// its request handler returns, and the sender's connection ends instead of
+// blocking forever on a buffer nobody drains.
+var errReceiverGone = errors.New("pipe receiver disconnected")
+
 // wsMaxMessageBytes caps one inbound WebSocket frame. Signaling messages
 // are small (offers, accepts, text, clipboard). Chunk bodies travel over
 // HTTP, so 1 MiB is generous and prevents a token holder from forcing
@@ -847,6 +853,18 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 	h.pipeMu.Unlock()
 
 	defer func() {
+		// The receiver is the pipe's only consumer. When it disconnects
+		// — the viewer closed, the CLI died, the tunnel dropped — the
+		// sender would otherwise keep POSTing into the bounded buffer
+		// with nobody draining it, blocked on a pipe that never closes
+		// (the buffer's Write blocks once full, and the session is
+		// never idle, so the sweep never reaps it). Close the pipe with
+		// an error the moment the receiver leaves so the sender's copy
+		// aborts and its request ends; the idempotent close makes the
+		// receiver-first-rendezvous-timeout path safe too.
+		if role == "receiver" {
+			_ = session.pipe.CloseWithError(errReceiverGone)
+		}
 		h.pipeMu.Lock()
 		session.releaseRoleLocked(role)
 		remaining := atomic.AddInt32(&session.activeConnections, -1)
@@ -889,6 +907,18 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 		if lowLatency {
 			flushInterval = 0 // flushWriter flushes after every write
 		}
+
+		// A receiver that hangs up while the pipe is empty would park
+		// the copy in pipe.Read forever: no write ever fails, so the
+		// disconnect is only visible through the request context. The
+		// watcher closes the pipe, which unblocks this copy, ends the
+		// handler, and lets the deferred role close tell the sender
+		// its consumer left.
+		go func() {
+			<-r.Context().Done()
+			_ = session.pipe.CloseWithError(errReceiverGone)
+		}()
+
 		fw := &flushWriter{w: w, flusher: flusher, interval: flushInterval}
 		buf := make([]byte, pipeCopyBufferSize)
 		_, err := io.CopyBuffer(fw, session.pipe, buf)
