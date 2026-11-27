@@ -6,6 +6,14 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -17,13 +25,18 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -32,6 +45,8 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import kotlinx.coroutines.delay
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -41,6 +56,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -58,6 +76,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** Three distinct states: a null flow read is not the same as an empty list. */
+private enum class HistoryPhase { Pending, Loading, Empty, List }
+
 /**
  * Local transfer history. Received files can be reopened, failed sends can be
  * retried, and text/link shares can be copied or resent. Nothing on this
@@ -67,15 +88,30 @@ import java.util.Locale
 fun HistoryScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val entries by TransferHistoryRepository.observe(context)
-        .collectAsStateWithLifecycle(initialValue = emptyList())
+    val historyFlow = remember(context) { TransferHistoryRepository.observe(context) }
+    val history by historyFlow.collectAsStateWithLifecycle(initialValue = null)
+    val entries = history.orEmpty()
+    val loading = history == null
     var confirmClear by remember { mutableStateOf(false) }
+    // A local read usually lands inside a frame or two. Showing a skeleton for
+    // 40 ms is a flash, not a loading state, so the placeholders wait for a
+    // delay long enough to mean "this is taking a moment".
+    var slow by remember { mutableStateOf(false) }
+    LaunchedEffect(loading) {
+        if (!loading) {
+            slow = false
+            return@LaunchedEffect
+        }
+        delay(Motion.Quick.toLong())
+        slow = true
+    }
+    val timeFormatter = remember { SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()) }
 
     Box(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .systemBarsPadding(),
+            .statusBarsPadding(),
         contentAlignment = Alignment.TopCenter,
     ) {
     Column(
@@ -98,36 +134,97 @@ fun HistoryScreen(onBack: () -> Unit) {
             Spacer(Modifier.width(2.dp))
             Text(
                 "Transfer history",
-                fontSize = 19.sp,
-                fontWeight = FontWeight.SemiBold,
+                style = BenchType.Title,
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.weight(1f),
             )
-            if (entries.isNotEmpty()) {
-                TextButton(onClick = { confirmClear = true }) {
-                    Text("Clear history", fontSize = 13.sp)
+            AnimatedVisibility(
+                visible = !loading && entries.isNotEmpty(),
+                enter = fadeIn(tween(Motion.Base)) +
+                    expandHorizontally(
+                        animationSpec = tween(Motion.Base, easing = Motion.EmphasizedDecelerate),
+                    ),
+                exit = fadeOut(tween(Motion.Quick)) +
+                    shrinkHorizontally(
+                        animationSpec = tween(Motion.Quick, easing = Motion.EmphasizedAccelerate),
+                    ),
+            ) {
+                // Destructive, so it stays quiet at rest: the accent belongs
+                // to live state, and the dialog carries the red.
+                TextButton(
+                    onClick = { confirmClear = true },
+                    modifier = Modifier.heightIn(min = 48.dp),
+                    colors = ButtonDefaults.textButtonColors(
+                        contentColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                    ),
+                ) {
+                    Text("Clear", style = BenchType.Caption, fontWeight = FontWeight.Medium)
                 }
             }
         }
 
-        if (entries.isEmpty()) {
-            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                Text(
-                    "No transfers yet.",
-                    fontSize = 14.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        } else {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 20.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
-                contentPadding = PaddingValues(bottom = 30.dp),
-            ) {
-                items(entries, key = { it.id }) { entry ->
-                    HistoryRow(entry, context, scope)
+        AnimatedContent(
+            targetState = when {
+                loading && !slow -> HistoryPhase.Pending
+                loading -> HistoryPhase.Loading
+                entries.isEmpty() -> HistoryPhase.Empty
+                else -> HistoryPhase.List
+            },
+            transitionSpec = {
+                fadeIn(tween(Motion.Base, easing = Motion.EmphasizedDecelerate))
+                    .togetherWith(fadeOut(tween(Motion.Quick, easing = Motion.EmphasizedAccelerate)))
+            },
+            label = "history_state",
+        ) { phase ->
+            when (phase) {
+                HistoryPhase.Pending -> Spacer(Modifier.fillMaxSize())
+                HistoryPhase.Loading -> HistorySkeleton()
+                HistoryPhase.Empty -> {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Text(
+                                "Nothing sent or received yet",
+                                style = BenchType.Section,
+                                color = MaterialTheme.colorScheme.onSurface,
+                            )
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                "Files you share appear here. Received files land in Downloads.",
+                                style = BenchType.Body,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center,
+                            )
+                        }
+                    }
+                }
+                HistoryPhase.List -> {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        contentPadding = PaddingValues(bottom = 30.dp),
+                    ) {
+                        items(entries, key = { it.id }) { entry ->
+                            HistoryRow(
+                                entry = entry,
+                                context = context,
+                                scope = scope,
+                                timeFormatter = timeFormatter,
+                                modifier = Modifier.animateItem(
+                                    fadeInSpec = tween(
+                                        Motion.Base,
+                                        easing = Motion.EmphasizedDecelerate,
+                                    ),
+                                    placementSpec = Motion.spatial(),
+                                    fadeOutSpec = tween(
+                                        Motion.Exit,
+                                        easing = Motion.EmphasizedAccelerate,
+                                    ),
+                                ),
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -165,112 +262,206 @@ fun HistoryScreen(onBack: () -> Unit) {
 }
 
 @Composable
+private fun HistorySkeleton() {
+    SkeletonHost {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            // Same pitch and same lead glyph as a real row, so the list does
+            // not grow when the read lands.
+            repeat(8) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(
+                            MaterialTheme.colorScheme.surface,
+                            MaterialTheme.shapes.large,
+                        )
+                        .padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    SkeletonBox(Modifier.size(32.dp), shape = CircleShape)
+                    Spacer(Modifier.width(12.dp))
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        SkeletonLine(widthFraction = 0.58f, height = 12)
+                        SkeletonLine(widthFraction = 0.36f, height = 9)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * One entry, one row. The status is a coloured span inside the caption rather
+ * than a badge, and the action is a single trailing control, so a page of
+ * history reads as a log instead of a stack of cards each shouting "Done".
+ */
+@Composable
 private fun HistoryRow(
     entry: TransferHistoryEntry,
     context: Context,
     scope: CoroutineScope,
+    timeFormatter: SimpleDateFormat,
+    modifier: Modifier = Modifier,
 ) {
     val scheme = MaterialTheme.colorScheme
+    val haptics = rememberHaptics()
     val directionLabel = if (entry.direction == "sent") "Sent" else "Received"
+    // Amber means live, so a finished transfer states its outcome in words and
+    // leaves the accent to the transfer that is actually running.
     val statusColor = when (entry.status) {
-        "completed" -> scheme.primary
+        "active" -> scheme.primary
         "failed" -> scheme.error
-        "active" -> scheme.tertiary
         else -> scheme.onSurfaceVariant
+    }
+    val statusWord = when (entry.status) {
+        "completed" -> "Done"
+        else -> entry.status.replaceFirstChar { it.uppercase() }
+    }
+    val meta = buildAnnotatedString {
+        append(directionLabel)
+        append(' ')
+        append(entry.kind)
+        if (entry.peerName.isNotBlank()) {
+            append(" \u00B7 ")
+            append(entry.peerName)
+        }
+        val time = formatTime(timeFormatter, entry.timestamp)
+        if (time.isNotEmpty()) {
+            append(" \u00B7 ")
+            append(time)
+        }
+        append(" \u00B7 ")
+        pushStyle(SpanStyle(color = statusColor, fontWeight = FontWeight.Medium))
+        append(statusWord)
+        pop()
     }
 
     Column(
-        Modifier
+        modifier
             .fillMaxWidth()
             .background(scheme.surface, MaterialTheme.shapes.large)
             .padding(14.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                    .size(32.dp)
+                    .clip(CircleShape)
+                    .background(scheme.onSurfaceVariant.copy(alpha = 0.10f)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Text(
+                    if (entry.direction == "sent") "\u2191" else "\u2193",
+                    style = BenchType.Data,
+                    color = statusColor,
+                )
+            }
+            Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text(
                     entry.label,
-                    fontSize = 14.sp,
+                    style = BenchType.Body,
                     fontWeight = FontWeight.Medium,
                     color = scheme.onSurface,
-                    maxLines = 1,
+                    // Two lines: a truncated filename is unreadable, and the
+                    // long ones are exactly the files people come back for.
+                    maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
-                Spacer(Modifier.height(3.dp))
+                Spacer(Modifier.height(2.dp))
                 Text(
-                    "$directionLabel ${entry.kind} • ${entry.peerName} • ${formatTime(entry.timestamp)}",
-                    fontSize = 11.sp,
+                    meta,
+                    style = BenchType.Caption,
                     color = scheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Text(
-                entry.status.replaceFirstChar { it.uppercase() },
-                fontSize = 11.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = statusColor,
-            )
-        }
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            when {
-                entry.direction == "received" && entry.kind == "file" &&
-                    entry.localPath != null -> {
-                    OutlinedButton(
-                        onClick = { openReceived(context, entry) },
-                        modifier = Modifier.height(30.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp),
-                    ) {
-                        Text("Open", fontSize = 11.sp)
-                    }
-                }
-
-                entry.direction == "sent" && entry.kind == "file" &&
-                    entry.sourceUri != null -> {
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                RelayManager.sendFiles(
-                                    context,
-                                    ClusterPeer(entry.peerId, entry.peerName),
-                                    listOf(Uri.parse(entry.sourceUri)),
-                                )
-                            }
-                        },
-                        modifier = Modifier.height(30.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp),
-                    ) {
-                        Text(
-                            if (entry.status == "failed") "Retry" else "Send again",
-                            fontSize = 11.sp,
+            val actions = historyActions(entry)
+            if (actions.size == 1) {
+                Spacer(Modifier.width(4.dp))
+                HistoryAction(
+                    label = actions.first(),
+                    onClick = {
+                        haptics.select()
+                        runHistoryAction(
+                            action = actions.first(),
+                            context = context,
+                            entry = entry,
+                            scope = scope,
                         )
-                    }
-                }
-
-                entry.kind != "file" && entry.text != null -> {
-                    OutlinedButton(
-                        onClick = { copyText(context, entry.text) },
-                        modifier = Modifier.height(30.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp),
-                    ) {
-                        Text("Copy", fontSize = 11.sp)
-                    }
-                    OutlinedButton(
+                    },
+                )
+            }
+        }
+        if (historyActions(entry).size > 1) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                historyActions(entry).forEach { label ->
+                    HistoryAction(
+                        label = label,
                         onClick = {
-                            scope.launch {
-                                RelayManager.sendText(
-                                    context,
-                                    ClusterPeer(entry.peerId, entry.peerName),
-                                    entry.text,
-                                )
-                            }
+                            haptics.select()
+                            runHistoryAction(
+                                action = label,
+                                context = context,
+                                entry = entry,
+                                scope = scope,
+                            )
                         },
-                        modifier = Modifier.height(30.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp),
-                    ) {
-                        Text("Send again", fontSize = 11.sp)
-                    }
+                    )
                 }
+            }
+        }
+    }
+}
+
+/** What this entry can still do. Labels are the control names. */
+private fun historyActions(entry: TransferHistoryEntry): List<String> = when {
+    entry.direction == "received" && entry.kind == "file" && entry.localPath != null ->
+        listOf("Open")
+    entry.direction == "sent" && entry.kind == "file" && entry.sourceUri != null ->
+        listOf(if (entry.status == "failed") "Retry" else "Send again")
+    entry.kind != "file" && entry.text != null ->
+        listOf("Copy", if (entry.status == "failed") "Retry" else "Send again")
+    else -> emptyList()
+}
+
+@Composable
+private fun HistoryAction(label: String, onClick: () -> Unit) {
+    TextButton(
+        onClick = onClick,
+        modifier = Modifier.heightIn(min = 48.dp),
+        contentPadding = PaddingValues(horizontal = 12.dp),
+    ) {
+        Text(label, style = BenchType.Caption, fontWeight = FontWeight.Medium)
+    }
+}
+
+private fun runHistoryAction(
+    action: String,
+    context: Context,
+    entry: TransferHistoryEntry,
+    scope: CoroutineScope,
+) {
+    when (action) {
+        "Open" -> openReceived(context, entry)
+        "Copy" -> entry.text?.let { copyText(context, it) }
+        else -> {
+            val peer = ClusterPeer(entry.peerId, entry.peerName)
+            if (entry.kind == "file" && entry.sourceUri != null) {
+                scope.launch {
+                    RelayManager.sendFiles(context, peer, listOf(Uri.parse(entry.sourceUri)))
+                }
+            } else if (entry.text != null) {
+                scope.launch { RelayManager.sendText(context, peer, entry.text) }
             }
         }
     }
@@ -304,7 +495,7 @@ private fun copyText(context: Context, text: String) {
     Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
 }
 
-private fun formatTime(timestamp: Long): String {
+private fun formatTime(formatter: SimpleDateFormat, timestamp: Long): String {
     if (timestamp <= 0L) return ""
-    return SimpleDateFormat("MMM d, HH:mm", Locale.getDefault()).format(Date(timestamp))
+    return formatter.format(Date(timestamp))
 }

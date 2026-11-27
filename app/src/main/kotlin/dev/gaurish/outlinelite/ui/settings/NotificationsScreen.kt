@@ -85,7 +85,7 @@ fun NotificationsScreen(onBack: () -> Unit) {
             }
         }
 
-        if (notificationSync && !notificationAccess) {
+        RevealSetting(visible = notificationSync && !notificationAccess) {
             SettingsRow(
                 title = "Notification access",
                 summary = "Required to read notifications from other apps",
@@ -99,10 +99,10 @@ fun NotificationsScreen(onBack: () -> Unit) {
             )
         }
 
-        if (notificationSync) {
+        RevealSetting(visible = notificationSync) {
             val appNotificationsEnabled =
                 NotificationManagerCompat.from(context).areNotificationsEnabled()
-            if (!appNotificationsEnabled) {
+            RevealSetting(visible = !appNotificationsEnabled) {
                 SettingsRow(
                     title = "Allow gaurPN notifications",
                     summary = "Android is blocking mirrored notifications",

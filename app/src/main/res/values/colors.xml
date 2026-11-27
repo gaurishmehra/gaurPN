@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ic_launcher_background">#000000</color>
+    <!-- Mirror of the Bench background in each mode; see ui/Theme.kt. -->
+    <color name="bench_background">#F4F2EE</color>
 </resources>

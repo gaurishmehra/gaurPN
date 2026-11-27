@@ -6,6 +6,12 @@ import android.os.Build
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.material3.Text
@@ -17,6 +23,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -28,6 +35,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.data.TransferSettingsRepository
 import dev.gaurish.outlinelite.transfer.allFilesAccessIntent
 import dev.gaurish.outlinelite.transfer.hasAllFilesAccess
+import dev.gaurish.outlinelite.ui.Motion
 import kotlinx.coroutines.launch
 
 /**
@@ -133,7 +141,7 @@ fun TransfersScreen(
             }
         }
 
-        if (allowFileRequests) {
+        RevealSetting(visible = allowFileRequests) {
             val grantAction: (@Composable () -> Unit)? = if (allFilesAccess) {
                 null
             } else {

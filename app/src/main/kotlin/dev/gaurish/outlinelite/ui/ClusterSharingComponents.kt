@@ -3,16 +3,22 @@ package dev.gaurish.outlinelite.ui
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -34,6 +40,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -42,7 +49,9 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -53,6 +62,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -62,6 +75,7 @@ import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.TrustedDeviceRepository
 import dev.gaurish.outlinelite.transfer.ClusterPeer
+import dev.gaurish.outlinelite.transfer.RelayLinkPhase
 import dev.gaurish.outlinelite.transfer.RelayManager
 import dev.gaurish.outlinelite.transfer.TransferState
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
@@ -79,13 +93,29 @@ fun LanAccessRow(
     val context = LocalContext.current
     val scheme = MaterialTheme.colorScheme
     var showWarningDialog by remember { mutableStateOf(false) }
+    val connected = status.phase == TunnelPhase.CONNECTED
+    val lanOn = status.allowLanAccess
+    val borderColor by animateColorAsState(
+        targetValue = if (lanOn) {
+            scheme.primary.copy(alpha = 0.6f)
+        } else {
+            scheme.outlineVariant.copy(alpha = 0.5f)
+        },
+        animationSpec = Motion.base(),
+        label = "lan_border",
+    )
+    val fillColor by animateColorAsState(
+        targetValue = if (lanOn) scheme.primary.copy(alpha = 0.06f) else scheme.surface,
+        animationSpec = Motion.base(),
+        label = "lan_fill",
+    )
 
     Row(
         modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(14.dp))
-            .background(scheme.surface)
-            .border(1.dp, scheme.outlineVariant.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
+            .background(fillColor)
+            .border(1.dp, borderColor, RoundedCornerShape(14.dp))
             .padding(horizontal = 16.dp, vertical = 10.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -97,13 +127,18 @@ fun LanAccessRow(
                 color = scheme.onSurface,
             )
             Text(
-                "Reach printers and smart devices on your Wi-Fi without the VPN.",
-                fontSize = 11.sp,
+                if (connected) {
+                    "Printers and smart devices on your Wi-Fi stay off the tunnel."
+                } else {
+                    "Available while the VPN is on."
+                },
+                fontSize = 13.sp,
+                lineHeight = 18.sp,
                 color = scheme.onSurfaceVariant,
             )
         }
         Switch(
-            checked = status.allowLanAccess,
+            checked = lanOn,
             onCheckedChange = { willEnable ->
                 if (willEnable) {
                     showWarningDialog = true
@@ -111,6 +146,7 @@ fun LanAccessRow(
                     TunnelService.toggleLanAccess(context)
                 }
             },
+            enabled = connected,
             colors = SwitchDefaults.colors(
                 checkedTrackColor = scheme.primary,
                 checkedThumbColor = scheme.onPrimary,
@@ -154,15 +190,15 @@ fun ClusterSharingSection(
     modifier: Modifier = Modifier,
     embedded: Boolean = false,
     showHeader: Boolean = true,
+    relayLink: RelayLinkPhase = RelayLinkPhase.ONLINE,
 ) {
     val context = LocalContext.current
     val scheme = MaterialTheme.colorScheme
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
-    val transferState by RelayManager.transferState.collectAsStateWithLifecycle()
     val token by KeyRepository.observeClusterToken(context).collectAsStateWithLifecycle(initialValue = "")
+    val motionEnabled = rememberMotionEnabled()
 
     var targetPeerForPicker by remember { mutableStateOf<ClusterPeer?>(null) }
-    var browsePeer by remember { mutableStateOf<ClusterPeer?>(null) }
     val filePickerLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris: List<Uri> ->
@@ -174,13 +210,6 @@ fun ClusterSharingSection(
     }
 
     Column(modifier = modifier.fillMaxWidth()) {
-    if (transferState !is TransferState.Idle) {
-        TransferDialog(
-            state = transferState,
-            onDismiss = { RelayManager.dismissTransfer() },
-        )
-    }
-
         val containerModifier = if (embedded) {
             Modifier.fillMaxWidth()
         } else {
@@ -214,17 +243,17 @@ fun ClusterSharingSection(
                     }
                     Text(
                         "Add your sharing key in Settings to send files between your devices. Files stay encrypted inside the VPN tunnel.",
-                        fontSize = 13.sp,
-                        lineHeight = 18.sp,
+                        fontSize = 14.sp,
+                        lineHeight = 20.sp,
                         color = scheme.onSurfaceVariant,
                     )
                     Spacer(Modifier.height(10.dp))
                     OutlinedButton(
                         onClick = onOpenSettings,
-                        modifier = Modifier.heightIn(min = 40.dp),
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
+                        modifier = Modifier.heightIn(min = 44.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp),
                     ) {
-                        Text("Open settings", fontSize = 13.sp)
+                        Text("Open settings", fontSize = 14.sp)
                     }
                 }
             } else {
@@ -242,7 +271,13 @@ fun ClusterSharingSection(
                                         .size(8.dp)
                                         .clip(CircleShape)
                                         .background(
-                                            if (otherPeers.isEmpty()) scheme.outline else scheme.primary
+                                            when {
+                                                relayLink == RelayLinkPhase.AUTH_FAILED ||
+                                                    relayLink == RelayLinkPhase.UNREACHABLE ->
+                                                    scheme.error
+                                                otherPeers.isEmpty() -> scheme.outline
+                                                else -> scheme.primary
+                                            }
                                         ),
                                 )
                                 Spacer(Modifier.width(8.dp))
@@ -254,8 +289,13 @@ fun ClusterSharingSection(
                                 )
                             }
                             Text(
-                                "${otherPeers.size} online",
-                                fontSize = 12.sp,
+                                when {
+                                    relayLink == RelayLinkPhase.AUTH_FAILED -> "Key rejected"
+                                    relayLink == RelayLinkPhase.UNREACHABLE -> "Relay unreachable"
+                                    relayLink == RelayLinkPhase.CONNECTING -> "Connecting"
+                                    else -> "${otherPeers.size} online"
+                                },
+                                fontSize = 13.sp,
                                 color = scheme.onSurfaceVariant,
                             )
                         }
@@ -264,61 +304,55 @@ fun ClusterSharingSection(
 
                     if (otherPeers.isEmpty()) {
                         Text(
-                            "No other devices are online. Connect the VPN on the device you want to reach.",
-                            fontSize = 13.sp,
-                            lineHeight = 18.sp,
+                            when (relayLink) {
+                                RelayLinkPhase.AUTH_FAILED ->
+                                    "The relay rejected this cluster key. Check that every " +
+                                        "device uses the same key."
+                                RelayLinkPhase.UNREACHABLE ->
+                                    "Can't reach the relay. Check the relay address and " +
+                                        "the VPN connection."
+                                RelayLinkPhase.CONNECTING ->
+                                    "Connecting to the relay\u2026"
+                                else ->
+                                    "No other devices are online. Both devices need the VPN " +
+                                        "on and the same cluster key."
+                            },
+                            fontSize = 14.sp,
+                            lineHeight = 20.sp,
                             color = scheme.onSurfaceVariant,
                         )
                     } else {
-                        otherPeers.forEachIndexed { index, peer ->
-                            PeerRow(
-                                peer = peer,
-                                onSendClick = {
-                                    targetPeerForPicker = peer
-                                    filePickerLauncher.launch("*/*")
-                                },
-                                onBrowseClick = { browsePeer = peer },
-                            )
-                            if (index != otherPeers.lastIndex) {
-                                HorizontalDivider(
-                                    color = scheme.outlineVariant,
-                                    thickness = 1.dp,
-                                )
+                        Column(Modifier.animateContentSize(Motion.spatialFast())) {
+                            otherPeers.forEachIndexed { index, peer ->
+                                key(peer.id) {
+                                    Reveal(
+                                        order = index.coerceAtMost(4),
+                                        enabled = motionEnabled,
+                                    ) {
+                                        PeerRow(
+                                            peer = peer,
+                                            onSendClick = {
+                                                targetPeerForPicker = peer
+                                                filePickerLauncher.launch("*/*")
+                                            },
+                                            // A tap on Browse is an explicit,
+                                            // non-destructive request; the old
+                                            // confirm step only added friction.
+                                            onBrowseClick = { onBrowsePeer(peer) },
+                                        )
+                                    }
+                                }
+                                if (index != otherPeers.lastIndex) {
+                                    HorizontalDivider(
+                                        color = scheme.outlineVariant,
+                                        thickness = 1.dp,
+                                    )
+                                }
                             }
                         }
                     }
                 }
             }
-        }
-
-        browsePeer?.let { peer ->
-            AlertDialog(
-                onDismissRequest = { browsePeer = null },
-                title = { Text("Browse files") },
-                text = {
-                    Text(
-                        "Open ${peer.name}'s shared folders and download what you pick " +
-                            "over the encrypted tunnel.",
-                        fontSize = 13.sp,
-                        color = scheme.onSurfaceVariant,
-                    )
-                },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            browsePeer = null
-                            onBrowsePeer(peer)
-                        },
-                    ) {
-                        Text("Browse ${peer.name}'s files")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { browsePeer = null }) {
-                        Text("Cancel")
-                    }
-                },
-            )
         }
     }
 }
@@ -334,6 +368,7 @@ fun ShareTargetDialog(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
+    val link by RelayManager.link.collectAsStateWithLifecycle()
     val token by KeyRepository.observeClusterToken(context).collectAsStateWithLifecycle(initialValue = "")
     val trustedDevices by TrustedDeviceRepository.observe(context)
         .collectAsStateWithLifecycle(initialValue = emptyList())
@@ -346,9 +381,14 @@ fun ShareTargetDialog(
     val hasAvailablePeers = isVpnConnected && otherPeers.isNotEmpty()
     val emptyStateMessage = when {
         !isVpnConnected && tunnelStatus.phase == TunnelPhase.CONNECTING -> R.string.share_waiting_for_vpn
+        !isVpnConnected && tunnelStatus.phase == TunnelPhase.RECONNECTING ->
+            R.string.share_vpn_reconnecting
         !isVpnConnected && tunnelStatus.phase == TunnelPhase.STOPPING -> R.string.share_vpn_stopping
         !isVpnConnected -> R.string.share_connect_vpn
         token.isBlank() -> R.string.share_configure_cluster
+        link == RelayLinkPhase.AUTH_FAILED -> R.string.share_relay_auth_failed
+        link == RelayLinkPhase.UNREACHABLE -> R.string.share_relay_unreachable
+        link == RelayLinkPhase.CONNECTING -> R.string.share_relay_connecting
         else -> R.string.share_no_devices
     }
 
@@ -446,7 +486,7 @@ fun ShareTargetDialog(
                                 onDismiss()
                             },
                         ) {
-                            Text("Send to all ${otherPeers.size} devices", fontSize = 12.sp)
+                            Text("Send to all ${otherPeers.size} devices", fontSize = 13.sp)
                         }
                     }
                 }
@@ -455,7 +495,7 @@ fun ShareTargetDialog(
                     Spacer(Modifier.height(12.dp))
                     Text(
                         "Offline. Queued until it reconnects.",
-                        fontSize = 12.sp,
+                        fontSize = 13.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                     Spacer(Modifier.height(6.dp))
@@ -502,6 +542,11 @@ fun ShareTargetDialog(
                         Text(stringResource(R.string.share_connecting))
                     }
                 }
+                tunnelStatus.phase == TunnelPhase.RECONNECTING -> {
+                    Button(onClick = {}, enabled = false) {
+                        Text(stringResource(R.string.status_reconnecting))
+                    }
+                }
                 tunnelStatus.phase == TunnelPhase.STOPPING -> {
                     Button(onClick = {}, enabled = false) {
                         Text(stringResource(R.string.share_disconnecting))
@@ -530,59 +575,169 @@ private fun PeerRow(
     onBrowseClick: (() -> Unit)? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
+    val haptics = rememberHaptics()
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 56.dp)
-            .then(
-                if (onBrowseClick != null) {
-                    Modifier.clickable(
-                        onClickLabel = "Browse files",
-                        onClick = onBrowseClick,
-                    )
-                } else {
-                    Modifier
-                }
-            )
+            .heightIn(min = 64.dp)
             .padding(vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        // A monogram gives the row a fixed left edge, so a list of peers
+        // scans as a list of devices rather than a wall of names.
+        Box(
+            modifier = Modifier
+                .size(32.dp)
+                .clip(MaterialTheme.shapes.medium)
+                .background(scheme.surfaceContainerHigh)
+                .border(1.dp, scheme.outlineVariant, MaterialTheme.shapes.medium),
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                peer.name.trim().take(1).uppercase().ifBlank { "\u00B7" },
+                style = BenchType.Data,
+                color = scheme.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.width(8.dp))
         Column(modifier = Modifier.weight(1f)) {
             Text(
                 peer.name,
-                fontSize = 14.sp,
+                fontSize = 15.sp,
+                lineHeight = 20.sp,
                 fontWeight = FontWeight.Medium,
                 color = scheme.onSurface,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            // The section header already says who is online; the caption only
+            // exists when it adds a fact (power state). No caption, no gap.
             val battery = peer.battery
-            val meta = buildString {
-                if (battery != null) {
+            if (battery != null) {
+                val meta = buildString {
                     append(battery)
                     append('%')
-                    if (peer.charging == true) append(" charging")
-                } else {
-                    append("Online")
+                    if (peer.charging == true) append(" \u00B7 charging")
                 }
+                Text(
+                    meta,
+                    fontSize = 13.sp,
+                    lineHeight = 18.sp,
+                    color = scheme.onSurfaceVariant,
+                )
             }
-            Text(
-                meta,
-                fontSize = 11.sp,
-                color = scheme.onSurfaceVariant,
-            )
         }
 
-        OutlinedButton(
-            onClick = onSendClick,
-            modifier = Modifier.heightIn(min = 40.dp),
-            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 14.dp),
-            border = BorderStroke(1.dp, scheme.outline),
-            colors = ButtonDefaults.outlinedButtonColors(contentColor = scheme.primary),
-        ) {
-            Text(actionLabel, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        // Both cluster actions are visible on the row. Browsing used to hide
+        // behind a row tap plus a confirmation dialog — a feature nobody can
+        // find is not a feature.
+        // Two explicit actions, two different weights. Browse is a quiet icon
+        // that opens the file tree; Send is the labelled control. Making both
+        // buttons compete made neither read as the primary action.
+        if (onBrowseClick != null) {
+            IconButton(
+                onClick = {
+                    haptics.select()
+                    onBrowseClick()
+                },
+                modifier = Modifier.semantics {
+                    contentDescription = "Browse files on ${peer.name}"
+                },
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_folder),
+                    contentDescription = null,
+                    tint = scheme.onSurfaceVariant,
+                )
+            }
         }
+        // Two actions of the same weight: both are icons, and the accent
+        // marks the one that starts the transfer. The label survives as the
+        // accessible name instead of as row furniture.
+        IconButton(
+            onClick = {
+                haptics.select()
+                onSendClick()
+            },
+            modifier = Modifier.semantics {
+                contentDescription = "$actionLabel to ${peer.name}"
+            },
+        ) {
+            Icon(
+                painter = painterResource(R.drawable.ic_send),
+                contentDescription = null,
+                tint = scheme.primary,
+            )
+        }
+    }
+}
+
+private enum class TransferPhase { Idle, Sending, Receiving, Completed, Error }
+
+/**
+ * A stable snapshot of the dialog's state. Progress changes arrive many times
+ * per second, so the transition is keyed on [phase] instead of the whole
+ * object: the bar updates in place, and only a real phase change animates.
+ */
+private data class TransferUi(
+    val phase: TransferPhase,
+    val title: String,
+    val fileName: String?,
+    val progress: Float,
+    val speedMbPerSec: Float,
+    val message: String?,
+)
+
+private fun TransferState.toUi(): TransferUi = when (this) {
+    is TransferState.Idle -> TransferUi(TransferPhase.Idle, "", null, 0f, 0f, null)
+    is TransferState.Sending -> TransferUi(
+        phase = TransferPhase.Sending,
+        title = "Sending to $peerName",
+        fileName = fileName,
+        progress = progress,
+        speedMbPerSec = speedMbPerSec,
+        message = null,
+    )
+    is TransferState.Receiving -> TransferUi(
+        phase = TransferPhase.Receiving,
+        title = "Receiving from $peerName",
+        fileName = fileName,
+        progress = progress,
+        speedMbPerSec = speedMbPerSec,
+        message = null,
+    )
+    is TransferState.Completed -> TransferUi(
+        phase = TransferPhase.Completed,
+        title = "Transfer complete",
+        fileName = null,
+        progress = 1f,
+        speedMbPerSec = 0f,
+        message = message,
+    )
+    is TransferState.Error -> TransferUi(
+        phase = TransferPhase.Error,
+        title = "Transfer failed",
+        fileName = null,
+        progress = 0f,
+        speedMbPerSec = 0f,
+        message = message,
+    )
+}
+
+/**
+ * App-wide transfer surface. The dialog is hosted above navigation so a
+ * transfer started from Browse, History, or a share sheet is still visible
+ * when the screen changes.
+ */
+@Composable
+fun TransferOverlay() {
+    val state by RelayManager.transferState.collectAsStateWithLifecycle()
+    if (state !is TransferState.Idle) {
+        TransferDialog(
+            state = state,
+            onDismiss = { RelayManager.dismissTransfer() },
+        )
     }
 }
 
@@ -592,66 +747,103 @@ private fun TransferDialog(
     onDismiss: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
+    val haptics = rememberHaptics()
+    val ui = state.toUi()
+
+    LaunchedEffect(ui.phase) {
+        when (ui.phase) {
+            TransferPhase.Completed -> haptics.confirm()
+            TransferPhase.Error -> haptics.reject()
+            else -> Unit
+        }
+    }
 
     AlertDialog(
         onDismissRequest = {
-            if (state is TransferState.Completed || state is TransferState.Error) {
+            if (ui.phase == TransferPhase.Completed || ui.phase == TransferPhase.Error) {
                 onDismiss()
             }
         },
         title = {
-            val titleText = when (state) {
-                is TransferState.Idle -> ""
-                is TransferState.Sending -> "Sending file"
-                is TransferState.Receiving -> "Receiving file"
-                is TransferState.Completed -> "Transfer complete"
-                is TransferState.Error -> "Transfer failed"
-            }
-            Text(
-                titleText,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Bold,
-                color = when (state) {
-                    is TransferState.Completed -> scheme.primary
-                    is TransferState.Error -> scheme.error
-                    else -> scheme.onSurface
+            AnimatedContent(
+                targetState = ui,
+                contentKey = { it.phase },
+                transitionSpec = {
+                    (
+                        fadeIn(tween(Motion.Base, easing = Motion.EmphasizedDecelerate)) +
+                            slideInVertically(
+                                animationSpec = tween(
+                                    Motion.Base,
+                                    easing = Motion.EmphasizedDecelerate,
+                                ),
+                                initialOffsetY = { it / 3 },
+                            )
+                        ).togetherWith(
+                        fadeOut(tween(Motion.Quick, easing = Motion.EmphasizedAccelerate)) +
+                            slideOutVertically(
+                                animationSpec = tween(
+                                    Motion.Quick,
+                                    easing = Motion.EmphasizedAccelerate,
+                                ),
+                                targetOffsetY = { -it / 3 },
+                            ),
+                    )
                 },
-            )
+                label = "transfer_title",
+            ) { target ->
+                Text(
+                    target.title,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = when (target.phase) {
+                        TransferPhase.Completed -> scheme.primary
+                        TransferPhase.Error -> scheme.error
+                        else -> scheme.onSurface
+                    },
+                )
+            }
         },
         text = {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                when (state) {
-                    is TransferState.Idle -> Unit
-                    is TransferState.Sending -> TransferFileProgress(
-                        fileName = state.fileName,
-                        progress = state.progress,
-                        speedMbPerSec = state.speedMbPerSec,
-                    )
-                    is TransferState.Receiving -> TransferFileProgress(
-                        fileName = state.fileName,
-                        progress = state.progress,
-                        speedMbPerSec = state.speedMbPerSec,
-                    )
-                    is TransferState.Completed -> {
-                        Text(
-                            state.message,
-                            fontSize = 14.sp,
-                            color = scheme.onSurfaceVariant,
-                        )
-                    }
-                    is TransferState.Error -> {
-                        Text(
-                            state.message,
-                            fontSize = 14.sp,
-                            color = scheme.error,
-                        )
+            AnimatedContent(
+                targetState = ui,
+                contentKey = { it.phase },
+                transitionSpec = {
+                    fadeIn(tween(Motion.Base, easing = Motion.EmphasizedDecelerate))
+                        .togetherWith(fadeOut(tween(Motion.Quick, easing = Motion.EmphasizedAccelerate)))
+                },
+                label = "transfer_body",
+            ) { target ->
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    when (target.phase) {
+                        TransferPhase.Idle -> Unit
+                        TransferPhase.Sending, TransferPhase.Receiving -> {
+                            TransferFileProgress(
+                                fileName = target.fileName.orEmpty(),
+                                progress = target.progress,
+                                speedMbPerSec = target.speedMbPerSec,
+                            )
+                        }
+                        TransferPhase.Completed -> {
+                            Text(
+                                target.message.orEmpty(),
+                                fontSize = 14.sp,
+                                color = scheme.onSurfaceVariant,
+                            )
+                        }
+                        TransferPhase.Error -> {
+                            Text(
+                                target.message.orEmpty(),
+                                fontSize = 14.sp,
+                                color = scheme.error,
+                            )
+                        }
                     }
                 }
             }
         },
         confirmButton = {
-            when (state) {
-                is TransferState.Completed -> {
+            when (ui.phase) {
+                TransferPhase.Completed -> {
                     Button(
                         onClick = onDismiss,
                         colors = ButtonDefaults.buttonColors(containerColor = scheme.primary),
@@ -659,7 +851,7 @@ private fun TransferDialog(
                         Text("Done", color = scheme.onPrimary)
                     }
                 }
-                is TransferState.Error -> {
+                TransferPhase.Error -> {
                     Button(
                         onClick = onDismiss,
                         colors = ButtonDefaults.buttonColors(containerColor = scheme.error),
@@ -672,7 +864,7 @@ private fun TransferDialog(
                         onClick = {
                             RelayManager.cancelActiveTransfers()
                             onDismiss()
-                        }
+                        },
                     ) {
                         Text("Cancel")
                     }
@@ -693,6 +885,11 @@ private fun TransferFileProgress(
     speedMbPerSec: Float,
 ) {
     val scheme = MaterialTheme.colorScheme
+    val shown by animateFloatAsState(
+        targetValue = progress.coerceIn(0f, 1f),
+        animationSpec = tween(Motion.Base, easing = Motion.Linear),
+        label = "transfer_progress",
+    )
     Text(
         fileName,
         fontSize = 14.sp,
@@ -707,24 +904,27 @@ private fun TransferFileProgress(
         horizontalArrangement = Arrangement.SpaceBetween,
     ) {
         Text(
-            "${(progress * 100).toInt()}%",
-            fontSize = 12.sp,
+            "${(shown * 100).toInt()}%",
+            fontSize = 13.sp,
             color = scheme.onSurfaceVariant,
         )
         Text(
             "%.1f MB/s".format(speedMbPerSec),
-            fontSize = 12.sp,
+            fontSize = 13.sp,
             fontWeight = FontWeight.Medium,
             color = scheme.primary,
         )
     }
     Spacer(Modifier.height(10.dp))
     LinearProgressIndicator(
-        progress = { progress },
+        progress = { shown },
         modifier = Modifier
             .fillMaxWidth()
             .height(6.dp)
-            .clip(RoundedCornerShape(3.dp)),
+            .clip(RoundedCornerShape(3.dp))
+            .semantics {
+                contentDescription = "$fileName, ${(shown * 100).toInt()} percent"
+            },
         color = scheme.primary,
         trackColor = scheme.outlineVariant,
     )

@@ -4,7 +4,17 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.widget.Toast
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,11 +28,13 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.DropdownMenu
@@ -32,10 +44,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -43,8 +55,11 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.RectangleShape
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
@@ -73,12 +88,24 @@ fun ServersScreen(
     onSelect: (AccessKey) -> Unit,
     onRename: (AccessKey, String) -> Unit,
     onDelete: (AccessKey) -> Unit,
+    connected: Boolean = false,
+    startInAdd: Boolean = false,
+    onStartInAddConsumed: () -> Unit = {},
 ) {
     val context = LocalContext.current
     var showAdd by remember { mutableStateOf(false) }
     var keyToDelete by remember { mutableStateOf<AccessKey?>(null) }
     var keyToRename by remember { mutableStateOf<AccessKey?>(null) }
     val scheme = MaterialTheme.colorScheme
+
+    // "Add server" on Home lands directly on the paste field instead of
+    // making the user find the same button twice.
+    LaunchedEffect(startInAdd) {
+        if (startInAdd) {
+            onStartInAddConsumed()
+            showAdd = true
+        }
+    }
 
     val copyKey: (AccessKey) -> Unit = { key ->
         val manager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
@@ -94,7 +121,7 @@ fun ServersScreen(
         Modifier
             .fillMaxSize()
             .background(scheme.background)
-            .systemBarsPadding(),
+            .statusBarsPadding(),
         contentAlignment = Alignment.TopCenter,
     ) {
     Column(
@@ -105,7 +132,9 @@ fun ServersScreen(
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            // 20 dp minus the icon button's own inset keeps "Servers" on the
+            // same left edge as every other screen title.
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
         ) {
             IconButton(onClick = onBack, modifier = Modifier.size(48.dp)) {
                 Icon(
@@ -116,8 +145,7 @@ fun ServersScreen(
             }
             Text(
                 "Servers",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.SemiBold,
+                style = BenchType.Title,
                 color = scheme.onBackground,
                 modifier = Modifier.weight(1f),
             )
@@ -131,7 +159,23 @@ fun ServersScreen(
         }
 
         if (loading) {
-            Box(Modifier.fillMaxSize())
+            SkeletonHost {
+                Column(
+                    Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 20.dp, vertical = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    repeat(5) {
+                        SkeletonBox(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(64.dp),
+                            shape = MaterialTheme.shapes.medium,
+                        )
+                    }
+                }
+            }
         } else if (keys.isEmpty()) {
             Box(
                 Modifier
@@ -165,29 +209,56 @@ fun ServersScreen(
                     .padding(horizontal = 20.dp),
                 contentPadding = PaddingValues(top = 8.dp, bottom = 32.dp),
             ) {
-                item {
-                    Surface(
-                        color = scheme.surface,
-                        shape = MaterialTheme.shapes.medium,
+                itemsIndexed(keys, key = { _, key -> key.id }) { index, key ->
+                    // Rounded ends on the first and last row keep the
+                    // group-panel look while each row owns its own item
+                    // identity, so deletion and reordering can animate.
+                    val shape = when {
+                        keys.size == 1 -> MaterialTheme.shapes.medium
+                        index == 0 -> RoundedCornerShape(
+                            topStart = 8.dp,
+                            topEnd = 8.dp,
+                            bottomStart = 0.dp,
+                            bottomEnd = 0.dp,
+                        )
+                        index == keys.lastIndex -> RoundedCornerShape(
+                            topStart = 0.dp,
+                            topEnd = 0.dp,
+                            bottomStart = 8.dp,
+                            bottomEnd = 8.dp,
+                        )
+                        else -> RectangleShape
+                    }
+                    Column(
+                        modifier = Modifier
+                            .animateItem(
+                                fadeInSpec = tween(
+                                    Motion.Base,
+                                    easing = Motion.EmphasizedDecelerate,
+                                ),
+                                placementSpec = Motion.spatial(),
+                                fadeOutSpec = tween(
+                                    Motion.Exit,
+                                    easing = Motion.EmphasizedAccelerate,
+                                ),
+                            )
+                            .clip(shape)
+                            .background(scheme.surface),
                     ) {
-                        Column {
-                            keys.forEachIndexed { index, key ->
-                                ServerRow(
-                                    key = key,
-                                    selected = key.id == activeId,
-                                    onSelect = onSelect,
-                                    onRename = { keyToRename = key },
-                                    onShare = { copyKey(key) },
-                                    onDelete = { keyToDelete = key },
-                                )
-                                if (index != keys.lastIndex) {
-                                    HorizontalDivider(
-                                        color = scheme.outlineVariant,
-                                        thickness = 1.dp,
-                                        modifier = Modifier.padding(start = 20.dp),
-                                    )
-                                }
-                            }
+                        ServerRow(
+                            key = key,
+                            selected = key.id == activeId,
+                            onSelect = onSelect,
+                            onRename = { keyToRename = key },
+                            onShare = { copyKey(key) },
+                            onDelete = { keyToDelete = key },
+                        )
+                        if (index != keys.lastIndex) {
+                            HorizontalDivider(
+                                color = scheme.outlineVariant,
+                                thickness = 1.dp,
+                                modifier = Modifier.padding(start = 20.dp),
+                            )
                         }
                     }
                 }
@@ -222,7 +293,14 @@ fun ServersScreen(
             title = { Text("Delete ${target.name.ifBlank { target.displayAddress() }}?") },
             text = {
                 Text(
-                    "This removes the key from this device. You can add it again with its ss:// link.",
+                    if (connected && target.id == activeId) {
+                        "You're connected through this server. Deleting disconnects " +
+                            "the VPN and removes the key from this device. You can add " +
+                            "it again with its ss:// link."
+                    } else {
+                        "This removes the key from this device. You can add it again " +
+                            "with its ss:// link."
+                    },
                     fontSize = 14.sp,
                     lineHeight = 20.sp,
                 )
@@ -256,25 +334,55 @@ private fun ServerRow(
     onDelete: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
+    val haptics = rememberHaptics()
+    val interaction = remember { MutableInteractionSource() }
     var menuOpen by remember { mutableStateOf(false) }
+    val background by animateColorAsState(
+        targetValue = if (selected) scheme.primary.copy(alpha = 0.07f) else Color.Transparent,
+        animationSpec = Motion.base(),
+        label = "server_row_tint",
+    )
+    val dotColor by animateColorAsState(
+        targetValue = if (selected) scheme.primary else scheme.outlineVariant,
+        animationSpec = Motion.base(),
+        label = "server_dot",
+    )
+    val dotScale = animateFloatAsState(
+        targetValue = if (selected) 1.4f else 1f,
+        animationSpec = Motion.spatialFast(),
+        label = "server_dot_scale",
+    )
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 60.dp)
+            .pressScale(interaction)
+            // Drawn, not composed: animating this tint through `.background`
+            // would recompose the row on every frame of the selection change.
+            .drawBehind { drawRect(background) }
             .selectable(
                 selected = selected,
+                interactionSource = interaction,
+                indication = LocalIndication.current,
                 role = Role.RadioButton,
-                onClick = { onSelect(key) },
+                onClick = {
+                    haptics.select()
+                    onSelect(key)
+                },
             )
+            .heightIn(min = 60.dp)
             .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
             Modifier
                 .size(8.dp)
+                .graphicsLayer {
+                    scaleX = dotScale.value
+                    scaleY = dotScale.value
+                }
                 .clip(androidx.compose.foundation.shape.CircleShape)
-                .background(if (selected) scheme.primary else scheme.outlineVariant)
+                .background(dotColor)
         )
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
@@ -294,10 +402,20 @@ private fun ServerRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        if (selected) {
+        AnimatedVisibility(
+            visible = selected,
+            enter = fadeIn(tween(Motion.Base)) +
+                expandHorizontally(
+                    animationSpec = tween(Motion.Base, easing = Motion.EmphasizedDecelerate),
+                ),
+            exit = fadeOut(tween(Motion.Quick)) +
+                shrinkHorizontally(
+                    animationSpec = tween(Motion.Quick, easing = Motion.EmphasizedAccelerate),
+                ),
+        ) {
             Text(
                 "Active",
-                style = BenchType.Micro,
+                style = BenchType.Label,
                 color = scheme.primary,
                 modifier = Modifier.padding(horizontal = 8.dp),
             )

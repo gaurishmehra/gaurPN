@@ -21,6 +21,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,8 +49,8 @@ fun DnsScreen(onBack: () -> Unit) {
     val dnsServers by KeyRepository.observeDnsServers(context)
         .collectAsStateWithLifecycle(initialValue = KeyRepository.DEFAULT_DNS_SERVERS)
 
-    var draftMode by remember(dnsMode) { mutableStateOf(dnsMode) }
-    var draftServers by remember(dnsServers) { mutableStateOf(dnsServers) }
+    var draftMode by rememberSaveable(dnsMode) { mutableStateOf(dnsMode) }
+    var draftServers by rememberSaveable(dnsServers) { mutableStateOf(dnsServers) }
 
     SettingsScaffold(title = "DNS Resolver", onBack = onBack) {
         SectionLabel("Resolver")
@@ -78,7 +79,7 @@ fun DnsScreen(onBack: () -> Unit) {
             }
         }
 
-        if (draftMode != DnsMode.SYSTEM) {
+        RevealSetting(visible = draftMode != DnsMode.SYSTEM) {
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
                 value = draftServers,

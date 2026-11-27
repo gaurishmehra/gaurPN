@@ -92,7 +92,7 @@ fun MediaScreen(onBack: () -> Unit) {
             },
             onClick = { MediaSessionBridge.refresh(context) },
         )
-        if (mediaSync && !notificationAccess) {
+        RevealSetting(visible = mediaSync && !notificationAccess) {
             SettingsRow(
                 title = "Notification access",
                 summary = "Required to read media sessions",

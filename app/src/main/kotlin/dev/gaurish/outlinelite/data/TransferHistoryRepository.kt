@@ -4,7 +4,9 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import org.json.JSONArray
 import org.json.JSONObject
@@ -36,8 +38,15 @@ object TransferHistoryRepository {
     private val HISTORY = stringPreferencesKey("history_v1")
     private const val MAX_ENTRIES = 100
 
+    /**
+     * Decoding runs on IO, not in the collector's context. The collector is a
+     * Compose `collectAsStateWithLifecycle`, i.e. the main thread, so parsing
+     * the log inline here would block the frame that shows it.
+     */
     fun observe(context: Context): Flow<List<TransferHistoryEntry>> =
-        context.transferHistoryDataStore.data.map { decode(it[HISTORY]) }
+        context.transferHistoryDataStore.data
+            .map { decode(it[HISTORY]) }
+            .flowOn(Dispatchers.IO)
 
     suspend fun add(context: Context, entry: TransferHistoryEntry) {
         context.transferHistoryDataStore.edit { prefs ->

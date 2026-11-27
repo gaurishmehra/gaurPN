@@ -4,9 +4,11 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.os.Build
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -17,12 +19,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -37,6 +39,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -73,7 +76,7 @@ fun SplitTunnelScreen(onBack: () -> Unit) {
         .collectAsStateWithLifecycle(initialValue = emptySet())
 
     var apps by remember { mutableStateOf<List<InstalledApp>>(emptyList()) }
-    var searchQuery by remember { mutableStateOf("") }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
     var loading by remember { mutableStateOf(true) }
 
     LaunchedEffect(Unit) {
@@ -123,10 +126,12 @@ fun SplitTunnelScreen(onBack: () -> Unit) {
         Modifier
             .fillMaxSize()
             .background(scheme.background)
-            .systemBarsPadding()
+            .statusBarsPadding(),
+        contentAlignment = Alignment.TopCenter,
     ) {
         Column(
             Modifier
+                .widthIn(max = 720.dp)
                 .fillMaxSize()
                 .padding(horizontal = 20.dp)
         ) {
@@ -145,9 +150,8 @@ fun SplitTunnelScreen(onBack: () -> Unit) {
                 Spacer(Modifier.width(2.dp))
                 Text(
                     "Split tunneling",
-                    fontSize = 19.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = scheme.onBackground,
+                    style = BenchType.Title,
+                    color = MaterialTheme.colorScheme.onBackground,
                 )
             }
 
@@ -183,35 +187,94 @@ fun SplitTunnelScreen(onBack: () -> Unit) {
                 Text(
                     "${filteredApps.size} apps",
                     fontSize = 12.sp,
-                    color = scheme.onSurfaceVariant.copy(alpha = 0.7f),
+                    color = scheme.onSurfaceVariant,
                 )
             }
 
             Spacer(Modifier.height(8.dp))
 
             if (loading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(color = scheme.primary)
+                SkeletonHost {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(scheme.surface)
+                            .padding(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        repeat(8) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = 12.dp),
+                            ) {
+                                SkeletonBox(
+                                    modifier = Modifier.size(38.dp),
+                                    shape = RoundedCornerShape(8.dp),
+                                )
+                                Spacer(Modifier.width(14.dp))
+                                Column(Modifier.weight(1f)) {
+                                    SkeletonLine(widthFraction = 0.46f, height = 12)
+                                    Spacer(Modifier.height(6.dp))
+                                    SkeletonLine(widthFraction = 0.28f, height = 9)
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
-                LazyColumn(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .clip(RoundedCornerShape(18.dp))
-                        .background(scheme.surface),
-                    contentPadding = PaddingValues(8.dp),
-                ) {
-                    items(filteredApps, key = { it.packageName }) { app ->
-                        val isExcluded = excludedPackages.contains(app.packageName)
-                        AppRow(
-                            app = app,
-                            isExcluded = isExcluded,
-                            onToggle = {
-                                scope.launch {
-                                    SplitTunnelRepository.togglePackage(context, app.packageName)
-                                }
+                if (filteredApps.isEmpty()) {
+                    Box(
+                        Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(scheme.surface),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            if (searchQuery.isBlank()) {
+                                "No apps found."
+                            } else {
+                                "No apps match \"$searchQuery\"."
                             },
+                            fontSize = 13.sp,
+                            color = scheme.onSurfaceVariant,
                         )
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clip(RoundedCornerShape(18.dp))
+                            .background(scheme.surface),
+                        contentPadding = PaddingValues(8.dp),
+                    ) {
+                        items(filteredApps, key = { it.packageName }) { app ->
+                            val isExcluded = excludedPackages.contains(app.packageName)
+                            AppRow(
+                                app = app,
+                                isExcluded = isExcluded,
+                                onToggle = {
+                                    scope.launch {
+                                        SplitTunnelRepository.togglePackage(
+                                            context,
+                                            app.packageName,
+                                        )
+                                    }
+                                },
+                                modifier = Modifier.animateItem(
+                                    fadeInSpec = tween(
+                                        Motion.Base,
+                                        easing = Motion.EmphasizedDecelerate,
+                                    ),
+                                    placementSpec = Motion.spatial(),
+                                    fadeOutSpec = tween(
+                                        Motion.Exit,
+                                        easing = Motion.EmphasizedAccelerate,
+                                    ),
+                                ),
+                            )
+                        }
                     }
                 }
             }
@@ -224,21 +287,38 @@ private fun AppRow(
     app: InstalledApp,
     isExcluded: Boolean,
     onToggle: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val scheme = MaterialTheme.colorScheme
+    val haptics = rememberHaptics()
+    val background by animateColorAsState(
+        targetValue = if (isExcluded) {
+            scheme.primary.copy(alpha = 0.08f)
+        } else {
+            Color.Transparent
+        },
+        animationSpec = Motion.base(),
+        label = "app_row_tint",
+    )
+    val icon = remember(app.iconBitmap) { app.iconBitmap?.asImageBitmap() }
 
     Row(
         verticalAlignment = Alignment.CenterVertically,
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(12.dp))
-            .clickable(onClick = onToggle)
-            .background(if (isExcluded) scheme.primary.copy(alpha = 0.08f) else Color.Transparent)
+            .benchSurface(
+                shape = RoundedCornerShape(12.dp),
+                color = background,
+                onClick = {
+                    haptics.select()
+                    onToggle()
+                },
+            )
             .padding(horizontal = 12.dp, vertical = 8.dp),
     ) {
-        if (app.iconBitmap != null) {
+        if (icon != null) {
             Image(
-                bitmap = app.iconBitmap.asImageBitmap(),
+                bitmap = icon,
                 contentDescription = null,
                 modifier = Modifier.size(38.dp),
             )

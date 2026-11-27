@@ -51,7 +51,9 @@ import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.SplitTunnelRepository
 import dev.gaurish.outlinelite.data.ThemeMode
 import dev.gaurish.outlinelite.tunnel.TunnelState
+import dev.gaurish.outlinelite.transfer.RelayManager
 import dev.gaurish.outlinelite.ui.LanAccessRow
+import dev.gaurish.outlinelite.ui.rememberHaptics
 import kotlinx.coroutines.launch
 
 /**
@@ -73,6 +75,7 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val haptics = rememberHaptics()
 
     val autoReconnect by KeyRepository.observeAutoReconnect(context)
         .collectAsStateWithLifecycle(initialValue = true)
@@ -105,6 +108,7 @@ fun SettingsScreen(
     var showDeviceNameDialog by remember { mutableStateOf(false) }
     var draftDeviceName by remember { mutableStateOf("") }
     var showTokenDialog by remember { mutableStateOf(false) }
+    var showClearTokenConfirm by remember { mutableStateOf(false) }
     var draftToken by remember { mutableStateOf("") }
     var showRelayDialog by remember { mutableStateOf(false) }
     var draftRelay by remember { mutableStateOf("") }
@@ -246,7 +250,7 @@ fun SettingsScreen(
         )
         SettingsRow(
             title = "Trusted devices",
-            summary = "Choose which cluster devices can send files without approval",
+            summary = "Decide which devices can send, browse, or open things here",
             onClick = onOpenTrustedDevices,
             trailing = { Chevron() },
         )
@@ -349,7 +353,9 @@ fun SettingsScreen(
             text = {
                 Column {
                     Text(
-                        "Enter the cluster secret shared with your server relay and other devices. The key is obscured for security.",
+                        "Shared by the relay and every device in your cluster. Anyone " +
+                            "with this key can join the cluster and see your devices. " +
+                            "Treat it like a password.",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -379,8 +385,13 @@ fun SettingsScreen(
             },
             confirmButton = {
                 Button(
+                    enabled = draftToken.isNotBlank(),
                     onClick = {
-                        scope.launch { KeyRepository.setClusterToken(context, draftToken) }
+                        haptics.confirm()
+                        scope.launch {
+                            KeyRepository.setClusterToken(context, draftToken)
+                            RelayManager.onSettingsChanged(context)
+                        }
                         showTokenDialog = false
                     },
                 ) {
@@ -388,7 +399,57 @@ fun SettingsScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showTokenDialog = false }) {
+                Row {
+                    if (clusterToken.isNotBlank()) {
+                        TextButton(
+                            onClick = {
+                                showTokenDialog = false
+                                showClearTokenConfirm = true
+                            },
+                        ) {
+                            Text(
+                                "Remove key",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                    TextButton(onClick = { showTokenDialog = false }) {
+                        Text("Cancel")
+                    }
+                }
+            },
+        )
+    }
+
+    if (showClearTokenConfirm) {
+        AlertDialog(
+            onDismissRequest = { showClearTokenConfirm = false },
+            title = { Text("Remove sharing key?", fontWeight = FontWeight.SemiBold) },
+            text = {
+                Text(
+                    "File sharing and device sync stop on this device until you add " +
+                        "the key again. Other devices keep their copy.",
+                    fontSize = 14.sp,
+                    lineHeight = 20.sp,
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        haptics.reject()
+                        showClearTokenConfirm = false
+                        scope.launch {
+                            KeyRepository.setClusterToken(context, "")
+                            RelayManager.onSettingsChanged(context)
+                        }
+                    },
+                ) {
+                    Text("Remove key", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearTokenConfirm = false }) {
                     Text("Cancel")
                 }
             },
@@ -422,7 +483,10 @@ fun SettingsScreen(
                 Button(
                     enabled = isValid,
                     onClick = {
-                        scope.launch { KeyRepository.setRelayAddress(context, draftRelay) }
+                        scope.launch {
+                            KeyRepository.setRelayAddress(context, draftRelay)
+                            RelayManager.onSettingsChanged(context)
+                        }
                         showRelayDialog = false
                     },
                 ) {
@@ -489,7 +553,8 @@ fun SettingsScreen(
     }
 }
 
-private fun openBatterySettings(context: Context, batteryExempt: Boolean) {    val intent = if (batteryExempt) {
+private fun openBatterySettings(context: Context, batteryExempt: Boolean) {
+    val intent = if (batteryExempt) {
         Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
     } else {
         Intent(

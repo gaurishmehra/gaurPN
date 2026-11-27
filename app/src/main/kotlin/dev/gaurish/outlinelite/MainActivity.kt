@@ -16,10 +16,20 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.ContentTransform
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.shrinkVertically
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -28,12 +38,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.Surface
@@ -52,6 +67,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.platform.LocalConfiguration
@@ -74,12 +90,14 @@ import dev.gaurish.outlinelite.data.isValid
 import dev.gaurish.outlinelite.data.maskedToken
 import dev.gaurish.outlinelite.transfer.ClipboardSyncManager
 import dev.gaurish.outlinelite.transfer.ClusterPeer
+import dev.gaurish.outlinelite.transfer.RelayManager
 import dev.gaurish.outlinelite.transfer.MediaSessionBridge
 import dev.gaurish.outlinelite.transfer.NotificationMirrorManager
 import dev.gaurish.outlinelite.tunnel.TunnelPhase
 import dev.gaurish.outlinelite.tunnel.TunnelService
 import dev.gaurish.outlinelite.tunnel.TunnelState
 import dev.gaurish.outlinelite.ui.BrowseScreen
+import dev.gaurish.outlinelite.ui.BrowseSort
 import dev.gaurish.outlinelite.ui.HistoryScreen
 import dev.gaurish.outlinelite.ui.HomeScreen
 import dev.gaurish.outlinelite.ui.Motion
@@ -88,6 +106,7 @@ import dev.gaurish.outlinelite.ui.ServersScreen
 import dev.gaurish.outlinelite.ui.ShareTargetDialog
 import dev.gaurish.outlinelite.ui.Screens
 import dev.gaurish.outlinelite.ui.SplitTunnelScreen
+import dev.gaurish.outlinelite.ui.TransferOverlay
 import dev.gaurish.outlinelite.ui.TrustedDevicesScreen
 import dev.gaurish.outlinelite.ui.settings.ClipboardSyncScreen
 import dev.gaurish.outlinelite.ui.settings.DnsScreen
@@ -188,17 +207,26 @@ class MainActivity : ComponentActivity() {
                         widthClass != WindowWidthSizeClass.Expanded ||
                             configuration.screenHeightDp < 560
                     var screen by rememberSaveable { mutableIntStateOf(Screens.HOME) }
+                    var historyOrigin by rememberSaveable { mutableIntStateOf(Screens.HOME) }
+                    var addServerOnOpen by remember { mutableStateOf(false) }
+                    var browseSort by rememberSaveable { mutableStateOf(BrowseSort.NAME) }
+                    var browseAscending by rememberSaveable { mutableStateOf(true) }
                     var browsePeer by remember { mutableStateOf<ClusterPeer?>(null) }
                     val displayedScreen =
                         if (screen == Screens.BROWSE && browsePeer == null) Screens.HOME else screen
                     val showNavigation = displayedScreen != Screens.BROWSE
                     val selectedTab = tabOf(displayedScreen)
+                    val onSelectTab: (Int) -> Unit = { target ->
+                        if (target == Screens.HISTORY) historyOrigin = Screens.HOME
+                        screen = target
+                    }
 
                     BackHandler(
                         enabled = displayedScreen != Screens.HOME && displayedScreen != Screens.BROWSE,
                     ) {
                         screen = when (displayedScreen) {
                             Screens.SETTINGS, Screens.SERVERS -> Screens.HOME
+                            Screens.HISTORY -> historyOrigin
                             else -> Screens.SETTINGS
                         }
                     }
@@ -207,15 +235,7 @@ class MainActivity : ComponentActivity() {
                     AnimatedContent(
                         targetState = displayedScreen,
                         transitionSpec = {
-                            (
-                                fadeIn(tween(Motion.Screen, easing = Motion.Decelerate)) +
-                                    scaleIn(
-                                        initialScale = 0.985f,
-                                        animationSpec = tween(Motion.Screen, easing = Motion.Decelerate),
-                                    )
-                                ).togetherWith(
-                                fadeOut(tween(90, easing = Motion.Accelerate)),
-                            )
+                            screenTransition(from = initialState, to = targetState)
                         },
                         label = "screen",
                         modifier = Modifier
@@ -228,6 +248,12 @@ class MainActivity : ComponentActivity() {
                             if (peer != null) {
                                 BrowseScreen(
                                     peer = peer,
+                                    sort = browseSort,
+                                    ascending = browseAscending,
+                                    onSortChange = { key, asc ->
+                                        browseSort = key
+                                        browseAscending = asc
+                                    },
                                     onBack = { screen = Screens.HOME },
                                 )
                             }
@@ -235,7 +261,10 @@ class MainActivity : ComponentActivity() {
                         Screens.TRANSFERS -> {
                             TransfersScreen(
                                 onBack = { screen = Screens.SETTINGS },
-                                onOpenHistory = { screen = Screens.HISTORY },
+                                onOpenHistory = {
+                                    historyOrigin = Screens.TRANSFERS
+                                    screen = Screens.HISTORY
+                                },
                             )
                         }
                         Screens.MEDIA -> {
@@ -254,7 +283,7 @@ class MainActivity : ComponentActivity() {
                             TrustedDevicesScreen(onBack = { screen = Screens.SETTINGS })
                         }
                         Screens.HISTORY -> {
-                            HistoryScreen(onBack = { screen = Screens.HOME })
+                            HistoryScreen(onBack = { screen = historyOrigin })
                         }
                         Screens.SPLIT_TUNNEL -> {
                             SplitTunnelScreen(onBack = { screen = Screens.SETTINGS })
@@ -287,8 +316,21 @@ class MainActivity : ComponentActivity() {
                                     scope.launch { KeyRepository.renameKey(applicationContext, key.id, newName) }
                                 },
                                 onDelete = { key ->
-                                    scope.launch { KeyRepository.removeKey(applicationContext, key.id) }
+                                    // Deleting the key that is carrying the
+                                    // tunnel would leave the UI pointing at a
+                                    // server the engine is no longer using.
+                                    if (status.activeId == key.id &&
+                                        status.phase != TunnelPhase.DISCONNECTED
+                                    ) {
+                                        TunnelService.stop(this@MainActivity)
+                                    }
+                                    scope.launch {
+                                        KeyRepository.removeKey(applicationContext, key.id)
+                                    }
                                 },
+                                connected = status.phase == TunnelPhase.CONNECTED,
+                                startInAdd = addServerOnOpen,
+                                onStartInAddConsumed = { addServerOnOpen = false },
                             )
                         }
                         Screens.SETTINGS -> {
@@ -329,8 +371,14 @@ class MainActivity : ComponentActivity() {
                                         else -> TunnelService.stop(this@MainActivity)
                                     }
                                 },
-                                onOpenServers = { screen = Screens.SERVERS },
-                                onOpenHistory = { screen = Screens.HISTORY },
+                                onAddServer = {
+                                    addServerOnOpen = true
+                                    screen = Screens.SERVERS
+                                },
+                                onOpenHistory = {
+                                    historyOrigin = Screens.HOME
+                                    screen = Screens.HISTORY
+                                },
                                 onOpenSettings = { screen = Screens.SETTINGS },
                                 onBrowsePeer = { peer ->
                                     browsePeer = peer
@@ -344,27 +392,61 @@ class MainActivity : ComponentActivity() {
 
                     if (useRail) {
                         Row(Modifier.fillMaxSize()) {
-                            if (showNavigation) {
+                            AnimatedVisibility(
+                                visible = showNavigation,
+                                // The size change is instant on purpose: animating
+                                // a layout dimension re-measures the whole screen
+                                // on every frame, which is what a dropped frame
+                                // during navigation actually is. The fade carries
+                                // the arrival; the size does not participate.
+                                enter = expandHorizontally(
+                                    animationSpec = tween(0),
+                                    expandFrom = Alignment.Start,
+                                ) + fadeIn(tween(Motion.Base, easing = Motion.EmphasizedDecelerate)),
+                                exit = shrinkHorizontally(
+                                    animationSpec = tween(0),
+                                    shrinkTowards = Alignment.Start,
+                                ) + fadeOut(tween(Motion.Quick, easing = Motion.EmphasizedAccelerate)),
+                            ) {
                                 AppNavigation(
                                     selected = selectedTab,
                                     useRail = true,
-                                    onSelect = { screen = it },
+                                    onSelect = onSelectTab,
                                 )
                             }
-                            Box(Modifier.weight(1f).fillMaxHeight()) { content() }
+                            // The rail owns its own vertical insets; the screen
+                            // beside it still has to clear the gesture bar.
+                            Box(
+                                Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                                    .navigationBarsPadding()
+                            ) { content() }
                         }
                     } else {
                         Column(Modifier.fillMaxSize()) {
                             Box(Modifier.weight(1f).fillMaxSize()) { content() }
-                            if (showNavigation) {
+                            AnimatedVisibility(
+                                visible = showNavigation,
+                                enter = expandVertically(
+                                    animationSpec = tween(0),
+                                    expandFrom = Alignment.Bottom,
+                                ) + fadeIn(tween(Motion.Base, easing = Motion.EmphasizedDecelerate)),
+                                exit = shrinkVertically(
+                                    animationSpec = tween(0),
+                                    shrinkTowards = Alignment.Bottom,
+                                ) + fadeOut(tween(Motion.Quick, easing = Motion.EmphasizedAccelerate)),
+                            ) {
                                 AppNavigation(
                                     selected = selectedTab,
                                     useRail = false,
-                                    onSelect = { screen = it },
+                                    onSelect = onSelectTab,
                                 )
                             }
                         }
                     }
+
+                    TransferOverlay()
 
                     if (pendingSharedUris.isNotEmpty() || pendingSharedText != null) {
                         ShareTargetDialog(
@@ -426,10 +508,16 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         handleSsIntent(intent)
         handlePairingIntent(intent)
-        pendingSharedUris = sharedUrisFrom(intent)
-        persistSharedUris(pendingSharedUris)
-        pendingSharedText = sharedTextFrom(intent)
-        pendingOpenOnArrival = isOpenIntent(intent)
+        val uris = sharedUrisFrom(intent)
+        val text = sharedTextFrom(intent)
+        // A launcher tap or a key import must not dismiss a share that is
+        // already waiting for a destination.
+        if (uris.isNotEmpty() || text != null) {
+            pendingSharedUris = uris
+            persistSharedUris(uris)
+            pendingSharedText = text
+            pendingOpenOnArrival = isOpenIntent(intent)
+        }
     }
 
     /**
@@ -521,6 +609,7 @@ class MainActivity : ComponentActivity() {
                 KeyRepository.setRelayAddress(this@MainActivity, request.relay)
             }
             KeyRepository.setClusterToken(this@MainActivity, request.token)
+            RelayManager.onSettingsChanged(this@MainActivity)
             if (request.dns.isNotBlank()) {
                 KeyRepository.setDnsMode(this@MainActivity, DnsMode.ADGUARD)
                 KeyRepository.setDnsServers(this@MainActivity, request.dns)
@@ -676,18 +765,132 @@ private fun tabOf(screen: Int): Int = when (screen) {
     else -> Screens.SETTINGS
 }
 
+/** Left-to-right position of each top-level tab, used for transition direction. */
+private fun tabOrder(screen: Int): Int = when (tabOf(screen)) {
+    Screens.HOME -> 0
+    Screens.SERVERS -> 1
+    Screens.HISTORY -> 2
+    else -> 3
+}
+
+/**
+ * Hierarchy depth, used only to pick a transition direction. Siblings at the
+ * same depth crossfade in place; parents and children slide, so the back
+ * gesture retraces the path the user took forward.
+ */
+private fun screenDepth(screen: Int): Int = when (screen) {
+    Screens.HOME -> 0
+    Screens.SERVERS, Screens.HISTORY, Screens.SETTINGS -> 1
+    else -> 2
+}
+
+/**
+ * Every transition here is built on one rule: a screen is only half-visible for
+ * a very short time. A long crossfade leaves two screens legible at once, which
+ * reads as a ghost rather than as a movement, and it also keeps two full-screen
+ * surfaces on the GPU for the whole animation. So the travel is long and the
+ * fade is short: by the time the incoming screen has slid a fifth of the way it
+ * is already opaque, and the outgoing one is gone before it can show through.
+ */
+private fun AnimatedContentTransitionScope<Int>.screenTransition(
+    from: Int,
+    to: Int,
+): ContentTransform {
+    // 110 ms is short enough that the incoming surface is opaque before the eye
+    // can resolve the outgoing screen behind it, but not so short that the
+    // arrival looks like a cut.
+    val fadeInFast = tween<Float>(110, easing = Motion.EmphasizedDecelerate)
+    val fadeOutFast = tween<Float>(100, easing = Motion.EmphasizedAccelerate)
+
+    // A top-level tab switch travels along the tab order. A quarter of the width
+    // is enough for the direction to be unambiguous even at half animator scale.
+    val fromTab = tabOrder(from)
+    val toTab = tabOrder(to)
+    if (fromTab != toTab) {
+        val direction = if (toTab > fromTab) 1 else -1
+        val enter = fadeIn(fadeInFast) +
+            slideInHorizontally(
+                animationSpec = tween(Motion.Screen, easing = Motion.EmphasizedDecelerate),
+                initialOffsetX = { width -> direction * (width / 4) },
+            )
+        val exit = fadeOut(fadeOutFast) +
+            slideOutHorizontally(
+                animationSpec = tween(Motion.Exit, easing = Motion.EmphasizedAccelerate),
+                targetOffsetX = { width -> -direction * (width / 12) },
+            )
+        return enter togetherWith exit
+    }
+
+    val depthChange = screenDepth(to) - screenDepth(from)
+    if (depthChange == 0) {
+        // Siblings: fade-through, not crossfade. The outgoing surface is gone
+        // before the incoming one starts, so the two are never both readable.
+        val enter = fadeIn(
+            tween(Motion.Base, delayMillis = 110, easing = Motion.EmphasizedDecelerate)
+        ) + scaleIn(
+            initialScale = 0.98f,
+            animationSpec = tween(Motion.Medium, delayMillis = 110, easing = Motion.EmphasizedDecelerate),
+        )
+        val exit = fadeOut(tween(110, easing = Motion.EmphasizedAccelerate)) +
+            scaleOut(
+                targetScale = 1.01f,
+                animationSpec = tween(110, easing = Motion.EmphasizedAccelerate),
+            )
+        return enter togetherWith exit
+    }
+
+    // Hierarchy: the child slides over its parent while the parent sinks back.
+    val direction = if (depthChange > 0) 1 else -1
+    val enter = fadeIn(fadeInFast) +
+        slideInHorizontally(
+            animationSpec = tween(Motion.Screen, easing = Motion.EmphasizedDecelerate),
+            initialOffsetX = { width -> direction * (width / 5) },
+        ) + scaleIn(
+        initialScale = 0.985f,
+        animationSpec = tween(Motion.Screen, easing = Motion.EmphasizedDecelerate),
+    )
+    val exit = fadeOut(fadeOutFast) +
+        slideOutHorizontally(
+            animationSpec = tween(Motion.Exit, easing = Motion.EmphasizedAccelerate),
+            targetOffsetX = { width -> -direction * (width / 14) },
+        ) + scaleOut(
+        targetScale = 1.01f,
+        animationSpec = tween(Motion.Exit, easing = Motion.EmphasizedAccelerate),
+    )
+    return enter togetherWith exit
+}
+
 @Composable
 private fun AppNavigation(
     selected: Int,
     useRail: Boolean,
     onSelect: (Int) -> Unit,
 ) {
+    // The bar is a plane, not a stripe: same container family as a card, with
+    // one hairline where the screen meets it, and the accent only inside the
+    // selected indicator.
+    val navColors = NavigationBarItemDefaults.colors(
+        selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        selectedTextColor = MaterialTheme.colorScheme.onSurface,
+        indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    // Read outside the draw phase: a DrawScope lambda is not composable.
+    val hairline = MaterialTheme.colorScheme.outlineVariant
+    val railColors = NavigationRailItemDefaults.colors(
+        selectedIconColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        selectedTextColor = MaterialTheme.colorScheme.onSurface,
+        indicatorColor = MaterialTheme.colorScheme.primaryContainer,
+        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
     if (useRail) {
         NavigationRail(
             modifier = Modifier
                 .fillMaxHeight()
                 .width(96.dp),
-            containerColor = MaterialTheme.colorScheme.surface,
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
         ) {
             Spacer(Modifier.height(12.dp))
             navItems.forEach { item ->
@@ -702,12 +905,21 @@ private fun AppNavigation(
                     },
                     label = { Text(item.label) },
                     alwaysShowLabel = true,
+                    colors = railColors,
                 )
             }
         }
     } else {
         NavigationBar(
-            containerColor = MaterialTheme.colorScheme.surface,
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+            modifier = Modifier.drawBehind {
+                drawLine(
+                    color = hairline,
+                    start = Offset(0f, 0.5f),
+                    end = Offset(size.width, 0.5f),
+                    strokeWidth = 1.dp.toPx(),
+                )
+            },
         ) {
             navItems.forEach { item ->
                 NavigationBarItem(
@@ -720,6 +932,7 @@ private fun AppNavigation(
                         )
                     },
                     label = { Text(item.label) },
+                    colors = navColors,
                 )
             }
         }

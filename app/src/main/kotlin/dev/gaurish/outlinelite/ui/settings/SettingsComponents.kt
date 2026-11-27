@@ -1,7 +1,12 @@
 package dev.gaurish.outlinelite.ui.settings
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
@@ -14,7 +19,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
@@ -26,15 +31,27 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.gaurish.outlinelite.R
+import dev.gaurish.outlinelite.ui.Motion
+import dev.gaurish.outlinelite.ui.BenchType
+import dev.gaurish.outlinelite.ui.benchSurface
+import dev.gaurish.outlinelite.ui.rememberHaptics
 
 /** Brand switch styling shared by every settings toggle. */
 @Composable
@@ -42,12 +59,28 @@ fun GaurSwitch(
     checked: Boolean,
     onCheckedChange: (Boolean) -> Unit,
 ) {
+    val haptics = rememberHaptics()
+    // The write goes to DataStore, which emits on a later frame. Move the
+    // thumb now and reconcile when the real value arrives; a switch that
+    // waits for disk looks broken.
+    var shown by remember { mutableStateOf(checked) }
+    LaunchedEffect(checked) { shown = checked }
     Switch(
-        checked = checked,
-        onCheckedChange = onCheckedChange,
+        checked = shown,
+        onCheckedChange = { next ->
+            shown = next
+            haptics.select()
+            onCheckedChange(next)
+        },
         colors = SwitchDefaults.colors(
             checkedTrackColor = MaterialTheme.colorScheme.primary,
             checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+            checkedBorderColor = MaterialTheme.colorScheme.primary,
+            // The stock off state reads as disabled against graphite, so the
+            // resting track is lifted and the thumb carries real contrast.
+            uncheckedTrackColor = MaterialTheme.colorScheme.surfaceBright,
+            uncheckedThumbColor = MaterialTheme.colorScheme.onSurfaceVariant,
+            uncheckedBorderColor = MaterialTheme.colorScheme.outlineVariant,
         ),
     )
 }
@@ -63,16 +96,20 @@ fun Chevron() {
     )
 }
 
-/** Uppercase section heading used across settings screens. */
+/**
+ * Section heading. Sentence case at the same weight as the section headings on
+ * Home: a group of settings and a group of devices are the same structural
+ * idea, so they should not look like two different apps.
+ */
 @Composable
 fun SectionLabel(text: String) {
     Text(
-        text.uppercase(),
-        fontSize = 11.sp,
-        letterSpacing = 1.4.sp,
-        fontWeight = FontWeight.SemiBold,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(bottom = 8.dp, top = 12.dp),
+        text,
+        style = BenchType.Section,
+        color = MaterialTheme.colorScheme.onBackground,
+        modifier = Modifier
+            .padding(top = 20.dp, bottom = 10.dp)
+            .semantics { heading() },
     )
 }
 
@@ -113,8 +150,7 @@ fun ScreenHeader(
         Spacer(Modifier.width(2.dp))
         Text(
             title,
-            fontSize = 19.sp,
-            fontWeight = FontWeight.SemiBold,
+            style = BenchType.Title,
             color = MaterialTheme.colorScheme.onBackground,
         )
     }
@@ -135,7 +171,7 @@ fun SettingsScaffold(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .systemBarsPadding(),
+            .statusBarsPadding(),
         contentAlignment = Alignment.TopCenter,
     ) {
         Column(
@@ -143,7 +179,9 @@ fun SettingsScaffold(
                 .widthIn(max = 720.dp)
                 .fillMaxWidth()
                 .fillMaxHeight()
-                .padding(horizontal = 20.dp)
+                // Breathing room at the bottom so the last row never sits
+                // flush against the navigation bar.
+                .padding(start = 20.dp, end = 20.dp, bottom = 20.dp)
                 .verticalScroll(rememberScrollState())
         ) {
             ScreenHeader(title, onBack, showBack)
@@ -160,16 +198,26 @@ fun SettingsRow(
     onClick: (() -> Unit)? = null,
     trailing: (@Composable () -> Unit)? = null,
 ) {
-    val clickableMod =
-        if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier
+    val shape = MaterialTheme.shapes.large
+    val surfaceMod = if (onClick != null) {
+        Modifier.benchSurface(
+            shape = shape,
+            color = MaterialTheme.colorScheme.surface,
+            role = Role.Button,
+            onClickLabel = title,
+            onClick = onClick,
+        )
+    } else {
+        Modifier
+            .clip(shape)
+            .background(MaterialTheme.colorScheme.surface)
+    }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
             .padding(bottom = 10.dp)
-            .clip(MaterialTheme.shapes.large)
-            .background(MaterialTheme.colorScheme.surface)
-            .then(clickableMod)
+            .then(surfaceMod)
             .heightIn(min = 56.dp)
             .padding(16.dp),
     ) {
@@ -192,5 +240,31 @@ fun SettingsRow(
             Spacer(Modifier.width(12.dp))
             trailing()
         }
+    }
+}
+
+/**
+ * Conditionally shown settings group. The group grows and collapses from the
+ * top so toggling a feature never makes the rows below jump.
+ */
+@Composable
+fun ColumnScope.RevealSetting(
+    visible: Boolean,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(tween(Motion.Medium, easing = Motion.EmphasizedDecelerate)) +
+            expandVertically(
+                animationSpec = tween(Motion.Medium, easing = Motion.EmphasizedDecelerate),
+                expandFrom = Alignment.Top,
+            ),
+        exit = fadeOut(tween(Motion.Exit, easing = Motion.EmphasizedAccelerate)) +
+            shrinkVertically(
+                animationSpec = tween(Motion.Exit, easing = Motion.EmphasizedAccelerate),
+                shrinkTowards = Alignment.Top,
+            ),
+    ) {
+        content()
     }
 }

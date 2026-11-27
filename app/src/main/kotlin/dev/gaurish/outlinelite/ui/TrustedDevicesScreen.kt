@@ -1,6 +1,7 @@
 package dev.gaurish.outlinelite.ui
 
 import android.widget.Toast
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -9,8 +10,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -24,6 +26,8 @@ import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -51,20 +55,22 @@ import kotlinx.coroutines.launch
 fun TrustedDevicesScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val haptics = rememberHaptics()
     val trusted by TrustedDeviceRepository.observe(context)
         .collectAsStateWithLifecycle(initialValue = emptyList())
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
     val onlyTrusted by TransferSettingsRepository.observeOnlyTrusted(context)
         .collectAsStateWithLifecycle(initialValue = false)
+    val motionEnabled = rememberMotionEnabled()
 
-    val trustedIds = trusted.map { it.id }.toSet()
-    val online = peers.filter { !it.isSelf }
+    val trustedIds = remember(trusted) { trusted.map { it.id }.toSet() }
+    val online = remember(peers) { peers.filter { !it.isSelf } }
 
     Column(
         Modifier
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background)
-            .systemBarsPadding()
+            .statusBarsPadding()
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -80,8 +86,7 @@ fun TrustedDevicesScreen(onBack: () -> Unit) {
             Spacer(Modifier.width(2.dp))
             Text(
                 "Trusted devices",
-                fontSize = 19.sp,
-                fontWeight = FontWeight.SemiBold,
+                style = BenchType.Title,
                 color = MaterialTheme.colorScheme.onBackground,
             )
         }
@@ -91,6 +96,7 @@ fun TrustedDevicesScreen(onBack: () -> Unit) {
                 .fillMaxSize()
                 .padding(horizontal = 20.dp)
                 .verticalScroll(rememberScrollState())
+                .animateContentSize(Motion.spatialFast())
         ) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -101,14 +107,14 @@ fun TrustedDevicesScreen(onBack: () -> Unit) {
             ) {
                 Column(Modifier.weight(1f)) {
                     Text(
-                        "Only accept from trusted devices",
+                        "Block untrusted devices",
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Medium,
                         color = MaterialTheme.colorScheme.onBackground,
                     )
                     Spacer(Modifier.height(3.dp))
                     Text(
-                        "Block offers from any device that is not on the list below.",
+                        "Deny files, browsing, and remote open from devices not on this list.",
                         fontSize = 12.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -136,19 +142,28 @@ fun TrustedDevicesScreen(onBack: () -> Unit) {
                 )
             } else {
                 online.forEach { peer ->
-                    DeviceRow(
-                        name = peer.name,
-                        id = peer.id,
-                        trusted = peer.id in trustedIds,
-                        actionLabel = if (peer.id in trustedIds) "Trusted" else "Trust",
-                        actionEnabled = peer.id !in trustedIds,
-                        onAction = {
-                            scope.launch {
-                                TrustedDeviceRepository.trust(context, peer.id, peer.name)
-                                Toast.makeText(context, "Trusted ${peer.name}", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                    )
+                    key(peer.id) {
+                        Reveal(0, motionEnabled) {
+                            DeviceRow(
+                                name = peer.name,
+                                id = peer.id,
+                                trusted = peer.id in trustedIds,
+                                actionLabel = if (peer.id in trustedIds) "Trusted" else "Trust",
+                                actionEnabled = peer.id !in trustedIds,
+                                onAction = {
+                                    haptics.confirm()
+                                    scope.launch {
+                                        TrustedDeviceRepository.trust(context, peer.id, peer.name)
+                                        Toast.makeText(
+                                            context,
+                                            "Trusted ${peer.name}",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                },
+                            )
+                        }
+                    }
                 }
             }
 
@@ -162,19 +177,28 @@ fun TrustedDevicesScreen(onBack: () -> Unit) {
                 )
             } else {
                 trusted.forEach { device ->
-                    DeviceRow(
-                        name = device.name,
-                        id = device.id,
-                        trusted = true,
-                        actionLabel = "Revoke",
-                        actionEnabled = true,
-                        onAction = {
-                            scope.launch {
-                                TrustedDeviceRepository.revoke(context, device.id)
-                                Toast.makeText(context, "Revoked ${device.name}", Toast.LENGTH_SHORT).show()
-                            }
-                        },
-                    )
+                    key(device.id) {
+                        Reveal(0, motionEnabled) {
+                            DeviceRow(
+                                name = device.name,
+                                id = device.id,
+                                trusted = true,
+                                actionLabel = "Revoke",
+                                actionEnabled = true,
+                                onAction = {
+                                    haptics.reject()
+                                    scope.launch {
+                                        TrustedDeviceRepository.revoke(context, device.id)
+                                        Toast.makeText(
+                                            context,
+                                            "Revoked ${device.name}",
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
+                                    }
+                                },
+                            )
+                        }
+                    }
                 }
             }
 
@@ -228,7 +252,7 @@ private fun DeviceRow(
         OutlinedButton(
             onClick = onAction,
             enabled = actionEnabled,
-            modifier = Modifier.height(30.dp),
+            modifier = Modifier.heightIn(min = 40.dp),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp),
         ) {
             Text(actionLabel, fontSize = 11.sp)

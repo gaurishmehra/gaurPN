@@ -21,6 +21,47 @@ internal enum class FileKind(val badge: String) {
     OTHER("FILE"),
 }
 
+/** Ordering for a peer's file listing. Directories always sort first. */
+enum class BrowseSort { NAME, MODIFIED, SIZE }
+
+/**
+ * Sorts a listing for the browse screen. Direction only flips the chosen key.
+ * Folders are grouped ahead of files for name sort only; modified and size
+ * sort the whole listing by their key. Rows without a modified timestamp
+ * always sink to the bottom. Pure so the ordering stays unit-testable.
+ */
+internal fun sortBrowseEntries(
+    entries: List<BrowseEntry>,
+    sort: BrowseSort,
+    ascending: Boolean,
+): List<BrowseEntry> {
+    val comparator = Comparator<BrowseEntry> { a, b ->
+        // Name is the only ordering that keeps the directory grouping: that is
+        // a filing convention, and "everything alphabetically" is what people
+        // expect of a folder. For modified and size, pinning directories first
+        // would answer a different question than the one that was asked, so
+        // the key alone decides and an old folder sinks with everything else.
+        if (sort == BrowseSort.NAME && a.dir != b.dir) {
+            return@Comparator if (a.dir) -1 else 1
+        }
+
+        if (sort == BrowseSort.MODIFIED) {
+            val aMissing = a.modified <= 0L
+            val bMissing = b.modified <= 0L
+            if (aMissing != bMissing) return@Comparator if (aMissing) 1 else -1
+        }
+
+        val primary = when (sort) {
+            BrowseSort.NAME -> a.name.compareTo(b.name, ignoreCase = true)
+            BrowseSort.MODIFIED -> a.modified.compareTo(b.modified)
+            BrowseSort.SIZE -> a.size.compareTo(b.size)
+        }
+        val directed = if (ascending) primary else -primary
+        if (directed != 0) directed else a.name.compareTo(b.name, ignoreCase = true)
+    }
+    return entries.sortedWith(comparator)
+}
+
 private val IMAGE_EXTENSIONS = setOf(
     "jpg", "jpeg", "png", "gif", "webp", "bmp", "heic", "heif", "avif", "svg", "tif", "tiff",
 )
@@ -75,11 +116,16 @@ internal fun formatBytes(bytes: Long): String {
     return "${text.removeSuffix(".0")} ${units[unit]}"
 }
 
+/** Cached per thread: DateFormat is expensive to construct and not thread-safe. */
+private val modifiedDateFormat = object : ThreadLocal<DateFormat>() {
+    override fun initialValue(): DateFormat = DateFormat.getDateInstance(DateFormat.MEDIUM)
+}
+
 /** Localized medium date, or "" when the peer did not report a timestamp. */
 internal fun formatModified(epochMs: Long): String {
     if (epochMs <= 0L) return ""
     return runCatching {
-        DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(epochMs))
+        modifiedDateFormat.get()!!.format(Date(epochMs))
     }.getOrDefault("")
 }
 
