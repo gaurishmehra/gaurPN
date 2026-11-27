@@ -27,6 +27,16 @@ object BatteryStatus {
     const val MIN_PUBLISH_INTERVAL_MS = 5_000L
 
     /**
+     * Repaint threshold for an unchanged battery. Receivers drop status
+     * blobs older than [PeerStatus.MAX_STATUS_AGE_MS] (10 minutes), and a
+     * device parked at the same level — full and plugged in — stops
+     * producing battery events. The repaint is event-driven, never a
+     * timer: it happens when the relay's peers fan-out arrives, proving
+     * some cluster member is listening.
+     */
+    const val REPAINT_AFTER_MS = 5 * 60_000L
+
+    /**
      * Converts the raw extras into a 0..100 percentage plus a charging flag.
      * Null when the broadcast is missing usable level/scale values.
      */
@@ -47,7 +57,10 @@ object BatteryStatus {
     /**
      * Full publish decision: a meaningful change, debounced to one frame per
      * [MIN_PUBLISH_INTERVAL_MS]. [lastSentAtMs] of 0 means nothing has been
-     * sent yet, so the first sample always goes out.
+     * sent yet, so the first sample always goes out. An unchanged sample
+     * whose last advertisement is older than [REPAINT_AFTER_MS] is
+     * re-advertised so the stored blob never ages past the receivers'
+     * freshness window.
      */
     fun shouldPublish(
         previous: BatterySample?,
@@ -55,6 +68,7 @@ object BatteryStatus {
         lastSentAtMs: Long,
         nowMs: Long,
     ): Boolean {
+        if (lastSentAtMs > 0L && nowMs - lastSentAtMs >= REPAINT_AFTER_MS) return true
         if (!isMeaningfulChange(previous, next)) return false
         if (lastSentAtMs <= 0L) return true
         return nowMs - lastSentAtMs >= MIN_PUBLISH_INTERVAL_MS

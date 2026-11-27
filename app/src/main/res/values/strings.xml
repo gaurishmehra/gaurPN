@@ -6,10 +6,12 @@
     <string name="action_disconnect">Disconnect</string>
     <string name="action_connect">Connect</string>
     <string name="notif_connecting">Connecting</string>
+    <string name="notif_reconnecting">Reconnecting</string>
     <string name="notif_connected">Connected to %1$s</string>
     <string name="status_disconnected">Not connected</string>
     <string name="status_connected">Protected</string>
     <string name="status_connecting">Connecting</string>
+    <string name="status_reconnecting">Reconnecting</string>
     <string name="status_stopping">Stopping</string>
     <string name="add_key_title">Add server</string>
     <string name="add_key_hint">Paste an ss:// access key</string>
@@ -41,7 +43,11 @@
     <string name="share_disconnecting">Disconnecting</string>
     <string name="share_vpn_stopping">Wait for the VPN to disconnect, then connect again to find cluster devices.</string>
     <string name="share_waiting_for_vpn">Connecting to VPN. Devices will appear as soon as the relay connects.</string>
+    <string name="share_vpn_reconnecting">Waiting for the VPN to reconnect. Devices will appear when the tunnel is back.</string>
     <string name="share_no_devices">No other cluster devices are online yet.</string>
+    <string name="share_relay_auth_failed">The relay rejected this cluster key. Check that every device uses the same key.</string>
+    <string name="share_relay_unreachable">Could not reach the relay. Check the relay address and the VPN connection.</string>
+    <string name="share_relay_connecting">Connecting to the relay. Devices will appear when it is up.</string>
     <string name="share_refresh_devices">Refresh devices</string>
     <string name="share_cancel">Cancel</string>
 </resources>

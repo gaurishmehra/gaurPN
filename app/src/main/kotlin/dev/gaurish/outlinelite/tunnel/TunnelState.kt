@@ -4,7 +4,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
 /** Coarse connection lifecycle used by app UI, the QS tile and the widget. */
-enum class TunnelPhase { DISCONNECTED, CONNECTING, CONNECTED, STOPPING }
+enum class TunnelPhase { DISCONNECTED, CONNECTING, RECONNECTING, CONNECTED, STOPPING }
 
 data class TunnelStatus(
     val phase: TunnelPhase = TunnelPhase.DISCONNECTED,
@@ -14,6 +14,10 @@ data class TunnelStatus(
     val connectedAt: Long = 0L,
     val lastError: String? = null,
     val allowLanAccess: Boolean = false,
+    /** 1-based retry count while RECONNECTING; 0 when idle or connected. */
+    val attempt: Int = 0,
+    /** Elapsed realtime (ms) of the next retry, or 0 while connecting now. */
+    val retryAt: Long = 0L,
 )
 
 /** Single source of truth for connection state, shared across UI, tile and widget. */

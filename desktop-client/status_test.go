@@ -101,11 +101,20 @@ func TestStatusThrottle(t *testing.T) {
 	base := time.UnixMilli(1730000000000)
 	var throttle statusThrottle
 
+	if throttle.repaintDue(base) {
+		t.Fatal("an empty throttle must not be repaint-due")
+	}
 	if !throttle.shouldSend(50, false, base) {
 		t.Fatal("first reading must be sent")
 	}
 	if throttle.shouldSend(51, false, base.Add(31*time.Second)) {
 		t.Fatal("a one-point change must not be sent")
+	}
+	if throttle.repaintDue(base.Add(31 * time.Second)) {
+		t.Fatal("a reading inside the repaint window must not resend")
+	}
+	if !throttle.repaintDue(base.Add(statusRepaintInterval)) {
+		t.Fatal("an unchanged reading past the repaint window must resend")
 	}
 	if !throttle.shouldSend(52, false, base.Add(32*time.Second)) {
 		t.Fatal("a two-point change after the window must be sent")
@@ -199,6 +208,72 @@ func TestStatusPublisherPublishesAndSuppresses(t *testing.T) {
 	p.SetWriter(writer)
 	if got := len(writer.snapshot()); got != 3 {
 		t.Fatalf("reconnect resend produced %d frames, want 3", got)
+	}
+}
+
+// A laptop parked at full battery stops emitting UPower changes; without a
+// repaint its stored blob would age past the 10-minute freshness window and
+// every peer would show no battery at all. The event source is presence
+// traffic: RepaintIfStale, driven by the daemon's inbound peers handler.
+func TestStatusPublisherRepaintKeepsUnchangedReadingFresh(t *testing.T) {
+	_, peerKey := DeriveSubKeys("status-publisher-token")
+	now := time.UnixMilli(1730000000000)
+	reading := batteryReading{Battery: 100, Charging: true, Present: true}
+
+	p := &StatusPublisher{
+		cfg:           Config{DeviceID: "laptop"},
+		peerCryptoKey: peerKey,
+		read:          func(*dbus.Conn) (batteryReading, error) { return reading, nil },
+		now:           func() time.Time { return now },
+	}
+	writer := &fakeStatusWriter{}
+	p.SetWriter(writer)
+	if got := len(writer.snapshot()); got != 1 {
+		t.Fatalf("initial publish produced %d frames, want 1", got)
+	}
+
+	// Presence traffic well inside the repaint window: no frame, and the
+	// repaint call must not even reach UPower.
+	p.RepaintIfStale()
+	if got := len(writer.snapshot()); got != 1 {
+		t.Fatalf("premature repaint produced %d frames, want 1", got)
+	}
+
+	// Past the window the same reading is re-advertised with a fresh
+	// timestamp.
+	now = now.Add(statusRepaintInterval + time.Second)
+	p.RepaintIfStale()
+	frames := writer.snapshot()
+	if len(frames) != 2 {
+		t.Fatalf("repaint produced %d frames, want 2", len(frames))
+	}
+	blob, _ := frames[1]["status"].(string)
+	battery, charging, ts, err := DecodeStatusBlob(DeriveStatusKey(peerKey), "laptop", blob)
+	if err != nil {
+		t.Fatalf("decode repaint blob: %v", err)
+	}
+	if battery != 100 || !charging {
+		t.Fatalf("repaint reading = (%d, %v), want (100, true)", battery, charging)
+	}
+	if ts != now.UnixMilli() {
+		t.Fatalf("repaint ts = %d, want %d", ts, now.UnixMilli())
+	}
+
+	// The repaint resets the change gates too, so a real change right after
+	// is still delivered on its own schedule.
+	now = now.Add(statusMinInterval + time.Second)
+	reading = batteryReading{Battery: 98, Charging: true, Present: true}
+	p.refresh()
+	if got := len(writer.snapshot()); got != 3 {
+		t.Fatalf("post-repaint change produced %d frames, want 3", got)
+	}
+
+	// An unchanged reading via the signal path repaints too — UPower often
+	// emits PropertiesChanged for sub-threshold ticks.
+	now = now.Add(statusRepaintInterval + time.Second)
+	p.refresh()
+	if got := len(writer.snapshot()); got != 4 {
+		t.Fatalf("signal-driven repaint produced %d frames, want 4", got)
 	}
 }
 

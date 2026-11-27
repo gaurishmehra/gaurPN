@@ -233,14 +233,14 @@ GOOS=windows GOARCH=amd64 go build -ldflags "-s -w" -o dist/gaur-share-windows-a
 ### 1. Connecting to Shadowsocks
 
 1. Copy an access key (`ss://...`) from your Shadowsocks server's manager.
-2. Open gaurPN and tap **+** to paste the key, or open the link on your device to import it.
+2. Open gaurPN and tap **Add server** (or **+**) to paste the key, or open the link on your device to import it.
 3. Tap **Connect** and confirm the system VPN permission dialog once.
 4. Add the gaurPN tile to your Quick Settings panel for one-tap toggling.
 
 ### 2. Split Tunneling and LAN Bypass
 
-- **Per-App Split Tunneling**: Open **Settings** (gear icon) -> **Split Tunneling**. Check the apps you want to bypass the VPN. Selected apps will route through your direct Wi-Fi or mobile network.
-- **LAN Bypass**: Open **Settings** and toggle **Allow LAN Access**. Local devices (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`) remain reachable while internet traffic routes through the tunnel.
+- **Per-App Split Tunneling**: Open **Settings** -> **Split tunneling**. Check the apps you want to bypass the VPN. Selected apps will route through your direct Wi-Fi or mobile network.
+- **LAN Bypass**: Connect the VPN, then toggle **Allow LAN access** in Settings. Local devices (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`) remain reachable while internet traffic routes through the tunnel. The bypass turns itself off when the VPN disconnects.
 
 ### 3. Setting Up In-Tunnel File Sharing
 
@@ -442,3 +442,5 @@ For full protocol specifications, see [docs/FILE_SHARING.md](docs/FILE_SHARING.m
 This project is licensed under the [MIT License](LICENSE).
 
 Upstream `outline-go-tun2socks` is licensed under the Apache License 2.0.
+
+IBM Plex Sans and IBM Plex Mono are licensed under the SIL Open Font License 1.1. The license text ships in `app/src/main/assets/licenses/ibm_plex_ofl.txt`.

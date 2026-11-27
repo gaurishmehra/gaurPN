@@ -46,6 +46,13 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
+ * Health of the WebSocket link to the in-tunnel relay. This is separate from
+ * the VPN tunnel: the tunnel can be CONNECTED while the relay rejects the
+ * cluster key or cannot be reached at all.
+ */
+enum class RelayLinkPhase { DISABLED, CONNECTING, ONLINE, AUTH_FAILED, UNREACHABLE }
+
+/**
  * Facade for the cluster relay: owns the device identity, the peer and
  * transfer-state flows, and the WebSocket message dispatch (clipboard,
  * text, notification, and media routing). The socket session lives in
@@ -79,6 +86,9 @@ object RelayManager {
 
     private val _peers = MutableStateFlow<List<ClusterPeer>>(emptyList())
     val peers: StateFlow<List<ClusterPeer>> = _peers.asStateFlow()
+
+    private val _link = MutableStateFlow(RelayLinkPhase.DISABLED)
+    val link: StateFlow<RelayLinkPhase> = _link.asStateFlow()
 
     private val _transferState = MutableStateFlow<TransferState>(TransferState.Idle)
     val transferState: StateFlow<TransferState> = _transferState.asStateFlow()
@@ -224,13 +234,19 @@ object RelayManager {
     }
 
     private fun connectRelay(context: Context, token: String) {
+        _link.value = RelayLinkPhase.CONNECTING
         RelayConnection.connect(context, token, deviceId, object : RelayConnection.Listener {
+            override fun onConnecting(context: Context) {
+                _link.value = RelayLinkPhase.CONNECTING
+            }
+
             override fun onOpen(
                 context: Context,
                 socket: WebSocket,
                 relayToken: String,
                 peerCryptoKey: ByteArray,
             ) {
+                _link.value = RelayLinkPhase.ONLINE
                 requestPeerList(socket)
                 ClipboardSyncManager.onRelayConnected(context)
                 MediaSessionBridge.onRelayConnected(context)
@@ -246,13 +262,23 @@ object RelayManager {
                 handleWsMessage(context, relayToken, peerCryptoKey, text)
             }
 
-            override fun onClosed(context: Context) {
+            override fun onClosed(context: Context, code: Int) {
+                _link.value = if (code == 1000 || code == 1001) {
+                    RelayLinkPhase.DISABLED
+                } else {
+                    RelayLinkPhase.CONNECTING
+                }
                 _peers.value = emptyList()
                 stopStatusPublisher()
                 ClipboardSyncManager.onRelayDisconnected()
             }
 
-            override fun onFailure(context: Context) {
+            override fun onFailure(context: Context, httpCode: Int?) {
+                _link.value = if (httpCode == 401 || httpCode == 403) {
+                    RelayLinkPhase.AUTH_FAILED
+                } else {
+                    RelayLinkPhase.UNREACHABLE
+                }
                 _peers.value = emptyList()
                 stopStatusPublisher()
                 ClipboardSyncManager.onRelayDisconnected()
@@ -274,7 +300,27 @@ object RelayManager {
             Log.i(TAG, "Relay unavailable during device refresh; reconnecting")
             currentSocket?.close(1012, "Refresh device list")
             RelayConnection.clearIfCurrent(currentSocket)
-            RelayConnection.scheduleReconnect(appCtx, token)
+            RelayConnection.scheduleReconnect(appCtx)
+        }
+    }
+
+    /**
+     * Re-evaluates the relay link after the cluster key or relay address
+     * changes. A blank key tears the link down; a new key attempts a fresh
+     * connection without restarting the tunnel.
+     */
+    fun onSettingsChanged(context: Context) {
+        val appCtx = context.applicationContext
+        scope.launch {
+            val token = KeyRepository.getClusterToken(appCtx)
+            if (token.isBlank()) {
+                disconnectRelay()
+            } else {
+                // Force a fresh handshake so a rotated key or a new relay
+                // address takes effect instead of riding the old socket.
+                RelayConnection.close()
+                RelayConnection.scheduleReconnect(appCtx)
+            }
         }
     }
 
@@ -297,6 +343,7 @@ object RelayManager {
 
     private fun disconnectRelay() {
         RelayConnection.close()
+        _link.value = RelayLinkPhase.DISABLED
         stopStatusPublisher()
         _peers.value = emptyList()
         ClipboardSyncManager.onRelayDisconnected()
@@ -323,6 +370,10 @@ object RelayManager {
                     }
                 }
                 _peers.value = decoded.peers
+                // Presence traffic proves the cluster is listening: this is
+                // the event that re-advertises an unchanged battery before
+                // it ages past the freshness window. No timer is involved.
+                repaintStatusIfStale(context)
             }
             "transfer_offer" -> {
                 val txId = json.optString("transfer_id")
@@ -1753,7 +1804,10 @@ object RelayManager {
      * Starts publishing the encrypted battery status while the socket is up.
      * ACTION_BATTERY_CHANGED is sticky and event-driven: registering delivers
      * the current value immediately and the system pushes later changes, so
-     * there is no polling and no wakeup timer.
+     * there is no polling and no wakeup timer. A device parked at an
+     * unchanged level (full, plugged in) eventually stops emitting
+     * broadcasts; that case is covered by [repaintStatusIfStale], which
+     * rides the relay's peers fan-out — still an event, never a timer.
      */
     private fun startStatusPublisher(context: Context, peerCryptoKey: ByteArray) {
         val appCtx = context.applicationContext
@@ -1789,16 +1843,7 @@ object RelayManager {
                 // context-registered receiver on registration — query it
                 // directly so the first sample publishes deterministically
                 // on every Android version.
-                val sticky = runCatching {
-                    appCtx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
-                }.getOrNull()
-                if (sticky?.action == Intent.ACTION_BATTERY_CHANGED) {
-                    initialSample = BatteryStatus.fromExtras(
-                        level = sticky.getIntExtra(BatteryManager.EXTRA_LEVEL, -1),
-                        scale = sticky.getIntExtra(BatteryManager.EXTRA_SCALE, -1),
-                        status = sticky.getIntExtra(BatteryManager.EXTRA_STATUS, -1),
-                    )
-                }
+                initialSample = currentBatterySample(appCtx)
             } else {
                 statusContext = null
                 statusPeerKey = null
@@ -1806,6 +1851,38 @@ object RelayManager {
         }
         // Publish outside the lock — publishStatus takes statusLock itself.
         initialSample?.let { publishStatus(it) }
+    }
+
+    /**
+     * Re-advertises the current battery when presence traffic shows the
+     * cluster is listening and the last advertisement is ageing towards the
+     * receivers' freshness drop. Called from the inbound peers handler — the
+     * event source is the relay's fan-out, never a timer.
+     */
+    private fun repaintStatusIfStale(context: Context) {
+        val due = synchronized(statusLock) {
+            statusReceiver != null &&
+                lastStatusSentAt > 0L &&
+                System.currentTimeMillis() - lastStatusSentAt >= BatteryStatus.REPAINT_AFTER_MS
+        }
+        if (!due) return
+        // ShouldPublish rate-limits the repaint itself, so a burst of peers
+        // frames costs one battery read at most.
+        val sample = currentBatterySample(context) ?: return
+        publishStatus(sample)
+    }
+
+    /** Reads the current battery from the sticky broadcast; null if unknown. */
+    private fun currentBatterySample(context: Context): BatterySample? {
+        val sticky = runCatching {
+            context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        }.getOrNull()
+        if (sticky?.action != Intent.ACTION_BATTERY_CHANGED) return null
+        return BatteryStatus.fromExtras(
+            level = sticky.getIntExtra(BatteryManager.EXTRA_LEVEL, -1),
+            scale = sticky.getIntExtra(BatteryManager.EXTRA_SCALE, -1),
+            status = sticky.getIntExtra(BatteryManager.EXTRA_STATUS, -1),
+        )
     }
 
     /** Unregisters the battery receiver; safe to call when none is registered. */

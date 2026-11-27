@@ -254,6 +254,10 @@ func (s *daemonSession) runOnce() bool {
 			if s.localMedia != nil {
 				s.localMedia.ForceRefresh()
 			}
+			// Presence traffic proves the cluster is listening: this is the
+			// event that repaints an unchanged battery before it ages past
+			// the freshness window. No timer is involved.
+			s.status.RepaintIfStale()
 		case "transfer_offer":
 			txID := envelopeString(envelope, "transfer_id")
 			if txID == "" {

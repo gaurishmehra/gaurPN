@@ -259,20 +259,37 @@ func main() {
 		notifyFlags := flag.NewFlagSet("notify", flag.ExitOnError)
 		notifyAll := notifyFlags.Bool("all", false, "Send to every online device")
 		notifyIcon := notifyFlags.String("icon", "", "Icon file (PNG, max 64 KiB)")
+		notifyApp := notifyFlags.String("app", "", "Source app display name")
+		notifyPkg := notifyFlags.String("package", "", "Source Android package for duplicate suppression")
 		if err := notifyFlags.Parse(args[1:]); err != nil {
 			log.Fatalf("[FATAL] %v", err)
 		}
 		rest := notifyFlags.Args()
 		if *notifyAll {
 			if len(rest) < 1 {
-				log.Fatalf("Usage: gaur-share notify --all <title> [body...]")
+				log.Fatalf("Usage: gaur-share notify --all [-app name] [-package pkg] <title> [body...]")
 			}
-			runNotifyAll(cfg, rest[0], strings.Join(rest[1:], " "), *notifyIcon)
+			runNotifyAll(
+				cfg,
+				rest[0],
+				strings.Join(rest[1:], " "),
+				*notifyIcon,
+				*notifyApp,
+				*notifyPkg,
+			)
 		} else {
 			if len(rest) < 2 {
-				log.Fatalf("Usage: gaur-share notify <device> <title> [body...]")
+				log.Fatalf("Usage: gaur-share notify [-app name] [-package pkg] <device> <title> [body...]")
 			}
-			runNotify(cfg, rest[0], rest[1], strings.Join(rest[2:], " "), *notifyIcon)
+			runNotify(
+				cfg,
+				rest[0],
+				rest[1],
+				strings.Join(rest[2:], " "),
+				*notifyIcon,
+				*notifyApp,
+				*notifyPkg,
+			)
 		}
 	case "ask":
 		askFlags := flag.NewFlagSet("ask", flag.ExitOnError)

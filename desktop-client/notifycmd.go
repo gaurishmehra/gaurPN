@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 )
 
 // notifySession applies the one-shot outbound identity — the "-out" suffix
@@ -32,7 +33,10 @@ func notifySession(cfg Config) (Config, *wsClient, []byte) {
 
 // runNotify sends a sealed notification to a device. It is the desktop ->
 // device direction of the same mirroring channel.
-func runNotify(cfg Config, targetQuery, title, body, iconPath string) {
+func runNotify(
+	cfg Config,
+	targetQuery, title, body, iconPath, appName, packageName string,
+) {
 	cfg, client, peerCryptoKey := notifySession(cfg)
 	defer client.Close()
 
@@ -49,7 +53,7 @@ func runNotify(cfg Config, targetQuery, title, body, iconPath string) {
 		targetID = targetQuery
 		targetName = targetQuery
 	}
-	inner := notificationInner(cfg, title, body, iconPath)
+	inner := notificationInner(cfg, title, body, iconPath, appName, packageName)
 	envelope, err := sealEnvelope(peerCryptoKey, targetID, "notification", inner)
 	if err != nil {
 		log.Fatalf("[FATAL] %v", err)
@@ -62,7 +66,10 @@ func runNotify(cfg Config, targetQuery, title, body, iconPath string) {
 
 // runNotifyAll fans one sealed notification out to every online device. It is
 // used by the Quickshell notification server to mirror desktop notifications.
-func runNotifyAll(cfg Config, title, body, iconPath string) {
+func runNotifyAll(
+	cfg Config,
+	title, body, iconPath, appName, packageName string,
+) {
 	cfg, client, peerCryptoKey := notifySession(cfg)
 	defer client.Close()
 
@@ -70,7 +77,7 @@ func runNotifyAll(cfg Config, title, body, iconPath string) {
 	if len(targets) == 0 {
 		log.Fatalf("[FATAL] No other devices are online")
 	}
-	inner := notificationInner(cfg, title, body, iconPath)
+	inner := notificationInner(cfg, title, body, iconPath, appName, packageName)
 	sent := 0
 	for _, target := range targets {
 		envelope, err := sealEnvelope(peerCryptoKey, target, "notification", inner)
@@ -87,17 +94,31 @@ func runNotifyAll(cfg Config, title, body, iconPath string) {
 	fmt.Printf("Notification sent to %d device(s)\n", sent)
 }
 
-func notificationInner(cfg Config, title, body, iconPath string) map[string]interface{} {
+func notificationInner(
+	cfg Config,
+	title, body, iconPath, appName, packageName string,
+) map[string]interface{} {
 	key, _ := randomHex(8)
+	app := strings.TrimSpace(appName)
+	if app == "" {
+		app = cfg.Name
+	}
 	inner := map[string]interface{}{
 		"sender_id":   cfg.SenderID,
 		"sender_name": cfg.Name,
 		"event":       "posted",
 		"key":         "desktop-" + key,
-		"app":         cfg.Name,
+		"app":         app,
 		"title":       title,
 		"text":        body,
 		"actions":     []interface{}{},
+	}
+	// The Android package lets the receiver suppress a mirrored copy when
+	// the same app is installed there and already posted its own
+	// notification. Desktop-originated payloads without a package are
+	// always shown.
+	if pkg := strings.TrimSpace(packageName); pkg != "" {
+		inner["package"] = pkg
 	}
 	if icon := readIconBase64(iconPath); icon != "" {
 		inner["icon"] = icon

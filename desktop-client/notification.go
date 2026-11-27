@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"os"
 	"os/exec"
@@ -159,11 +160,19 @@ func displayMirroredNotification(
 	for _, action := range payload.Actions {
 		actionArgs = append(actionArgs, fmt.Sprintf("%d=%s", action.Index, action.Title))
 	}
-	out, err := exec.Command("notify-send", notifySendArgs(displayTitle, body, iconPath, actionArgs)...).Output()
+	replaceID := notificationReplaceID(fromID, payload.Key)
+	out, err := exec.Command(
+		"notify-send",
+		notifySendArgsForID(displayTitle, body, iconPath, actionArgs, 8000, replaceID)...,
+	).Output()
 	if err != nil {
-		// Some notification daemons reject action buttons. Fall back to a
-		// plain notification rather than dropping the event.
-		_ = exec.Command("notify-send", notifySendArgs(displayTitle, body, iconPath, nil)...).Run()
+		// Some notification daemons reject action buttons or the replace
+		// option. Fall back to a plain notification rather than dropping the
+		// event, but keep the replace id when the daemon supports it.
+		_ = exec.Command(
+			"notify-send",
+			notifySendArgs(displayTitle, body, iconPath, nil)...,
+		).Run()
 		return
 	}
 
@@ -208,11 +217,43 @@ func notifySendArgs(title, body, iconPath string, actions []string) []string {
 	return notifySendArgsFor(title, body, iconPath, actions, 8000)
 }
 
+// notificationReplaceID is the stable 31-bit id handed to notify-send -r.
+// Updates to one Android notification (WhatsApp rewrites the same chat entry
+// on every message) then replace the existing desktop bubble instead of
+// stacking a new one. Including the sender keeps two phones with the same
+// app apart.
+func notificationReplaceID(fromID, notifKey string) int32 {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(fromID))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(notifKey))
+	id := int32(h.Sum32() & 0x7fffffff)
+	if id == 0 {
+		return 1
+	}
+	return id
+}
+
 // notifySendArgsFor is notifySendArgs with an explicit expiry in
 // milliseconds. The URL action uses a 30-second expiry so the button stays
 // clickable for the whole action wait.
 func notifySendArgsFor(title, body, iconPath string, actions []string, timeoutMs int) []string {
+	return notifySendArgsForID(title, body, iconPath, actions, timeoutMs, 0)
+}
+
+// notifySendArgsForID is notifySendArgsFor with a notify-send -r replace id.
+// A zero replaceID leaves the option out entirely, which keeps the URL and
+// approval notifications non-replacing.
+func notifySendArgsForID(
+	title, body, iconPath string,
+	actions []string,
+	timeoutMs int,
+	replaceID int32,
+) []string {
 	args := []string{"-a", "gaurPN", "-t", strconv.Itoa(timeoutMs)}
+	if replaceID != 0 {
+		args = append(args, "-r", strconv.FormatInt(int64(replaceID), 10))
+	}
 	if iconPath != "" {
 		args = append(args, "-i", iconPath)
 	}

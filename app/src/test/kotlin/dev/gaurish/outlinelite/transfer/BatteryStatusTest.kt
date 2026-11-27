@@ -55,9 +55,28 @@ class BatteryStatusTest {
         assertTrue(
             BatteryStatus.shouldPublish(sample, BatterySample(55, false), 1_000L, 6_000L),
         )
-        // Not meaningful, however long it has been: suppressed.
+        // Not meaningful and inside the repaint window: suppressed.
         assertFalse(
-            BatteryStatus.shouldPublish(sample, BatterySample(51, false), 1_000L, 600_000L),
+            BatteryStatus.shouldPublish(
+                sample, BatterySample(51, false), 600_000L, 600_000L + BatteryStatus.REPAINT_AFTER_MS - 1,
+            ),
         )
+    }
+
+    @Test
+    fun unchangedReadingIsRepaintedInsideTheFreshnessWindow() {
+        val sample = BatterySample(100, true) // laptop parked at full, plugged in
+        // Past the repaint window the same reading is re-advertised
+        // (receivers drop blobs older than PeerStatus.MAX_STATUS_AGE_MS —
+        // 10 minutes).
+        assertTrue(
+            BatteryStatus.shouldPublish(sample, sample, 600_000L, 600_000L + BatteryStatus.REPAINT_AFTER_MS),
+        )
+        assertTrue(
+            BatteryStatus.shouldPublish(sample, sample, 600_000L, 600_000L + BatteryStatus.REPAINT_AFTER_MS + 1),
+        )
+        // The repaint cadence is at worst half the freshness window, so the
+        // stored blob never ages out between repaints.
+        assertTrue(BatteryStatus.REPAINT_AFTER_MS <= PeerStatus.MAX_STATUS_AGE_MS / 2)
     }
 }

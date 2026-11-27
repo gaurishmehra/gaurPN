@@ -37,10 +37,11 @@ internal object RelayConnection {
      * derived for this session.
      */
     internal interface Listener {
+        fun onConnecting(context: Context)
         fun onOpen(context: Context, socket: WebSocket, relayToken: String, peerCryptoKey: ByteArray)
         fun onMessage(context: Context, relayToken: String, peerCryptoKey: ByteArray, text: String)
-        fun onClosed(context: Context)
-        fun onFailure(context: Context)
+        fun onClosed(context: Context, code: Int)
+        fun onFailure(context: Context, httpCode: Int?)
     }
 
     /** Shared HTTP/WebSocket client; also used by the chunk transport. */
@@ -85,6 +86,7 @@ internal object RelayConnection {
         if (!connecting.compareAndSet(false, true)) return
         scope.launch {
             try {
+                listener.onConnecting(context)
                 val (relayToken, peerCryptoKey) = Crypto.deriveSubKeys(token)
                 val deviceName = KeyRepository.getDeviceName(context)
                 val relayHost = KeyRepository.getRelayAddress(context).ifBlank { RelayManager.RELAY_HOST }
@@ -116,16 +118,21 @@ internal object RelayConnection {
                         Log.i(TAG, "Relay WS closed: $code $reason")
                         ws = null
                         connecting.set(false)
-                        listener.onClosed(context)
-                        scheduleReconnect(context, token)
+                        listener.onClosed(context, code)
+                        scheduleReconnect(context)
                     }
 
                     override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                         Log.w(TAG, "Relay WS failure: ${t.message}")
                         ws = null
                         connecting.set(false)
-                        listener.onFailure(context)
-                        scheduleReconnect(context, token)
+                        listener.onFailure(context, response?.code)
+                        // A rejected cluster key will be rejected again.
+                        // Leave the link in AUTH_FAILED until the key changes
+                        // or the user asks for a refresh.
+                        if (response?.code != 401 && response?.code != 403) {
+                            scheduleReconnect(context)
+                        }
                     }
                 })
             } finally {
@@ -140,14 +147,27 @@ internal object RelayConnection {
     }
 
     /** Reconnects with the installed listener once the backoff delay elapses. */
-    fun scheduleReconnect(context: Context, token: String) {
+    fun scheduleReconnect(context: Context) {
         if (TunnelState.flow.value.phase != TunnelPhase.CONNECTED) return
         reconnectJob?.cancel()
         reconnectJob = scope.launch {
+            // Re-read the key: the user may have just fixed a rejected
+            // cluster key, and a reconnect must not reuse the old one.
+            val token = runCatching {
+                KeyRepository.getClusterToken(context)
+            }.getOrDefault("")
+            if (token.isBlank()) return@launch
+            // Show "connecting" for the whole backoff, not only when the
+            // socket attempt actually starts.
+            listener?.onConnecting(context)
             delay(backoff.delayFor(reconnectAttempts++))
             if (TunnelState.flow.value.phase == TunnelPhase.CONNECTED && ws == null) {
                 val currentListener = listener ?: return@launch
-                connect(context, token, deviceId, currentListener)
+                val currentToken = runCatching {
+                    KeyRepository.getClusterToken(context)
+                }.getOrDefault("")
+                if (currentToken.isBlank()) return@launch
+                connect(context, currentToken, deviceId, currentListener)
             }
         }
     }

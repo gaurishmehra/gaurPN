@@ -53,7 +53,7 @@ class QsTileService : TileService() {
             return
         }
 
-        tile.state = if (running) Tile.STATE_INACTIVE else Tile.STATE_ACTIVE
+        tile.state = Tile.STATE_INACTIVE
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching {
                 tile.subtitle = getString(
@@ -69,8 +69,10 @@ class QsTileService : TileService() {
         val tile = qsTile ?: return
         val s = TunnelState.status
         tile.icon = Icon.createWithResource(this, R.drawable.ic_tile_logo)
+        // Only a live tunnel is "active". A connecting or stopping tile must
+        // not advertise protection that does not exist yet.
         tile.state = when (s.phase) {
-            TunnelPhase.CONNECTED, TunnelPhase.CONNECTING -> Tile.STATE_ACTIVE
+            TunnelPhase.CONNECTED -> Tile.STATE_ACTIVE
             else -> Tile.STATE_INACTIVE
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -78,9 +80,9 @@ class QsTileService : TileService() {
                 tile.subtitle = when (s.phase) {
                     TunnelPhase.CONNECTED -> s.activeName ?: getString(R.string.status_connected)
                     TunnelPhase.CONNECTING -> getString(R.string.status_connecting)
+                    TunnelPhase.RECONNECTING -> getString(R.string.status_reconnecting)
                     TunnelPhase.STOPPING -> getString(R.string.status_stopping)
-                    TunnelPhase.DISCONNECTED ->
-                        s.activeName ?: getString(R.string.status_disconnected)
+                    TunnelPhase.DISCONNECTED -> getString(R.string.status_disconnected)
                 }
             }
         }

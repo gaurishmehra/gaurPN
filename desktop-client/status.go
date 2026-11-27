@@ -34,6 +34,14 @@ const (
 const (
 	statusBatteryDelta = 2
 	statusMinInterval  = 30 * time.Second
+
+	// Receivers drop status blobs whose authenticated timestamp is older
+	// than 10 minutes, and a battery that is not changing — a laptop parked
+	// at full — stops emitting UPower events long before that. Instead of a
+	// timer, an unchanged reading is re-advertised when presence traffic
+	// proves someone is listening: each peers broadcast the publisher
+	// receives triggers at most one repaint per this interval.
+	statusRepaintInterval = 5 * time.Minute
 )
 
 // batteryReading is one decoded UPower sample. Present is false when the
@@ -162,6 +170,15 @@ func (t *statusThrottle) shouldSend(battery int, charging bool, now time.Time) b
 	return true
 }
 
+// repaintDue reports whether an unchanged reading is due a re-advertisement:
+// the event-driven gates above would otherwise never fire for a battery
+// sitting at the same level, and peers drop blobs whose timestamp ages past
+// the freshness window. Repaints are requested only when presence traffic
+// shows a consumer exists; this check is what keeps them bounded.
+func (t *statusThrottle) repaintDue(now time.Time) bool {
+	return t.have && now.Sub(t.lastSent) >= statusRepaintInterval
+}
+
 // force records a reading as sent. The reconnect resend uses it so every new
 // relay connection carries the current status once, regardless of throttle.
 func (t *statusThrottle) force(battery int, charging bool, now time.Time) {
@@ -262,28 +279,34 @@ func NewStatusPublisher(cfg Config, peerCryptoKey []byte) (*StatusPublisher, err
 }
 
 func (p *StatusPublisher) loop() {
+	// A nil signal channel parks that select case: without a match rule no
+	// PropertiesChanged ever arrives, but repaints (driven by peers traffic,
+	// not by this loop) and reconnect resends still keep a present battery
+	// from going stale.
+	var signals <-chan *dbus.Signal
 	if err := p.conn.AddMatchSignal(
 		dbus.WithMatchObjectPath(upowerDevicePath),
 		dbus.WithMatchInterface(upowerPropsIface),
 		dbus.WithMatchMember("PropertiesChanged"),
 	); err != nil {
 		// Without the match rule no PropertiesChanged ever arrives. Keep the
-		// publisher (reconnect resends still work) but stop the watcher and
-		// say why once.
+		// publisher (reconnect resends and peers-driven repaints still work)
+		// and say why once.
 		log.Printf("[STATUS] Could not subscribe to UPower: %v", err)
-		return
-	}
-	p.conn.Signal(p.signals)
-	defer p.conn.RemoveSignal(p.signals)
+	} else {
+		p.conn.Signal(p.signals)
+		defer p.conn.RemoveSignal(p.signals)
+		signals = p.signals
 
-	// Re-read after the match is installed so a change between the probe and
-	// the subscription is not missed.
-	p.refresh()
+		// Re-read after the match is installed so a change between the probe
+		// and the subscription is not missed.
+		p.refresh()
+	}
 	for {
 		select {
 		case <-p.stop:
 			return
-		case signal, ok := <-p.signals:
+		case signal, ok := <-signals:
 			if !ok {
 				return
 			}
@@ -292,6 +315,25 @@ func (p *StatusPublisher) loop() {
 			}
 		}
 	}
+}
+
+// RepaintIfStale re-advertises the current battery when presence traffic
+// shows the cluster is listening and the last advertisement is ageing
+// towards the receivers' freshness drop. Called from the daemon's inbound
+// peers handler — the event source is the relay's fan-out, never a timer.
+// A quiet cluster costs one mutex and a time compare per peers frame.
+func (p *StatusPublisher) RepaintIfStale() {
+	if p == nil {
+		return
+	}
+	now := p.now()
+	p.mu.Lock()
+	due := p.haveLast && p.throttle.repaintDue(now)
+	p.mu.Unlock()
+	if !due {
+		return
+	}
+	p.refresh()
 }
 
 // Stop ends the watcher and closes the bus connection when the publisher owns
@@ -373,9 +415,15 @@ func (p *StatusPublisher) publishReading(reading batteryReading, force bool) {
 	}
 	now := p.now()
 	p.mu.Lock()
-	if force {
+	switch {
+	case force:
 		p.throttle.force(reading.Battery, reading.Charging, now)
-	} else if !p.throttle.shouldSend(reading.Battery, reading.Charging, now) {
+	case p.throttle.shouldSend(reading.Battery, reading.Charging, now):
+	case p.throttle.repaintDue(now):
+		// Unchanged but ageing: refresh the stored blob's timestamp so
+		// receivers keep seeing the battery.
+		p.throttle.force(reading.Battery, reading.Charging, now)
+	default:
 		p.mu.Unlock()
 		return
 	}

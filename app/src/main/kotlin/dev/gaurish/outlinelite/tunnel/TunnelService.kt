@@ -234,6 +234,8 @@ class TunnelService : VpnService() {
             it.copy(
                 phase = TunnelPhase.CONNECTED,
                 connectedAt = SystemClock.elapsedRealtime(),
+                attempt = 0,
+                retryAt = 0L,
                 lastError = null
             )
         }
@@ -285,6 +287,7 @@ class TunnelService : VpnService() {
         val gen = generation
         cleanupTunnel(keepInterface = blockOnReconnect)
         val cfg = activeConfig
+        val wasConnected = TunnelState.status.connectedAt > 0L
         if (userStopped || cfg == null) {
             giveUp(message)
             return
@@ -301,8 +304,21 @@ class TunnelService : VpnService() {
                 if (!keepAlive && gen == generation) giveUp(message)
                 return@launch
             }
+            // A dropped session is reconnecting; a first connect that has
+            // never succeeded is still just connecting.
+            val phase = if (wasConnected || failedAttempts > 1) {
+                TunnelPhase.RECONNECTING
+            } else {
+                TunnelPhase.CONNECTING
+            }
             TunnelState.update {
-                it.copy(phase = TunnelPhase.CONNECTING, connectedAt = 0L, lastError = message)
+                it.copy(
+                    phase = phase,
+                    connectedAt = 0L,
+                    lastError = message,
+                    attempt = failedAttempts,
+                    retryAt = SystemClock.elapsedRealtime() + wait,
+                )
             }
             pushNotification()
             notifyExternal(this@TunnelService)
@@ -318,10 +334,12 @@ class TunnelService : VpnService() {
         if (userStopped || gen != generation) return
         TunnelState.update {
             it.copy(
-                phase = TunnelPhase.CONNECTING,
+                phase = TunnelPhase.RECONNECTING,
                 activeName = cfg.second,
                 connectedAt = 0L,
-                lastError = reason
+                lastError = reason,
+                attempt = failedAttempts,
+                retryAt = 0L,
             )
         }
         pushNotification()
@@ -486,7 +504,9 @@ class TunnelService : VpnService() {
             it.copy(
                 phase = TunnelPhase.DISCONNECTED,
                 connectedAt = 0L,
-                allowLanAccess = false
+                allowLanAccess = false,
+                attempt = 0,
+                retryAt = 0L,
             )
         }
         notifyExternal(this)
@@ -502,7 +522,9 @@ class TunnelService : VpnService() {
                 phase = TunnelPhase.DISCONNECTED,
                 lastError = message,
                 connectedAt = 0L,
-                allowLanAccess = false
+                allowLanAccess = false,
+                attempt = 0,
+                retryAt = 0L,
             )
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -685,6 +707,7 @@ class TunnelService : VpnService() {
         return when (TunnelState.status.phase) {
             TunnelPhase.CONNECTED -> getString(R.string.notif_connected, TunnelState.status.activeName ?: "")
             TunnelPhase.CONNECTING -> getString(R.string.notif_connecting)
+            TunnelPhase.RECONNECTING -> getString(R.string.notif_reconnecting)
             else -> getString(R.string.app_name)
         }
     }

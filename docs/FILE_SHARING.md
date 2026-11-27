@@ -593,9 +593,13 @@ so they are never re-broadcast.
   results for replies).
 - The desktop daemon renders the notification with `notify-send`, including the
   icon and action buttons. A chosen action is sealed back to the source; reply
-  actions prompt with `zenity` or `kdialog`.
-- `gaur-share notify <device> <title> [body]` sends a sealed notification from
-  the desktop to a device.
+  actions prompt with `zenity` or `kdialog`. Updates to the same Android
+  notification reuse a stable `notify-send -r` id, so a chat that rewrites its
+  entry replaces the desktop bubble instead of stacking another one.
+- `gaur-share notify [-app name] [-package pkg] <device> <title> [body]` sends a
+  sealed notification from the desktop to a device. `--all` fans it out. `-app`
+  labels the source; `-package` lets the receiver suppress the mirror when that
+  app is installed there and already posted its own copy.
 - Android requires **Notification access** (Settings → Notifications → Share
   notifications). The desktop daemon uses `notify-send`.
 - Group summaries are skipped to avoid duplicate notifications.
@@ -603,9 +607,12 @@ so they are never re-broadcast.
   on it: Android checks whether the package is installed and enabled, and the
   desktop checks whether a matching process is running. Either way the local
   app posts the notification itself, so the mirrored copy would be a duplicate.
-  Desktop-originated payloads carry no package name and are never dropped this
-  way. A suppressed Android notification answers with `notification_ack`
-  status `suppressed`; that is expected, not a delivery failure.
+  Desktop-originated payloads without a package are always shown; the
+  Quickshell forwarder maps ZapFast/WhatsApp/Karere to `com.whatsapp`, Telegram
+  to `org.telegram.messenger`, and Signal to `org.thoughtcrime.securesms`, so
+  the phone drops the copy when it has the same app. A suppressed Android
+  notification answers with `notification_ack` status `suppressed`; that is
+  expected, not a delivery failure.
 - Rebranded desktop clients are matched by an explicit alias table because the
   process name shares nothing with the Android label. WhatsApp
   (`com.whatsapp`, including `com.whatsapp.w4b`) maps to the Linux clients
@@ -746,10 +753,19 @@ whether the phone will survive a transfer before sending one.
   as an optional `"status"` field. The relay never learns the battery level;
   it validates only length (≤160 chars) and base64 shape.
 - Receivers drop blobs whose authenticated `ts` is older than 10 minutes.
-- Publishers are event-driven, never polled: Android listens to
-  `ACTION_BATTERY_CHANGED` while the relay connection is up; the desktop
-  daemon watches UPower's `PropertiesChanged` on the system bus (battery-less
-  desktops publish nothing).
+- Publishers are event-driven; nothing is polled or timer-driven: Android
+  listens to `ACTION_BATTERY_CHANGED` while the relay connection is up; the
+  desktop daemon watches UPower's `PropertiesChanged` on the system bus
+  (battery-less desktops publish nothing). One wrinkle exists on both
+  platforms: a battery that has not changed in 5 minutes (a laptop parked
+  at full, plugged in) no longer produces events, while consumers decode
+  blobs against the 10-minute window. The fix rides existing events rather
+  than adding a timer: whenever a publisher receives a peers broadcast —
+  proof the cluster is listening — it re-advertises its unchanged battery
+  if the last advertisement is 5 minutes old or older. A quiet cluster
+  publishes nothing; a device that joins later sends its own status, whose
+  fan-out triggers everyone else's repaint, so its view heals within a
+  round trip.
 - The desktop daemon decrypts blobs and republishes them in
   `~/.cache/gaur-share/peers.json` as optional `"battery"` and `"charging"`
   fields per peer (schema addition; the file is 0600). Android shows them on
