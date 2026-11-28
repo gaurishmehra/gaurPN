@@ -57,6 +57,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.transfer.CameraLens
 import dev.gaurish.outlinelite.transfer.CameraTier
+import dev.gaurish.outlinelite.transfer.CameraGeometry
 import dev.gaurish.outlinelite.transfer.CameraSession
 import dev.gaurish.outlinelite.transfer.CameraSessionPhase
 import dev.gaurish.outlinelite.transfer.CameraSessionState
@@ -328,6 +329,16 @@ private fun StreamingPanel(session: CameraSession) {
                 selectedIndex = if (session.fps >= 60) 1 else 0,
                 onSelect = { index ->
                     CameraStreamService.setFps(if (index == 1) 60 else 30)
+                },
+            )
+            ControlLabel("Aspect")
+            SegmentedControl(
+                options = listOf("Fill (crop)", "Fit (bars)"),
+                selectedIndex = if (session.aspect == CameraGeometry.CameraAspect.FIT) 1 else 0,
+                onSelect = { index ->
+                    CameraStreamService.setAspect(
+                        if (index == 1) CameraGeometry.CameraAspect.FIT else CameraGeometry.CameraAspect.FILL,
+                    )
                 },
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

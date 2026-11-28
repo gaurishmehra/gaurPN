@@ -83,4 +83,77 @@ object CameraGeometry {
      * hundreds of milliseconds of stream latency.
      */
     fun captureFpsRange(fps: Int): Pair<Int, Int> = Pair(fps, fps)
+
+    // ------------------------------------------------------------- aspect
+
+    /**
+     * How a rotated source frame maps into the encoder surface when the two
+     * aspect ratios disagree — and they do: sensors hand back 4:3 buffers
+     * even when the tier asks for 16:9. Stretching is never an option.
+     */
+    enum class CameraAspect(val wire: String) {
+        /** Center-crop: the image fills the frame; the overflow beyond the destination aspect is cropped away. */
+        FILL("fill"),
+
+        /** Letterbox: the whole image stays visible; the remainder of the frame is black bars. */
+        FIT("fit");
+
+        companion object {
+            fun fromWire(value: String): CameraAspect? = entries.firstOrNull { it.wire == value }
+        }
+    }
+
+    /**
+     * The two numbers the GL draw needs for one aspect decision: the quad's
+     * position scale (below 1 shrinks the quad into letterbox bars) and the
+     * UV scale (below 1 crops the source center into the frame). Exactly one
+     * of the pairs is a no-op (1.0) per mode: FILL crops and never bars, FIT
+     * bars and never crops. The source is the camera's buffer size — the
+     * rotation is applied first, so the effective source is swapped at
+     * quarter turns, exactly as the encoder dims are.
+     */
+    data class AspectTransform(
+        val posScaleX: Float,
+        val posScaleY: Float,
+        val uvScaleX: Float,
+        val uvScaleY: Float,
+    )
+
+    private val ASPECT_IDENTITY = AspectTransform(1f, 1f, 1f, 1f)
+
+    /**
+     * Aspect mapping between the rotated source and the encoder surface.
+     * Degenerate dimensions fall back to the identity rather than dividing
+     * by zero — a zero-size window or buffer must not kill the draw loop.
+     */
+    fun aspectTransform(
+        sourceW: Int,
+        sourceH: Int,
+        destW: Int,
+        destH: Int,
+        rotationDeg: Int,
+        aspect: CameraAspect,
+    ): AspectTransform {
+        if (sourceW <= 0 || sourceH <= 0 || destW <= 0 || destH <= 0) return ASPECT_IDENTITY
+        val swap = rotationDeg % 180 == 90
+        val srcW = if (swap) sourceH else sourceW
+        val srcH = if (swap) sourceW else sourceH
+        val srcAspect = srcW.toFloat() / srcH
+        val dstAspect = destW.toFloat() / destH
+        return when {
+            aspect == CameraAspect.FILL && srcAspect > dstAspect ->
+                // Source is wider: keep the full height, crop the sides.
+                AspectTransform(1f, 1f, dstAspect / srcAspect, 1f)
+            aspect == CameraAspect.FILL ->
+                // Source is taller: keep the full width, crop top and bottom.
+                AspectTransform(1f, 1f, 1f, srcAspect / dstAspect)
+            srcAspect > dstAspect ->
+                // FIT with a wider source: full width would overflow, so the
+                // quad's height shrinks and bars land top and bottom.
+                AspectTransform(1f, dstAspect / srcAspect, 1f, 1f)
+            else ->
+                // FIT with a taller source: bars land left and right.
+                AspectTransform(srcAspect / dstAspect, 1f, 1f, 1f)
+        }
+    }
 }

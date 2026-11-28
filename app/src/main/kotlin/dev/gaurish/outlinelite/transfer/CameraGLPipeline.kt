@@ -84,6 +84,7 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
 
     private var program = 0
     private var uvMatrixHandle = 0
+    private var posScaleHandle = 0
     private var positionHandle = 0
     private var texCoordHandle = 0
 
@@ -91,11 +92,39 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
     @Volatile
     private var rotationDeg = 0
 
+    /**
+     * Aspect handling between the rotated camera frame and the encoder
+     * surface; written by [setAspect], read at draw time. FILL crops, FIT
+     * letterboxes, nothing stretches.
+     */
+    @Volatile
+    private var aspect: CameraGeometry.CameraAspect = CameraGeometry.CameraAspect.FILL
+
+    /** Camera buffer size, as last handed to [setCameraBufferSize]. */
+    @Volatile
+    private var cameraWidth = 0
+
+    @Volatile
+    private var cameraHeight = 0
+
+    /** Encoder window size, as queried at the last [attachEncoderSurface]. */
+    @Volatile
+    private var encoderWidth = 0
+
+    @Volatile
+    private var encoderHeight = 0
+
     /** Set before release; the draw and posted blocks stop on it. */
     private val released = AtomicBoolean(false)
 
     private val surfaceMatrix = FloatArray(16)
     private val uvMatrix = FloatArray(16)
+    private val uvCropMatrix = floatArrayOf(
+        1f, 0f, 0f, 0f,
+        0f, 1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 0f, 0f, 1f,
+    )
 
     /**
      * UV transforms for the four quarter turns, column-major 4x4, applied to
@@ -136,11 +165,12 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
 
     private val vertexSource = """
         uniform mat4 uUvMatrix;
+        uniform vec2 uPosScale;
         attribute vec4 aPosition;
         attribute vec2 aTexCoord;
         varying vec2 vTex;
         void main() {
-            gl_Position = aPosition;
+            gl_Position = vec4(aPosition.xy * uPosScale, 0.0, 1.0);
             vTex = (uUvMatrix * vec4(aTexCoord, 0.0, 1.0)).xy;
         }
     """.trimIndent()
@@ -307,6 +337,8 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
         val height = IntArray(1)
         EGL14.eglQuerySurface(display, window, EGL14.EGL_WIDTH, width, 0)
         EGL14.eglQuerySurface(display, window, EGL14.EGL_HEIGHT, height, 0)
+        encoderWidth = width[0]
+        encoderHeight = height[0]
         GLES20.glViewport(0, 0, width[0], height[0])
     }
 
@@ -343,6 +375,7 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
         GLES20.glDeleteShader(fragment)
         this.program = program
         uvMatrixHandle = GLES20.glGetUniformLocation(program, "uUvMatrix")
+        posScaleHandle = GLES20.glGetUniformLocation(program, "uPosScale")
         positionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
     }
@@ -365,15 +398,24 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
     /**
      * Sizes the SurfaceTexture's buffers to the requested resolution before
      * the surface is provided to CameraX; applied per SurfaceRequest, so a
-     * lens-switch rebind lands on the same size.
+     * lens-switch rebind lands on the same size. The size also feeds the
+     * aspect math: the camera's real buffer shape is what must be cropped
+     * or letterboxed into the encoder, never stretched.
      */
     fun setCameraBufferSize(width: Int, height: Int) {
+        cameraWidth = width
+        cameraHeight = height
         surfaceTexture?.setDefaultBufferSize(width, height)
     }
 
     /** Sets the clockwise rotation applied to every frame from here on. */
     fun setRotation(deg: Int) {
         rotationDeg = ((deg % 360) + 360) % 360
+    }
+
+    /** Sets the aspect handling applied to every frame from here on. */
+    fun setAspect(newAspect: CameraGeometry.CameraAspect) {
+        aspect = newAspect
     }
 
     // -------------------------------------------------------------- the draw
@@ -407,8 +449,26 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
         try {
             texture.getTransformMatrix(surfaceMatrix)
             Matrix.multiplyMM(uvMatrix, 0, surfaceMatrix, 0, rotationMatrix(), 0)
+            // The aspect decision runs per frame against the sizes that are
+            // live right now: the camera's buffer (a 4:3 sensor does not care
+            // what the tier asked for) and the encoder window (swapped by the
+            // rotation). FILL crops the source into the frame, FIT shrinks
+            // the quad and lets the clear show through as bars — either way
+            // the image keeps its proportions; stretching never happens.
+            val transform = CameraGeometry.aspectTransform(
+                sourceW = cameraWidth,
+                sourceH = cameraHeight,
+                destW = encoderWidth,
+                destH = encoderHeight,
+                rotationDeg = rotationDeg,
+                aspect = aspect,
+            )
+            composeUvCrop(transform)
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             GLES20.glUseProgram(program)
             GLES20.glUniformMatrix4fv(uvMatrixHandle, 1, false, uvMatrix, 0)
+            GLES20.glUniform2f(posScaleHandle, transform.posScaleX, transform.posScaleY)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTexture)
             GLES20.glEnableVertexAttribArray(positionHandle)
@@ -442,6 +502,23 @@ internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
     private fun rotationMatrix(): FloatArray {
         val quarter = (((rotationDeg % 360) + 360) % 360) / 90
         return uvRotationMatrices[quarter.coerceIn(0, 3)]
+    }
+
+    /**
+     * Composes the aspect crop into [uvMatrix] as the innermost remap: the
+     * rotation stands the frame up first, the crop then keeps the centered
+     * sub-rect of that upright image. Scales of 1.0 are the no-op the FILL
+     * side of the transform computes when nothing needs cropping.
+     */
+    private fun composeUvCrop(transform: CameraGeometry.AspectTransform) {
+        if (transform.uvScaleX >= 1f && transform.uvScaleY >= 1f) return
+        val tx = (1f - transform.uvScaleX) / 2f
+        val ty = (1f - transform.uvScaleY) / 2f
+        uvCropMatrix[0] = transform.uvScaleX
+        uvCropMatrix[5] = transform.uvScaleY
+        uvCropMatrix[12] = tx
+        uvCropMatrix[13] = ty
+        Matrix.multiplyMM(uvMatrix, 0, uvCropMatrix, 0, uvMatrix.copyOf(), 0)
     }
 
     // ------------------------------------------------------------- teardown

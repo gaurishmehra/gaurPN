@@ -128,4 +128,76 @@ class CameraGeometryTest {
             assertFalse("fps $fps", CameraGeometry.isSupportedFps(fps))
         }
     }
+
+    @Test
+    fun aspectNeverStretches() {
+        // A 4:3 sensor buffer into a 16:9 encoder is the case that made
+        // every mode matter: FILL scales to the width and crops the
+        // overflow height, FIT keeps the full image and bars it left and
+        // right. Neither mode distorts.
+        val fill = CameraGeometry.aspectTransform(
+            1440, 1080, 1920, 1080, 0, CameraGeometry.CameraAspect.FILL,
+        )
+        assertEquals(1f, fill.posScaleX)
+        assertEquals(1f, fill.posScaleY)
+        assertEquals(1f, fill.uvScaleX)
+        assertEquals(0.75f, fill.uvScaleY)
+
+        val fit = CameraGeometry.aspectTransform(
+            1440, 1080, 1920, 1080, 0, CameraGeometry.CameraAspect.FIT,
+        )
+        assertEquals(0.75f, fit.posScaleX)
+        assertEquals(1f, fit.posScaleY)
+        assertEquals(1f, fit.uvScaleX)
+        assertEquals(1f, fit.uvScaleY)
+    }
+
+    @Test
+    fun aspectTallerSourceCropsOrBarsTheOtherAxis() {
+        // A 16:9 source into a 4:3 destination: the overflow moves to the
+        // horizontal axis — FILL crops the sides, FIT bars top and bottom.
+        val fill = CameraGeometry.aspectTransform(
+            1920, 1080, 1440, 1080, 0, CameraGeometry.CameraAspect.FILL,
+        )
+        assertEquals(0.75f, fill.uvScaleX)
+        assertEquals(1f, fill.uvScaleY)
+
+        val fit = CameraGeometry.aspectTransform(
+            1920, 1080, 1440, 1080, 0, CameraGeometry.CameraAspect.FIT,
+        )
+        assertEquals(1f, fit.posScaleX)
+        assertEquals(0.75f, fit.posScaleY)
+    }
+
+    @Test
+    fun aspectMatchesAtTheSameRatioAndFollowsTheRotation() {
+        // Same ratio in every mode: nothing to crop or bar.
+        CameraGeometry.CameraAspect.entries.forEach { mode ->
+            val t = CameraGeometry.aspectTransform(1920, 1080, 1280, 720, 0, mode)
+            assertEquals(mode.wire, 1f, t.posScaleX)
+            assertEquals(mode.wire, 1f, t.posScaleY)
+            assertEquals(mode.wire, 1f, t.uvScaleX)
+            assertEquals(mode.wire, 1f, t.uvScaleY)
+        }
+
+        // A quarter turn swaps the effective source: the same 16:9 buffer
+        // into a portrait encoder still fits — rotation maps corner to
+        // corner, aspect stays honest.
+        val rotated = CameraGeometry.aspectTransform(
+            1920, 1080, 1080, 1920, 90, CameraGeometry.CameraAspect.FILL,
+        )
+        assertEquals(1f, rotated.posScaleX)
+        assertEquals(1f, rotated.posScaleY)
+        assertEquals(1f, rotated.uvScaleX)
+        assertEquals(1f, rotated.uvScaleY)
+    }
+
+    @Test
+    fun aspectDegenerateDimensionsFallBackToIdentity() {
+        val t = CameraGeometry.aspectTransform(0, 1080, 1920, 1080, 0, CameraGeometry.CameraAspect.FIT)
+        assertEquals(1f, t.posScaleX)
+        assertEquals(1f, t.posScaleY)
+        assertEquals(1f, t.uvScaleX)
+        assertEquals(1f, t.uvScaleY)
+    }
 }

@@ -33,6 +33,7 @@ data class CameraSession(
     val lens: CameraLens = CameraLens.BACK,
     val torchOn: Boolean = false,
     val rotationDeg: Int = 0,
+    val aspect: CameraGeometry.CameraAspect = CameraGeometry.CameraAspect.FILL,
 ) {
     /**
      * An accept prompt went up. A prompt never coexists with a live stream
@@ -129,6 +130,14 @@ data class CameraSession(
         } else {
             this
         }
+
+    /** A control change; a no-op or a control outside a live stream is ignored. */
+    fun withAspect(aspect: CameraGeometry.CameraAspect): CameraSession =
+        if (phase == CameraSessionPhase.STREAMING && aspect != this.aspect) {
+            copy(aspect = aspect)
+        } else {
+            this
+        }
 }
 
 /**
@@ -191,6 +200,11 @@ object CameraSessionState {
     /** A local control rotated the live session. */
     internal fun rotationChanged(rotationDeg: Int) {
         _session.update { it.withRotation(rotationDeg) }
+    }
+
+    /** A local control changed the aspect handling of the live session. */
+    internal fun aspectChanged(aspect: CameraGeometry.CameraAspect) {
+        _session.update { it.withAspect(aspect) }
     }
 
     /** The session ended — Stop, pipe close, or a failed start. */

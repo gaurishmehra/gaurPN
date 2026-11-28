@@ -1012,8 +1012,8 @@ The phone is not blind while it streams. An eye indicator on the cluster
 devices card names the viewer while the camera is live (or names a pending
 request) and opens the **camera preview** screen: a live `PreviewView` of
 what is being sent, plus accept/decline for a pending request and local
-controls — tier (1080p/720p/360p), frame rate (30/60 fps), lens, torch,
-rotation (0/90/180/270), and Stop. Both camera notifications deep-link to
+controls — tier (1080p/720p/360p), frame rate (30/60 fps), aspect
+(Fill/Fit), lens, torch, rotation (0/90/180/270), and Stop. Both camera notifications deep-link to
 this screen. An incoming request can therefore be answered from the app
 instead of the notification shade. Controls the phone applies locally (fps,
 rotation) never touch the wire; the desktop's tier/torch/lens/stop arrive
@@ -1027,14 +1027,25 @@ as `cam_control` and land in the same code path.
   the user can cycle quarter turns from the preview screen, and the
   encoder runs at swapped dimensions at 90/270 (portrait streams are
   1080x1920). The wire format is unchanged.
+- **Aspect is never stretched.** The camera's buffer shape (a 4:3 sensor
+  does not care what the tier asked for) is mapped into the encoder
+  frame by FILL (center-crop, the default) or FIT (letterbox bars) —
+  both switchable from the preview screen, both proportion-true.
 - **Frame rate:** 30 fps by default; 60 fps doubles the encoder bitrate
   and pins the capture AE range. Fps is phone-local (no wire change).
-- **Latency:** the encoder is configured for low latency (`KEY_LATENCY=1`
-  on Android 11+), no B-frames, CBR, 2 s keyframes; the capture AE range
-  is pinned to the frame rate (with a log-once unpinned fallback); and
-  the relay connections set `TCP_NODELAY`. The desktop player runs mpv
-  `--untimed` with zero analyze/probe budgets so frames render on
-  arrival.
+- **Adaptive bitrate.** A fixed rate pushed into a link that cannot carry
+  it does not degrade the picture, it queues — every buffer along the
+  path fills and the viewer watches seconds-old scenes. The encoder
+  rate follows backpressure: a dropped frame steps it down 40%, a run
+  of clean writes steps it back up toward the tier's ceiling, and the
+  relay's low-latency pipes stage only 256 KiB so backpressure arrives
+  in hundreds of milliseconds instead of after seconds of video.
+- **Capture latency:** the encoder is configured for low latency
+  (`KEY_LATENCY=1` on Android 11+), no B-frames, CBR, 2 s keyframes; the
+  capture AE range is pinned to the frame rate (with a log-once
+  unpinned fallback); and the relay connections set `TCP_NODELAY`. The
+  desktop player runs mpv `--untimed` with zero analyze/probe budgets so
+  frames render on arrival.
 
 ### Quality tiers
 

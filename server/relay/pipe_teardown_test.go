@@ -14,8 +14,13 @@ import (
 // Before the receiver-side close, the sender blocked forever: its writes
 // stalled once the pipe buffer filled, the session was never idle (Write
 // touches it), and the sweep never reaped it. The pipe now closes with
-// errReceiverGone the moment the receiver leaves, so the sender's copy
-// aborts and its request returns.
+// errReceiverGone the moment the receiver leaves, so the sender's next
+// write errors and its request returns.
+//
+// The sender models a live streamer, not a one-shot upload: it writes
+// continuously, because the sender only learns the pipe closed by failing
+// a write — a silent body would stay parked inside the relay's body read
+// and prove nothing.
 func TestPipeReceiverDisconnectEndsSender(t *testing.T) {
 	token := []byte("test-secret-token")
 	hub := NewHub(token, mustChunkStore(t, "", 0, 0))
@@ -28,12 +33,11 @@ func TestPipeReceiverDisconnectEndsSender(t *testing.T) {
 	senderURL := srv.URL + "/pipe?transfer_id=" + transferID + "&role=sender&token=test-secret-token"
 	recvURL := srv.URL + "/pipe?transfer_id=" + transferID + "&role=receiver&token=test-secret-token"
 
-	// The sender POSTs a body that stays open until the relay kills it.
+	endless := struct{ io.Reader }{io.MultiReader(strings.NewReader("frame-zero"), neverEnding{})}
+
 	senderDone := make(chan error, 1)
 	go func() {
-		pr, pw := io.Pipe()
-		go pw.Write([]byte("frame-zero"))
-		req, err := http.NewRequest(http.MethodPost, senderURL, pr)
+		req, err := http.NewRequest(http.MethodPost, senderURL, endless)
 		if err != nil {
 			senderDone <- err
 			return
@@ -48,7 +52,7 @@ func TestPipeReceiverDisconnectEndsSender(t *testing.T) {
 		senderDone <- nil
 	}()
 
-	// The receiver connects, then hangs up without draining.
+	// The receiver connects, reads what is already flowing, then hangs up.
 	deadline := time.Now().Add(5 * time.Second)
 	var resp *http.Response
 	for {
@@ -63,6 +67,8 @@ func TestPipeReceiverDisconnectEndsSender(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	buf := make([]byte, 64)
+	resp.Body.Read(buf)
 	resp.Body.Close()
 
 	select {
@@ -73,6 +79,17 @@ func TestPipeReceiverDisconnectEndsSender(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatalf("sender still blocked after the receiver disconnected")
 	}
+}
+
+// neverEnding always has one more chunk, like a camera that never stops
+// producing frames.
+type neverEnding struct{}
+
+func (neverEnding) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	return len(p), nil
 }
 
 // The sender-first order keeps its current behavior: the receiver drains the

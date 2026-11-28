@@ -40,6 +40,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlin.math.max
+import kotlin.math.min
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
@@ -53,6 +55,7 @@ import okhttp3.Request
 import okhttp3.RequestBody
 import okio.BufferedSink
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -138,6 +141,22 @@ class CameraStreamService : Service() {
 
     private var lens: CameraLens = CameraLens.BACK
     private var torchOn = false
+    private var aspect: CameraGeometry.CameraAspect = CameraGeometry.CameraAspect.FILL
+
+    /**
+     * Adaptive bitrate. The tunnel and the home uplink are not dedicated: a
+     * fixed 8 Mbps pushed into a link that cannot carry it does not degrade
+     * the picture, it queues — every buffer along the chain (lwIP, the
+     * router, the relay's pipe) fills, and the viewer watches a scene from
+     * ten seconds ago. The ladder reacts to the only honest signal,
+     * backpressure: a dropped frame means the socket is behind, so the
+     * bitrate steps down; a run of clean writes means the path has room, so
+     * it steps back up toward the tier's target. Everything rides existing
+     * frame flow — no timers.
+     */
+    private val targetBitrate = AtomicInteger(0)
+    private val currentBitrate = AtomicInteger(0)
+    private val cleanWrites = AtomicInteger(0)
 
     /**
      * Clockwise rotation baked into the stream by the GL pipeline, computed
@@ -339,6 +358,13 @@ class CameraStreamService : Service() {
      * encoder reports through INFO_OUTPUT_FORMAT_CHANGED.
      */
     private fun startEncoder() {
+        // The ladder's ceiling for this generation: the tier's bitrate
+        // (doubled at 60 fps). The applied value starts at the ceiling; a
+        // fresh encoder begins at its configured format bitrate.
+        val bitrate = CameraGeometry.encoderBitrate(tier, fps)
+        targetBitrate.set(bitrate)
+        currentBitrate.set(bitrate)
+        cleanWrites.set(0)
         val thread = HandlerThread("gaur-camera-encoder").apply { start() }
         encoderThread = thread
         val handler = Handler(thread.looper)
@@ -431,6 +457,58 @@ class CameraStreamService : Service() {
                     Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) },
                 )
             }
+            // Backpressure is also the congestion signal: the socket could
+            // not keep up with this frame, so the bitrate steps down before
+            // the buffers along the path turn into seconds of delay.
+            adaptiveStepDown()
+        }
+    }
+
+    // ------------------------------------------------ adaptive bitrate
+
+    /**
+     * Steps the encoder down on backpressure: 0.6x, floored at
+     * [MIN_STREAM_BITRATE]. A compare-and-set decides the race between the
+     * encoder thread's drops and the writer's recoveries; the loser sees the
+     * value already moved and does nothing.
+     */
+    private fun adaptiveStepDown() {
+        val now = currentBitrate.get()
+        if (now <= 0) return
+        val next = max(MIN_STREAM_BITRATE, (now * 0.6f).toInt())
+        if (next >= now) return
+        if (!currentBitrate.compareAndSet(now, next)) return
+        cleanWrites.set(0)
+        applyStreamBitrate(next)
+        Log.i(TAG, "Camera stream bitrate $now -> $next (backpressure)")
+    }
+
+    /**
+     * Steps the encoder back up after [ADAPTIVE_RECOVERY_FRAMES] clean
+     * writes, capped at the tier's target. Recovery is deliberately slower
+     * than backoff (roughly a full second of clean flow at 30 fps), so a
+     * path hovering at capacity converges low instead of thrashing.
+     */
+    private fun adaptiveStepUpMaybe() {
+        if (cleanWrites.incrementAndGet() < ADAPTIVE_RECOVERY_FRAMES) return
+        cleanWrites.set(0)
+        val cap = targetBitrate.get()
+        val now = currentBitrate.get()
+        if (now <= 0 || now >= cap) return
+        val next = min(cap, (now * 1.25f).toInt())
+        if (next <= now) return
+        if (!currentBitrate.compareAndSet(now, next)) return
+        applyStreamBitrate(next)
+        Log.i(TAG, "Camera stream bitrate $now -> $next (recovered)")
+    }
+
+    /** Applies a live CBR value without restarting the encoder. */
+    private fun applyStreamBitrate(bitrate: Int) {
+        val encoder = codec ?: return
+        runCatching {
+            encoder.setParameters(
+                Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, bitrate) },
+            )
         }
     }
 
@@ -594,6 +672,9 @@ class CameraStreamService : Service() {
                     )
                     sink.write(sealed)
                     sink.flush()
+                    // A frame that left the socket cleanly is the path
+                    // breathing; the ladder counts them to recover.
+                    adaptiveStepUpMaybe()
                 }
             }
         }
@@ -703,6 +784,19 @@ class CameraStreamService : Service() {
         glPipeline?.setRotation(quarter)
         CameraSessionState.rotationChanged(quarter)
         restartEncoder()
+    }
+
+    /**
+     * Aspect change: pure GL — the crop or letterbox is recomputed on the
+     * next frame against the same camera buffer and encoder window. No
+     * encoder restart, no rebind; the change is visible immediately.
+     */
+    private fun applyAspect(newAspect: CameraGeometry.CameraAspect) {
+        if (stopping.get() || !sessionReady) return
+        if (newAspect == aspect) return
+        aspect = newAspect
+        glPipeline?.setAspect(aspect)
+        CameraSessionState.aspectChanged(aspect)
     }
 
     /** Unbinds and rebinds the camera (lens switch, tier or fps change). */
@@ -951,6 +1045,12 @@ class CameraStreamService : Service() {
         /** The usual back sensor; only used if the bound camera reports none. */
         private const val DEFAULT_SENSOR_ORIENTATION = 90
 
+        /** The adaptive ladder's floor; below this the picture is the problem, not the link. */
+        private const val MIN_STREAM_BITRATE = 600_000
+
+        /** Clean writes before the ladder steps back up (~1 s at 30 fps). */
+        private const val ADAPTIVE_RECOVERY_FRAMES = 90
+
         private val OCTET_STREAM: MediaType = "application/octet-stream".toMediaType()
 
         const val ACTION_START = "dev.gaurish.outlinelite.action.CAMERA_STREAM_START"
@@ -1029,6 +1129,10 @@ class CameraStreamService : Service() {
         /** Rotates the live session to a quarter turn; false when none is live. */
         fun setRotation(deg: Int): Boolean =
             dispatchLocal { service -> service.mainHandler.post { service.applyRotation(deg) } }
+
+        /** Sets the aspect handling of the live session; false when none is live. */
+        fun setAspect(aspect: CameraGeometry.CameraAspect): Boolean =
+            dispatchLocal { service -> service.mainHandler.post { service.applyAspect(aspect) } }
 
         /**
          * Binds the local display Preview of the live session; false when

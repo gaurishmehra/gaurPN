@@ -199,6 +199,11 @@ const (
 	// sender can keep the network socket full while the receiver drains
 	// at its own pace.
 	pipeBufferSize = 2 << 20
+	// lowLatencyPipeBufferSize is the staged-video budget of a flush=1
+	// session: small enough that backpressure reaches the sender within a
+	// few hundred milliseconds at stream bitrates, so the phone's adaptive
+	// ladder reacts before the viewer's delay grows.
+	lowLatencyPipeBufferSize = 256 * 1024
 	// pipeIdleTimeout is how long a pipe session may move no bytes
 	// before the hub's sweep evicts it.
 	pipeIdleTimeout = 5 * time.Minute
@@ -233,10 +238,21 @@ type PipeSession struct {
 	receiverActive bool
 }
 
-func newPipeSession(transferID string) *PipeSession {
+func newPipeSession(transferID string, lowLatency bool) *PipeSession {
+	// A live camera receiver opts into flush=1 and gets a small buffer:
+	// a 2 MiB queue holds seconds of video, and seconds of staged video are
+	// seconds of glass-to-glass delay. The small buffer turns a slow
+	// receiver into backpressure within ~0.3 s at 8 Mbps, which the phone's
+	// adaptive bitrate ladder answers by dropping the encoder rate. File
+	// receivers keep the big buffer: a tail drain must not stall the sender
+	// on every hiccup.
+	bufferSize := pipeBufferSize
+	if lowLatency {
+		bufferSize = lowLatencyPipeBufferSize
+	}
 	return &PipeSession{
 		transferID:    transferID,
-		pipe:          newBufferedPipe(pipeBufferSize),
+		pipe:          newBufferedPipe(bufferSize),
 		receiverReady: make(chan struct{}),
 		senderReady:   make(chan struct{}),
 		done:          make(chan struct{}),
@@ -838,7 +854,7 @@ func (h *Hub) handlePipe(w http.ResponseWriter, r *http.Request) {
 	h.pipeMu.Lock()
 	session, exists := h.pipes[transferID]
 	if !exists {
-		session = newPipeSession(transferID)
+		session = newPipeSession(transferID, lowLatency)
 		h.pipes[transferID] = session
 	}
 	// One live sender and one live receiver per transfer. A second
