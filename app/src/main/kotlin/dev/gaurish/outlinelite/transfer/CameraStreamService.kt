@@ -128,6 +128,9 @@ class CameraStreamService : Service() {
 
     private var requesterId: String = ""
     private var requesterName: String = ""
+
+    /** The stable origin id of the viewer; matches the devices-card peer row. */
+    private var requesterOriginId: String = ""
     private var tier: CameraTier = CameraTier.HIGH
 
     /** Capture rate, 30 or 60; 60 doubles the encoder bitrate. Phone-local. */
@@ -213,6 +216,7 @@ class CameraStreamService : Service() {
         }
         requesterId = intent.getStringExtra(EXTRA_REQUESTER_ID) ?: ""
         requesterName = intent.getStringExtra(EXTRA_REQUESTER_NAME) ?: ""
+        requesterOriginId = intent.getStringExtra(EXTRA_REQUESTER_ORIGIN_ID) ?: ""
         // Claim the ids first: when the system denies the foreground start —
         // the Android 14+ while-in-use rule bites the auto-accept path —
         // teardown must still release the manager's HELD_UNTIL_RELEASED lease.
@@ -316,6 +320,7 @@ class CameraStreamService : Service() {
         sessionReady = true
         CameraSessionState.streaming(
             requesterName = requesterName.ifBlank { requesterId },
+            requesterOriginId = requesterOriginId,
             tier = tier,
             fps = fps,
             lens = lens,
@@ -718,7 +723,13 @@ class CameraStreamService : Service() {
      */
     private fun restartEncoder() {
         encoderGeneration++
-        glPipeline?.detachEncoderSurface()
+        try {
+            glPipeline?.detachEncoderSurface()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Camera GL detach failed: ${t.javaClass.simpleName}; stopping session")
+            stopSession()
+            return
+        }
         runCatching { codec?.stop() }
         runCatching { codec?.release() }
         codec = null
@@ -734,7 +745,12 @@ class CameraStreamService : Service() {
             return
         }
         val surface = encoderSurface ?: return
-        glPipeline?.attachEncoderSurface(surface)
+        try {
+            glPipeline?.attachEncoderSurface(surface)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Camera GL attach failed: ${t.javaClass.simpleName}; stopping session")
+            stopSession()
+        }
     }
 
     /** Discards stale frames left in the queue (tier, fps, or rotation change). */
@@ -861,7 +877,10 @@ class CameraStreamService : Service() {
         // again if one is waiting, idle otherwise.
         val waitingPrompt = RelayManager.pendingCameraRequest.value
         if (waitingPrompt != null) {
-            CameraSessionState.sessionEndedWithPrompt(waitingPrompt.requesterName)
+            CameraSessionState.sessionEndedWithPrompt(
+                requesterName = waitingPrompt.requesterName,
+                requesterOriginId = waitingPrompt.requesterOriginId,
+            )
         } else {
             CameraSessionState.reset()
         }
@@ -940,6 +959,7 @@ class CameraStreamService : Service() {
         const val EXTRA_SESSION_ID = "session_id"
         const val EXTRA_REQUESTER_ID = "requester_id"
         const val EXTRA_REQUESTER_NAME = "requester_name"
+        const val EXTRA_REQUESTER_ORIGIN_ID = "requester_origin_id"
 
         @Volatile
         private var activeService: CameraStreamService? = null
@@ -955,6 +975,7 @@ class CameraStreamService : Service() {
             sessionId: String,
             requesterId: String,
             requesterName: String,
+            requesterOriginId: String,
         ): Boolean = runCatching {
             val intent = Intent(context, CameraStreamService::class.java)
                 .setAction(ACTION_START)
@@ -962,6 +983,7 @@ class CameraStreamService : Service() {
                 .putExtra(EXTRA_SESSION_ID, sessionId)
                 .putExtra(EXTRA_REQUESTER_ID, requesterId)
                 .putExtra(EXTRA_REQUESTER_NAME, requesterName)
+                .putExtra(EXTRA_REQUESTER_ORIGIN_ID, requesterOriginId)
             ContextCompat.startForegroundService(context, intent)
             true
         }.getOrDefault(false)

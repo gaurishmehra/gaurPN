@@ -18,12 +18,13 @@ class CameraSessionStateTest {
 
     @Test
     fun idleToPendingToStreamingToIdle() {
-        val pending = CameraSession().toPending("Lilac")
+        val pending = CameraSession().toPending("Lilac", "lilac-id")
         assertEquals(CameraSessionPhase.REQUEST_PENDING, pending.phase)
         assertEquals("Lilac", pending.requesterName)
 
         val streaming = pending.toStreaming(
             requesterName = "Lilac",
+            requesterOriginId = "lilac-id",
             tier = CameraTier.BALANCED,
             fps = 60,
             lens = CameraLens.FRONT,
@@ -49,6 +50,7 @@ class CameraSessionStateTest {
         // Auto-accept skips the prompt entirely.
         val streaming = CameraSession().toStreaming(
             requesterName = "Lilac",
+            requesterOriginId = "lilac-id",
             tier = CameraTier.HIGH,
             fps = 30,
             lens = CameraLens.BACK,
@@ -63,21 +65,21 @@ class CameraSessionStateTest {
         // A second request cannot stack on a live session; the transition
         // keeps the truth instead of the newest write.
         val streaming = CameraSession()
-            .toPending("Lilac")
-            .toStreaming("Lilac", CameraTier.HIGH, 30, CameraLens.BACK, 90)
-        val unchanged = streaming.toPending("Other desktop")
+            .toPending("Lilac", "lilac-id")
+            .toStreaming("Lilac", "lilac-id", CameraTier.HIGH, 30, CameraLens.BACK, 90)
+        val unchanged = streaming.toPending("Other desktop", "other-id")
         assertEquals(CameraSessionPhase.STREAMING, unchanged.phase)
         assertEquals("Lilac", unchanged.requesterName)
     }
 
     @Test
     fun resolvingAPromptDropsOnlyAPendingSession() {
-        val streaming = CameraSession().toStreaming("Lilac", CameraTier.HIGH, 30, CameraLens.BACK, 90)
+        val streaming = CameraSession().toStreaming("Lilac", "lilac-id", CameraTier.HIGH, 30, CameraLens.BACK, 90)
         assertEquals(
             CameraSessionPhase.STREAMING,
             streaming.toIdleIfPending().phase,
         )
-        val pending = CameraSession().toPending("Lilac")
+        val pending = CameraSession().toPending("Lilac", "lilac-id")
         assertEquals(
             CameraSessionPhase.IDLE,
             pending.toIdleIfPending().phase,
@@ -89,10 +91,10 @@ class CameraSessionStateTest {
         // Two origins can each hold a live prompt; the first one's stream
         // ends while the second prompt is still inside its window.
         val streaming = CameraSession()
-            .toPending("Lilac")
-            .toStreaming("Lilac", CameraTier.LOW, 60, CameraLens.FRONT, 270)
+            .toPending("Lilac", "lilac-id")
+            .toStreaming("Lilac", "lilac-id", CameraTier.LOW, 60, CameraLens.FRONT, 270)
             .withTorch(true)
-        val back = streaming.backToPending("Other desktop")
+        val back = streaming.backToPending("Other desktop", "other-id")
         assertEquals(CameraSessionPhase.REQUEST_PENDING, back.phase)
         assertEquals("Other desktop", back.requesterName)
         // The finished stream's tier, lens, torch, and rotation do not leak
@@ -124,7 +126,7 @@ class CameraSessionStateTest {
     @Test
     fun controlsUpdateTheLiveSession() {
         val changed = CameraSession()
-            .toStreaming("Lilac", CameraTier.HIGH, 30, CameraLens.BACK, 90)
+            .toStreaming("Lilac", "lilac-id", CameraTier.HIGH, 30, CameraLens.BACK, 90)
             .withTier(CameraTier.LOW)
             .withFps(60)
             .withLens(CameraLens.FRONT)
@@ -140,7 +142,7 @@ class CameraSessionStateTest {
 
     @Test
     fun noOpControlsAreRejectedWithoutAChange() {
-        val streaming = CameraSession().toStreaming("Lilac", CameraTier.HIGH, 30, CameraLens.BACK, 90)
+        val streaming = CameraSession().toStreaming("Lilac", "lilac-id", CameraTier.HIGH, 30, CameraLens.BACK, 90)
         // The service uses the same rule to skip an encoder restart.
         assertEquals(streaming, streaming.withTier(CameraTier.HIGH))
         assertEquals(streaming, streaming.withFps(30))
@@ -156,15 +158,15 @@ class CameraSessionStateTest {
         CameraSessionState.reset()
         assertEquals(CameraSessionPhase.IDLE, CameraSessionState.session.value.phase)
 
-        CameraSessionState.promptPosted("Lilac")
+        CameraSessionState.promptPosted("Lilac", "lilac-id")
         assertEquals(CameraSessionPhase.REQUEST_PENDING, CameraSessionState.session.value.phase)
         assertEquals("Lilac", CameraSessionState.session.value.requesterName)
 
         CameraSessionState.promptResolved()
         assertEquals(CameraSessionPhase.IDLE, CameraSessionState.session.value.phase)
 
-        CameraSessionState.promptPosted("Lilac")
-        CameraSessionState.streaming("Lilac", CameraTier.HIGH, 30, CameraLens.BACK, 90)
+        CameraSessionState.promptPosted("Lilac", "lilac-id")
+        CameraSessionState.streaming("Lilac", "lilac-id", CameraTier.HIGH, 30, CameraLens.BACK, 90)
         val streaming = CameraSessionState.session.value
         assertEquals(CameraSessionPhase.STREAMING, streaming.phase)
         assertEquals(90, streaming.rotationDeg)

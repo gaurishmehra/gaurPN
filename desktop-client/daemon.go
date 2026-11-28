@@ -302,6 +302,13 @@ func buildPeerEntries(cfg Config, peerCryptoKey []byte, peersRaw []interface{}, 
 	for _, p := range peersRaw {
 		pMap, _ := p.(map[string]interface{})
 		id, _ := pMap["id"].(string)
+		// Ephemeral reqdev- sessions are one-shot CLI requesters (cam,
+		// ask, browse) riding beside a device's real connection. They
+		// are not devices, and publishing them would show the same
+		// machine twice in a shell peer list while a command runs.
+		if strings.HasPrefix(id, "reqdev-") {
+			continue
+		}
 		name, _ := pMap["name"].(string)
 		entry := peerFileEntry{
 			ID:     id,

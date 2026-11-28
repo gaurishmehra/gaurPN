@@ -307,60 +307,6 @@ fun ClusterSharingSection(
                         Spacer(Modifier.height(8.dp))
                     }
 
-                    // The camera row only exists while there is something to
-                    // say: a live stream, or a request waiting for an answer.
-                    // It is the one row that names someone watching, and it
-                    // opens the preview screen where the controls live.
-                    val cameraStreaming = cameraSession.phase == CameraSessionPhase.STREAMING
-                    if (cameraStreaming || cameraSession.phase == CameraSessionPhase.REQUEST_PENDING) {
-                        val requester = cameraSession.requesterName.ifBlank { "a device" }
-                        Reveal(order = 0, enabled = motionEnabled) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(MaterialTheme.shapes.medium)
-                                    .benchSurface(
-                                        shape = MaterialTheme.shapes.medium,
-                                        color = scheme.surfaceContainerHigh,
-                                        onClickLabel = if (cameraStreaming) {
-                                            "Open the camera preview"
-                                        } else {
-                                            "Review the camera request"
-                                        },
-                                        role = Role.Button,
-                                    ) { onOpenCameraPreview() }
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                            ) {
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_eye),
-                                    contentDescription = null,
-                                    tint = scheme.primary,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                                Text(
-                                    if (cameraStreaming) {
-                                        "Camera streaming to $requester"
-                                    } else {
-                                        "$requester wants to view your camera"
-                                    },
-                                    style = BenchType.Body,
-                                    color = scheme.onSurface,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                Icon(
-                                    painter = painterResource(R.drawable.ic_chevron_right),
-                                    contentDescription = null,
-                                    tint = scheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                        Spacer(Modifier.height(10.dp))
-                    }
-
                     if (otherPeers.isEmpty()) {
                         Text(
                             when (relayLink) {
@@ -398,6 +344,14 @@ fun ClusterSharingSection(
                                             // non-destructive request; the old
                                             // confirm step only added friction.
                                             onBrowseClick = { onBrowsePeer(peer) },
+                                            onViewCamera = if (
+                                                cameraSession.phase != CameraSessionPhase.IDLE &&
+                                                cameraSession.requesterOriginId == peer.id
+                                            ) {
+                                                onOpenCameraPreview
+                                            } else {
+                                                null
+                                            },
                                         )
                                     }
                                 }
@@ -632,6 +586,7 @@ private fun PeerRow(
     actionLabel: String = "Send",
     onSendClick: () -> Unit,
     onBrowseClick: (() -> Unit)? = null,
+    onViewCamera: (() -> Unit)? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
     val haptics = rememberHaptics()
@@ -688,6 +643,27 @@ private fun PeerRow(
             }
         }
 
+        // The camera indicator lives on the viewer's row, beside the other
+        // actions: the eye is shown only while this peer is viewing (or has
+        // asked to), opens the preview screen, and carries the accent so a
+        // live camera reads as activity, not as another button.
+        if (onViewCamera != null) {
+            IconButton(
+                onClick = {
+                    haptics.select()
+                    onViewCamera()
+                },
+                modifier = Modifier.semantics {
+                    contentDescription = "Camera with ${peer.name}"
+                },
+            ) {
+                Icon(
+                    painter = painterResource(R.drawable.ic_eye),
+                    contentDescription = null,
+                    tint = scheme.primary,
+                )
+            }
+        }
         // Both cluster actions are visible on the row. Browsing used to hide
         // behind a row tap plus a confirmation dialog — a feature nobody can
         // find is not a feature.

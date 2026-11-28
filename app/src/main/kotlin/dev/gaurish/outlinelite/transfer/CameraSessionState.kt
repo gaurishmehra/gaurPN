@@ -21,6 +21,13 @@ enum class CameraSessionPhase { IDLE, REQUEST_PENDING, STREAMING }
 data class CameraSession(
     val phase: CameraSessionPhase = CameraSessionPhase.IDLE,
     val requesterName: String = "",
+    /**
+     * The stable device id of whoever is viewing (or asking to). The
+     * devices card matches it against a peer row, so the eye indicator
+     * can sit on the viewer's row instead of a separate banner. Empty
+     * only for the idle default.
+     */
+    val requesterOriginId: String = "",
     val tier: CameraTier = CameraTier.HIGH,
     val fps: Int = CameraGeometry.FPS_30,
     val lens: CameraLens = CameraLens.BACK,
@@ -33,9 +40,13 @@ data class CameraSession(
      * that arrives while streaming is ignored rather than clobbering the
      * truth.
      */
-    fun toPending(requesterName: String): CameraSession =
+    fun toPending(requesterName: String, requesterOriginId: String): CameraSession =
         if (phase == CameraSessionPhase.IDLE) {
-            copy(phase = CameraSessionPhase.REQUEST_PENDING, requesterName = requesterName)
+            copy(
+                phase = CameraSessionPhase.REQUEST_PENDING,
+                requesterName = requesterName,
+                requesterOriginId = requesterOriginId,
+            )
         } else {
             this
         }
@@ -53,10 +64,11 @@ data class CameraSession(
      * open. Unlike [toPending], this replaces the finished stream: the
      * stream's state stopped being true the moment the encoder went away.
      */
-    fun backToPending(requesterName: String): CameraSession =
+    fun backToPending(requesterName: String, requesterOriginId: String): CameraSession =
         copy(
             phase = CameraSessionPhase.REQUEST_PENDING,
             requesterName = requesterName,
+            requesterOriginId = requesterOriginId,
             tier = CameraTier.HIGH,
             fps = CameraGeometry.FPS_30,
             lens = CameraLens.BACK,
@@ -72,6 +84,7 @@ data class CameraSession(
      */
     fun toStreaming(
         requesterName: String,
+        requesterOriginId: String,
         tier: CameraTier,
         fps: Int,
         lens: CameraLens,
@@ -79,6 +92,7 @@ data class CameraSession(
     ): CameraSession = copy(
         phase = CameraSessionPhase.STREAMING,
         requesterName = requesterName,
+        requesterOriginId = requesterOriginId,
         tier = tier,
         fps = fps,
         lens = lens,
@@ -131,8 +145,8 @@ object CameraSessionState {
     val session: StateFlow<CameraSession> = _session.asStateFlow()
 
     /** An accept prompt was posted with this requester. */
-    internal fun promptPosted(requesterName: String) {
-        _session.update { it.toPending(requesterName) }
+    internal fun promptPosted(requesterName: String, requesterOriginId: String) {
+        _session.update { it.toPending(requesterName, requesterOriginId) }
     }
 
     /** The newest prompt is gone; a live stream is untouched. */
@@ -143,13 +157,14 @@ object CameraSessionState {
     /** The service bound the camera and started the encoder. */
     internal fun streaming(
         requesterName: String,
+        requesterOriginId: String,
         tier: CameraTier,
         fps: Int,
         lens: CameraLens,
         rotationDeg: Int,
     ) {
         _session.update {
-            it.toStreaming(requesterName, tier, fps, lens, rotationDeg)
+            it.toStreaming(requesterName, requesterOriginId, tier, fps, lens, rotationDeg)
         }
     }
 
@@ -187,7 +202,7 @@ object CameraSessionState {
      * The session ended while another origin's prompt is still waiting: the
      * phase goes back to pending with that prompt, not to idle.
      */
-    internal fun sessionEndedWithPrompt(requesterName: String) {
-        _session.update { it.backToPending(requesterName) }
+    internal fun sessionEndedWithPrompt(requesterName: String, requesterOriginId: String) {
+        _session.update { it.backToPending(requesterName, requesterOriginId) }
     }
 }

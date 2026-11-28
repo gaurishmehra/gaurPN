@@ -10,6 +10,7 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.Matrix
 import android.os.Handler
+import android.os.Looper
 import android.os.HandlerThread
 import android.util.Log
 import android.view.Surface
@@ -17,6 +18,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -41,11 +43,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * only a user action changes — the sensor's orientation is sampled once per
  * session by the service, never per frame.
  */
-internal class CameraGLPipeline(private val onError: () -> Unit) {
+internal class CameraGLPipeline(private val onError: (Throwable) -> Unit) {
+
+    /** Failures hop to the main thread before the callback runs; see [onErrorFromGl]. */
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     companion object {
         private const val TAG = "CameraGLPipeline"
         private const val GL_THREAD_NAME = "gaur-camera-gl"
+
+        /** Upper bound for one round trip onto the GL thread. */
+        private const val POST_TIMEOUT_MS = 2_500L
 
         /**
          * Not exposed by EGL14: the Android extension bit that marks a
@@ -274,9 +282,11 @@ internal class CameraGLPipeline(private val onError: () -> Unit) {
     /**
      * Rebuilds the EGL window surface around the encoder's input surface and
      * makes it current. Called once per encoder generation; the camera side
-     * of the pipeline persists across calls.
+     * of the pipeline persists across calls. A no-op after release — the
+     * teardown already owns the session.
      */
     fun attachEncoderSurface(surface: Surface) {
+        if (released.get()) return
         runOnGlThread { attachEncoderSurfaceOnGl(surface) }
     }
 
@@ -301,12 +311,13 @@ internal class CameraGLPipeline(private val onError: () -> Unit) {
     }
 
     /**
-     * Drops the current encoder window. Frames are skipped (not drawn, not
-     * errored) until the next [attachEncoderSurface]; the encoder restart
-     * calls this before releasing the old codec, so a frame that arrives
-     * mid-restart never lands on a dead window.
+     * Drops the current encoder window. Frames are consumed but not drawn
+     * until the next [attachEncoderSurface]; the encoder restart calls this
+     * before releasing the old codec, so a frame that arrives mid-restart
+     * never lands on a dead window. A no-op after release.
      */
     fun detachEncoderSurface() {
+        if (released.get()) return
         runOnGlThread { destroyEncoderWindowOnGl() }
     }
 
@@ -373,14 +384,27 @@ internal class CameraGLPipeline(private val onError: () -> Unit) {
      * current rotation. The SurfaceTexture transform is what an external
      * image needs to sample the right way up; the rotation remap turns that
      * upright frame by the session's quarter turns, corner to corner.
+     *
+     * updateTexImage runs even while no encoder window is attached (an
+     * encoder restart): without it the SurfaceTexture's buffer queue backs
+     * up, the camera producer stalls, and the next generation starts with a
+     * starved pipeline. Frames are consumed, not drawn, until the window
+     * returns.
      */
     private fun drawFrameOnGl() {
         if (released.get()) return
         val texture = surfaceTexture ?: return
+        try {
+            texture.updateTexImage()
+        } catch (t: Throwable) {
+            Log.w(TAG, "Camera GL consume failed: ${t.javaClass.simpleName}")
+            onErrorFromGl(t)
+            return
+        }
+        if (released.get()) return
         val window = encoderWindow
         if (window == EGL14.EGL_NO_SURFACE) return
         try {
-            texture.updateTexImage()
             texture.getTransformMatrix(surfaceMatrix)
             Matrix.multiplyMM(uvMatrix, 0, surfaceMatrix, 0, rotationMatrix(), 0)
             GLES20.glUseProgram(program)
@@ -399,8 +423,20 @@ internal class CameraGLPipeline(private val onError: () -> Unit) {
             }
         } catch (t: Throwable) {
             Log.w(TAG, "Camera GL draw failed: ${t.javaClass.simpleName}")
-            onError()
+            onErrorFromGl(t)
         }
+    }
+
+    /**
+     * The draw loop's failure exit. The callback runs on the GL thread, but
+     * its consequence (teardown) must never execute there: stopSession
+     * reaches back into this pipeline's release, which posts to the GL
+     * thread and waits on a latch — posted from the GL thread itself, that
+     * wait can never be satisfied. The failure hops to the main thread; the
+     * GL thread returns to its loop, so teardown still completes.
+     */
+    private fun onErrorFromGl(error: Throwable) {
+        mainHandler.post { onError(error) }
     }
 
     private fun rotationMatrix(): FloatArray {
@@ -472,7 +508,8 @@ internal class CameraGLPipeline(private val onError: () -> Unit) {
      * Runs [block] on the GL thread and waits for it. The service calls the
      * pipeline from its startup and control paths, which are already
      * synchronous with respect to the camera; a posted block after release is
-     * a no-op.
+     * a no-op. The wait is bounded: an unresponsive GL thread surfaces as an
+     * error to the caller instead of parking the main thread forever.
      */
     private fun runOnGlThread(block: () -> Unit) {
         val h = handler ?: throw IllegalStateException("GL pipeline not started")
@@ -487,7 +524,9 @@ internal class CameraGLPipeline(private val onError: () -> Unit) {
                 done.countDown()
             }
         }
-        done.await()
+        if (!done.await(POST_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            throw IllegalStateException("GL thread did not respond in ${POST_TIMEOUT_MS}ms")
+        }
         failure?.let { throw it }
     }
 

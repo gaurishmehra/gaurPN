@@ -73,6 +73,8 @@ internal data class PendingCameraPrompt(
 data class PendingCameraRequest(
     val requestId: String,
     val requesterName: String,
+    /** The stable device id of the asking origin; keys the peer-row eye indicator. */
+    val requesterOriginId: String,
 )
 
 /**
@@ -96,6 +98,9 @@ object RelayManager {
     private const val MAX_SEALED_PAYLOAD_BYTES = 512 * 1024
     private const val MAX_NOTIFICATION_PAYLOAD_BYTES = 256 * 1024
     private const val MAX_HISTORY_LABEL_CHARS = 120
+
+    /** One-shot CLI requester sessions ask under this id prefix. */
+    private const val REQDEV_PREFIX = "reqdev-"
 
     /** One listing round trip; a lost reply becomes a retryable UI error. */
     private const val BROWSE_TIMEOUT_MS = 10_000L
@@ -432,7 +437,13 @@ object RelayManager {
                         Log.w(TAG, "Ignoring stale status blob from $id")
                     }
                 }
-                _peers.value = decoded.peers
+                // Ephemeral reqdev- sessions are one-shot CLI requesters
+                // (cam, ask, browse) riding beside a device's real daemon
+                // connection. They are not devices: showing them would list
+                // the same machine twice while a command runs. Routing never
+                // sees them here — sealed replies address the requester id
+                // from the request itself.
+                _peers.value = decoded.peers.filter { !it.id.startsWith(REQDEV_PREFIX) }
                 // Presence traffic proves the cluster is listening: this is
                 // the event that re-advertises an unchanged battery before
                 // it ages past the freshness window. No timer is involved.
@@ -1681,6 +1692,7 @@ object RelayManager {
                 sessionId = sessionId,
                 requesterId = request.requesterId,
                 requesterName = request.requesterName,
+                requesterOriginId = request.trustId,
             )
             if (!started) {
                 sendDecline(
@@ -1744,12 +1756,13 @@ object RelayManager {
                 PendingCameraRequest(
                     requestId = prompt.request.requestId,
                     requesterName = requesterLabel(prompt.request.requesterName, prompt.request.trustId),
+                    requesterOriginId = prompt.request.trustId,
                 )
             }
         }
         _pendingCameraRequest.value = pending
         if (pending != null) {
-            CameraSessionState.promptPosted(pending.requesterName)
+            CameraSessionState.promptPosted(pending.requesterName, pending.requesterOriginId)
         } else {
             CameraSessionState.promptResolved()
         }
