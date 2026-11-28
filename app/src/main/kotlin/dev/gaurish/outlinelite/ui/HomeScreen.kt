@@ -119,6 +119,7 @@ fun HomeScreen(
     onOpenSettings: () -> Unit,
     onOpenHistory: () -> Unit,
     onBrowsePeer: (ClusterPeer) -> Unit,
+    onOpenCameraPreview: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
     val connected = status.phase == TunnelPhase.CONNECTED
@@ -201,6 +202,7 @@ fun HomeScreen(
                             reconnecting = status.phase == TunnelPhase.RECONNECTING,
                             onOpenSettings = onOpenSettings,
                             onBrowsePeer = onBrowsePeer,
+                            onOpenCameraPreview = onOpenCameraPreview,
                         )
                     }
                 }
@@ -278,6 +280,7 @@ fun HomeScreen(
                                 reconnecting = status.phase == TunnelPhase.RECONNECTING,
                                 onOpenSettings = onOpenSettings,
                                 onBrowsePeer = onBrowsePeer,
+                                onOpenCameraPreview = onOpenCameraPreview,
                             )
                         }
                     }
@@ -887,6 +890,7 @@ private fun DevicesSection(
     reconnecting: Boolean,
     onOpenSettings: () -> Unit,
     onBrowsePeer: (ClusterPeer) -> Unit,
+    onOpenCameraPreview: () -> Unit,
 ) {
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
     val link by RelayManager.link.collectAsStateWithLifecycle()
@@ -917,6 +921,7 @@ private fun DevicesSection(
                 ClusterSharingSection(
                     onOpenSettings = onOpenSettings,
                     onBrowsePeer = onBrowsePeer,
+                    onOpenCameraPreview = onOpenCameraPreview,
                     embedded = true,
                     showHeader = false,
                     relayLink = link,

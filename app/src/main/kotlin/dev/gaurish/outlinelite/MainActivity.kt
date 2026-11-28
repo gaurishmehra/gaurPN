@@ -90,6 +90,7 @@ import dev.gaurish.outlinelite.data.isValid
 import dev.gaurish.outlinelite.data.maskedToken
 import dev.gaurish.outlinelite.transfer.ClipboardSyncManager
 import dev.gaurish.outlinelite.transfer.ClusterPeer
+import dev.gaurish.outlinelite.transfer.CameraRequestNotifications
 import dev.gaurish.outlinelite.transfer.RelayManager
 import dev.gaurish.outlinelite.transfer.MediaSessionBridge
 import dev.gaurish.outlinelite.transfer.NotificationMirrorManager
@@ -98,6 +99,7 @@ import dev.gaurish.outlinelite.tunnel.TunnelService
 import dev.gaurish.outlinelite.tunnel.TunnelState
 import dev.gaurish.outlinelite.ui.BrowseScreen
 import dev.gaurish.outlinelite.ui.BrowseSort
+import dev.gaurish.outlinelite.ui.CameraPreviewScreen
 import dev.gaurish.outlinelite.ui.HistoryScreen
 import dev.gaurish.outlinelite.ui.HomeScreen
 import dev.gaurish.outlinelite.ui.Motion
@@ -126,6 +128,9 @@ class MainActivity : ComponentActivity() {
     private var pendingSharedText by mutableStateOf<String?>(null)
     private var pendingOpenOnArrival by mutableStateOf(false)
     private var pendingPairing by mutableStateOf<PairingRequest?>(null)
+
+    /** A camera notification asked for the preview screen; consumed by the composition. */
+    private var pendingRouteCamera by mutableStateOf(false)
 
     private val consentLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
@@ -159,6 +164,10 @@ class MainActivity : ComponentActivity() {
             ?: sharedTextFrom(intent)
         pendingOpenOnArrival = savedInstanceState?.getBoolean(KEY_PENDING_OPEN_ON_ARRIVAL)
             ?: isOpenIntent(intent)
+        // A camera notification tap survives a recreation that happens
+        // between the tap and the first frame of the preview screen.
+        pendingRouteCamera = savedInstanceState?.getBoolean(KEY_PENDING_ROUTE_CAMERA)
+            ?: routeCameraFrom(intent)
 
         if (Build.VERSION.SDK_INT >= 33 &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
@@ -222,12 +231,24 @@ class MainActivity : ComponentActivity() {
                         screen = target
                     }
 
+                    // The camera notifications deep-link here: a fresh
+                    // launch carries the flag in, a live activity sets it in
+                    // onNewIntent, and either way it routes once, to the
+                    // preview screen.
+                    LaunchedEffect(pendingRouteCamera) {
+                        if (pendingRouteCamera) {
+                            screen = Screens.CAMERA_PREVIEW
+                            pendingRouteCamera = false
+                        }
+                    }
+
                     BackHandler(
                         enabled = displayedScreen != Screens.HOME && displayedScreen != Screens.BROWSE,
                     ) {
                         screen = when (displayedScreen) {
                             Screens.SETTINGS, Screens.SERVERS -> Screens.HOME
                             Screens.HISTORY -> historyOrigin
+                            Screens.CAMERA_PREVIEW -> Screens.CAMERA
                             else -> Screens.SETTINGS
                         }
                     }
@@ -269,7 +290,13 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         Screens.CAMERA -> {
-                            CameraScreen(onBack = { screen = Screens.SETTINGS })
+                            CameraScreen(
+                                onBack = { screen = Screens.SETTINGS },
+                                onOpenPreview = { screen = Screens.CAMERA_PREVIEW },
+                            )
+                        }
+                        Screens.CAMERA_PREVIEW -> {
+                            CameraPreviewScreen(onBack = { screen = Screens.CAMERA })
                         }
                         Screens.MEDIA -> {
                             MediaScreen(onBack = { screen = Screens.SETTINGS })
@@ -389,6 +416,7 @@ class MainActivity : ComponentActivity() {
                                     browsePeer = peer
                                     screen = Screens.BROWSE
                                 },
+                                onOpenCameraPreview = { screen = Screens.CAMERA_PREVIEW },
                             )
                         }
                         }
@@ -506,6 +534,7 @@ class MainActivity : ComponentActivity() {
         outState.putParcelableArrayList(KEY_PENDING_SHARED_URIS, ArrayList(pendingSharedUris))
         outState.putString(KEY_PENDING_SHARED_TEXT, pendingSharedText)
         outState.putBoolean(KEY_PENDING_OPEN_ON_ARRIVAL, pendingOpenOnArrival)
+        outState.putBoolean(KEY_PENDING_ROUTE_CAMERA, pendingRouteCamera)
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -523,6 +552,9 @@ class MainActivity : ComponentActivity() {
             pendingSharedText = text
             pendingOpenOnArrival = isOpenIntent(intent)
         }
+        // The activity is alive; the camera route still has to change the
+        // composed screen.
+        if (routeCameraFrom(intent)) pendingRouteCamera = true
     }
 
     /**
@@ -696,12 +728,21 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * True when the intent carries the camera notifications' route extra:
+     * both the prompt and the streaming notification open the preview
+     * screen, where the accept card or the live controls are.
+     */
+    private fun routeCameraFrom(intent: Intent?): Boolean =
+        intent?.getBooleanExtra(CameraRequestNotifications.EXTRA_ROUTE_CAMERA, false) == true
+
     private companion object {
         const val NOTIFICATION_REQUEST_CODE = 99
         const val KEY_PENDING_KEY_ID = "pending_key_id"
         const val KEY_PENDING_SHARED_URIS = "pending_shared_uris"
         const val KEY_PENDING_SHARED_TEXT = "pending_shared_text"
         const val KEY_PENDING_OPEN_ON_ARRIVAL = "pending_open_on_arrival"
+        const val KEY_PENDING_ROUTE_CAMERA = "pending_route_camera"
     }
 }
 

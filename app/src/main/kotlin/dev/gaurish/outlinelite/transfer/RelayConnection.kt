@@ -17,8 +17,11 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.net.InetAddress
+import java.net.Socket
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.SocketFactory
 
 /**
  * The OkHttp WebSocket session to the in-tunnel relay: the shared client,
@@ -44,8 +47,16 @@ internal object RelayConnection {
         fun onFailure(context: Context, httpCode: Int?)
     }
 
-    /** Shared HTTP/WebSocket client; also used by the chunk transport. */
+    /**
+     * Shared HTTP/WebSocket client; also used by the chunk transport and
+     * the camera stream pipe. The socket factory wraps the platform default
+     * and sets TCP_NODELAY on every socket, so each sealed envelope or
+     * camera frame chunk leaves the phone the moment it is written instead
+     * of waiting for Nagle batching; the relay is a loopback hop inside the
+     * tunnel, where a 40 ms coalescing delay is pure latency.
+     */
     val client = OkHttpClient.Builder()
+        .socketFactory(NoDelaySocketFactory())
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS) // infinite for WS and streaming
         .writeTimeout(0, TimeUnit.MILLISECONDS)
@@ -179,4 +190,31 @@ internal object RelayConnection {
         ws?.close(1000, "Disconnect")
         ws = null
     }
+}
+
+/**
+ * The platform's default socket factory with TCP_NODELAY on every socket it
+ * hands out. Everything else about each socket stays the platform default,
+ * so the shared client keeps its connect-timeout and streaming read/write
+ * behavior.
+ */
+private class NoDelaySocketFactory : SocketFactory() {
+
+    private val delegate: SocketFactory = SocketFactory.getDefault()
+
+    private fun Socket.withNoDelay(): Socket = apply { tcpNoDelay = true }
+
+    override fun createSocket(): Socket = delegate.createSocket().withNoDelay()
+
+    override fun createSocket(host: String, port: Int): Socket =
+        delegate.createSocket(host, port).withNoDelay()
+
+    override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
+        delegate.createSocket(host, port, localHost, localPort).withNoDelay()
+
+    override fun createSocket(host: InetAddress, port: Int): Socket =
+        delegate.createSocket(host, port).withNoDelay()
+
+    override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket =
+        delegate.createSocket(address, port, localAddress, localPort).withNoDelay()
 }

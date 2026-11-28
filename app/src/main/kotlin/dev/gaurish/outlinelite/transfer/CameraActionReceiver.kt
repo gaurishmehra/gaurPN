@@ -9,9 +9,11 @@ import android.content.Intent
  * from the streaming notification. The notification tap is the user
  * interaction that exempts the phone from the Android 14+ restriction on
  * starting a camera foreground service from the background, so Accept is
- * forwarded immediately; Decline answers with the existing sealed decline.
- * Stop is routed to the running service, which releases the request slot,
- * stops the camera, and removes its own notification.
+ * forwarded immediately — through the same manager functions the in-app
+ * accept card uses, with the request id the notification action carries.
+ * Decline answers with the existing sealed decline. Stop is routed to the
+ * running service, which releases the request slot, stops the camera, and
+ * removes its own notification.
  */
 class CameraActionReceiver : BroadcastReceiver() {
 
@@ -24,8 +26,11 @@ class CameraActionReceiver : BroadcastReceiver() {
             CameraRequestNotifications.ACTION_ACCEPT, CameraRequestNotifications.ACTION_DECLINE -> {
                 val requestId = intent.getStringExtra(CameraRequestNotifications.EXTRA_REQUEST_ID)
                 if (requestId.isNullOrBlank()) return
-                val approved = intent.action == CameraRequestNotifications.ACTION_ACCEPT
-                RelayManager.resolveCameraRequest(appContext, requestId, approved)
+                if (intent.action == CameraRequestNotifications.ACTION_ACCEPT) {
+                    RelayManager.acceptPendingCameraRequest(appContext, requestId)
+                } else {
+                    RelayManager.declinePendingCameraRequest(appContext, requestId)
+                }
             }
             else -> Unit
         }

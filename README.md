@@ -61,7 +61,7 @@ Your devices should talk to each other through a server you pay for. gaurPN keep
 - **Media control (MPRIS)**: Android media sessions appear as local players on the desktop. Play, pause, skip, seek, volume. Position interpolates locally; commands are sealed and expire after 30 seconds.
 - **Pull transfers**: browse a trusted device's home directory (desktop) or media collections (phone; grant All files access for full shared storage) and fetch what you pick. Browsing is trusted-only and rate-limited, grants expire in five minutes, and every accepted fetch posts a notification on the target.
 - **Peer status**: battery and charging state ride inside encrypted presence updates, so you know a device can survive a transfer before you send one.
-- **Camera streaming**: `gaur-share cam <phone>` shows a trusted phone's camera live on the desktop (or feeds it to a v4l2 loopback as a system webcam). Hardware HEVC end to end, three quality tiers switchable mid-stream, torch and lens controls, accept prompt on the phone with an auto-accept opt-in.
+- **Camera streaming**: `gaur-share cam <phone>` shows a trusted phone's camera live on the desktop (or feeds it to a v4l2 loopback as a system webcam). Hardware HEVC end to end, upright rotation baked on the phone, three quality tiers switchable mid-stream, torch and lens controls, and a phone-side preview screen with its own controls, an eye indicator on the devices card, and in-app accept for requests.
 - **Transfer history**: local-only list of sent and received files and text, with open, retry, resend, and cancel.
 
 ### Clipboard sync

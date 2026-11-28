@@ -19,6 +19,8 @@ import java.util.concurrent.atomic.AtomicInteger
  * Android 14+, and the window is the request's own 120 s expiry, enforced by
  * the system via setTimeoutAfter. The stream notification carries the Stop
  * action; the service owns its lifecycle (startForeground / stopForeground).
+ * Both notifications' content intent opens the in-app preview screen, where
+ * the same prompt and controls live.
  *
  * The prompt is private on the lock screen: the requester's name is visible
  * only after unlock.
@@ -31,6 +33,13 @@ internal object CameraRequestNotifications {
     const val ACTION_DECLINE = "dev.gaurish.outlinelite.CAMERA_DECLINE"
     const val ACTION_STOP = "dev.gaurish.outlinelite.CAMERA_STOP"
     const val EXTRA_REQUEST_ID = "camera_request_id"
+
+    /**
+     * Set on both camera notifications' content intents: tapping the
+     * notification opens the preview screen, where the prompt (with its
+     * Accept/Decline actions) or the live controls are.
+     */
+    const val EXTRA_ROUTE_CAMERA = "camera_route_preview"
 
     /**
      * PendingIntent identity ignores extras, so two live prompts that hash to
@@ -66,6 +75,7 @@ internal object CameraRequestNotifications {
             val body = context.getString(R.string.camera_prompt_body, label)
             val accept = action(context, request.requestId, ACTION_ACCEPT, nextRequestCode())
             val decline = action(context, request.requestId, ACTION_DECLINE, nextRequestCode())
+            val content = contentIntent(context, nextRequestCode())
             val publicVersion = NotificationCompat.Builder(context, PROMPT_CHANNEL_ID)
                 .setSmallIcon(R.drawable.ic_key)
                 .setContentTitle(context.getString(R.string.camera_prompt_title))
@@ -77,6 +87,7 @@ internal object CameraRequestNotifications {
                 .setContentTitle(context.getString(R.string.camera_prompt_title))
                 .setContentText(body)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setContentIntent(content)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .setCategory(NotificationCompat.CATEGORY_CALL)
                 .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
@@ -112,14 +123,7 @@ internal object CameraRequestNotifications {
             NotificationManager.IMPORTANCE_LOW,
             description = "Shown while a trusted device is viewing this phone's camera",
         )
-        val contentIntent = PendingIntent.getActivity(
-            context,
-            0,
-            Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
-            },
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
+        val contentIntent = contentIntent(context, 0)
         val stop = PendingIntent.getBroadcast(
             context,
             nextRequestCode(),
@@ -145,6 +149,23 @@ internal object CameraRequestNotifications {
             .addAction(0, context.getString(R.string.camera_action_stop), stop)
             .build()
     }
+
+    /**
+     * Opens the preview screen on a notification tap, so the prompt or the
+     * live controls are one tap away. PendingIntent identity ignores
+     * extras, so the prompt notification uses a fresh request code like its
+     * actions; the stream notification keeps its stable one.
+     */
+    private fun contentIntent(context: Context, requestCode: Int): PendingIntent =
+        PendingIntent.getActivity(
+            context,
+            requestCode,
+            Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP
+                putExtra(EXTRA_ROUTE_CAMERA, true)
+            },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
 
     private fun action(
         context: Context,

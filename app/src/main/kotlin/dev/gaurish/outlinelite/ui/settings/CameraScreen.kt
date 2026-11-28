@@ -41,6 +41,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.TransferSettingsRepository
 import dev.gaurish.outlinelite.transfer.CameraLens
+import dev.gaurish.outlinelite.transfer.CameraSessionPhase
+import dev.gaurish.outlinelite.transfer.CameraSessionState
 import dev.gaurish.outlinelite.transfer.CameraTier
 import dev.gaurish.outlinelite.ui.BenchType
 import kotlinx.coroutines.launch
@@ -68,10 +70,12 @@ private fun tierSummary(tier: CameraTier): String =
  * Live camera streaming to trusted desktops: the request toggle (gated on
  * the CAMERA runtime permission), auto-accept, the default quality tier, and
  * the default lens. Streaming starts from an Accept/Decline prompt; the
- * desktop controls torch, lens, and tier live, and ends with Stop.
+ * desktop controls torch, lens, and tier live, and ends with Stop. The live
+ * preview screen — the local view and the same controls — opens from the
+ * first row.
  */
 @Composable
-fun CameraScreen(onBack: () -> Unit) {
+fun CameraScreen(onBack: () -> Unit, onOpenPreview: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -83,6 +87,7 @@ fun CameraScreen(onBack: () -> Unit) {
         .collectAsStateWithLifecycle(initialValue = TransferSettingsRepository.CAMERA_QUALITY_DEFAULT)
     val cameraLens by TransferSettingsRepository.observeCameraLens(context)
         .collectAsStateWithLifecycle(initialValue = TransferSettingsRepository.CAMERA_LENS_DEFAULT)
+    val session by CameraSessionState.session.collectAsStateWithLifecycle()
 
     // The camera grant lives in the OS, so the row re-reads it when the user
     // comes back from the system dialog instead of trusting a stale value.
@@ -128,6 +133,22 @@ fun CameraScreen(onBack: () -> Unit) {
     var showLensDialog by remember { mutableStateOf(false) }
 
     SettingsScaffold(title = "Camera", onBack = onBack) {
+        // The live row is always present: a live stream can outlive the
+        // allow toggle below, and an idle state that hid the screen would
+        // make the notification deep link a dead end.
+        SettingsRow(
+            title = "Live preview",
+            summary = when (session.phase) {
+                CameraSessionPhase.STREAMING ->
+                    "Streaming to ${session.requesterName.ifBlank { "a device" }}"
+                CameraSessionPhase.REQUEST_PENDING ->
+                    "${session.requesterName.ifBlank { "A device" }} wants to view your camera"
+                CameraSessionPhase.IDLE ->
+                    "Open the live view and controls while a stream is up"
+            },
+            onClick = onOpenPreview,
+            trailing = { Chevron() },
+        )
         SettingsRow(
             title = "Allow camera requests",
             summary = when {

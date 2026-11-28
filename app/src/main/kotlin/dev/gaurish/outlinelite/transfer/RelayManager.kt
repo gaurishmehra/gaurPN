@@ -65,6 +65,17 @@ internal data class PendingCameraPrompt(
 )
 
 /**
+ * The camera prompt the in-app accept card describes: the newest unexpired
+ * prompt, or null when none is waiting. Published alongside
+ * [CameraSessionState]'s pending phase, which carries the same name for the
+ * devices-card row.
+ */
+data class PendingCameraRequest(
+    val requestId: String,
+    val requesterName: String,
+)
+
+/**
  * Facade for the cluster relay: owns the device identity, the peer and
  * transfer-state flows, and the WebSocket message dispatch (clipboard,
  * text, notification, and media routing). The socket session lives in
@@ -132,6 +143,15 @@ object RelayManager {
      * cannot take it while the notification is visible. Guarded by itself.
      */
     private val pendingCameraPrompts = LinkedHashMap<String, PendingCameraPrompt>()
+
+    /**
+     * The camera prompt the UI answers in-app, when one is waiting. The
+     * notification is still the primary surface; this flow only mirrors the
+     * registry so the preview screen and the accept/decline functions below
+     * share one source of truth.
+     */
+    private val _pendingCameraRequest = MutableStateFlow<PendingCameraRequest?>(null)
+    val pendingCameraRequest: StateFlow<PendingCameraRequest?> = _pendingCameraRequest.asStateFlow()
 
     /**
      * The single request currently being served. Held from acceptance until
@@ -1534,6 +1554,7 @@ object RelayManager {
         if (!CameraRequestNotifications.showPrompt(context, request, notifId)) {
             synchronized(pendingCameraPrompts) { pendingCameraPrompts.remove(request.requestId) }
             NotificationIds.release(notifId)
+            publishPendingCameraRequest()
             sendDecline(
                 context, request.requesterId, request.requestId, DeclineReason.NOT_ALLOWED,
             )
@@ -1542,6 +1563,7 @@ object RelayManager {
         // One-shot cleanup: the notification times out on the system side;
         // this releases the held notification id and drops the registry
         // entry without a periodic timer.
+        publishPendingCameraRequest()
         scope.launch {
             delay((request.expiresTs - System.currentTimeMillis()).coerceAtLeast(0L))
             val expired = synchronized(pendingCameraPrompts) {
@@ -1550,8 +1572,26 @@ object RelayManager {
             if (expired != null) {
                 CameraRequestNotifications.cancelPrompt(context, expired.notifId)
                 NotificationIds.release(expired.notifId)
+                publishPendingCameraRequest()
             }
         }
+    }
+
+    /**
+     * Accepts the camera request the in-app card is showing — or the one a
+     * notification action named, when [requestId] is passed. The same
+     * resolve path serves both surfaces, so the registry entry is removed
+     * synchronously and a second tap can never answer the same request.
+     */
+    fun acceptPendingCameraRequest(context: Context, requestId: String? = null) {
+        val id = requestId ?: _pendingCameraRequest.value?.requestId ?: return
+        resolveCameraRequest(context, id, accepted = true)
+    }
+
+    /** Declines the same request [acceptPendingCameraRequest] would accept. */
+    fun declinePendingCameraRequest(context: Context, requestId: String? = null) {
+        val id = requestId ?: _pendingCameraRequest.value?.requestId ?: return
+        resolveCameraRequest(context, id, accepted = false)
     }
 
     /**
@@ -1566,6 +1606,7 @@ object RelayManager {
             ?: return
         CameraRequestNotifications.cancelPrompt(context, prompt.notifId)
         NotificationIds.release(prompt.notifId)
+        publishPendingCameraRequest()
         val request = prompt.request
         val appCtx = context.applicationContext
 
@@ -1691,6 +1732,29 @@ object RelayManager {
             pendingCameraPrompts.values.any { it.request.trustId == trustId && now < it.request.expiresTs }
         }
 
+    /**
+     * Mirrors the live camera prompts into the UI state: the newest prompt,
+     * or the clear when none is left. Called after every registry change —
+     * a post, a resolution, or an expiry — so the in-app card and the
+     * session phase never disagree with the notifications.
+     */
+    private fun publishPendingCameraRequest() {
+        val pending = synchronized(pendingCameraPrompts) {
+            pendingCameraPrompts.values.lastOrNull()?.let { prompt ->
+                PendingCameraRequest(
+                    requestId = prompt.request.requestId,
+                    requesterName = requesterLabel(prompt.request.requesterName, prompt.request.trustId),
+                )
+            }
+        }
+        _pendingCameraRequest.value = pending
+        if (pending != null) {
+            CameraSessionState.promptPosted(pending.requesterName)
+        } else {
+            CameraSessionState.promptResolved()
+        }
+    }
+
     /** Drops expired camera prompts and releases their notification ids. */
     private fun removeExpiredCameraPrompts(context: Context, now: Long) {
         val expired = synchronized(pendingCameraPrompts) {
@@ -1702,6 +1766,7 @@ object RelayManager {
             CameraRequestNotifications.cancelPrompt(context, it.notifId)
             NotificationIds.release(it.notifId)
         }
+        if (expired.isNotEmpty()) publishPendingCameraRequest()
     }
 
     private fun handleRequestDeclined(context: Context, inner: JSONObject) {

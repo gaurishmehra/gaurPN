@@ -63,6 +63,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -74,6 +75,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.gaurish.outlinelite.R
 import dev.gaurish.outlinelite.data.KeyRepository
 import dev.gaurish.outlinelite.data.TrustedDeviceRepository
+import dev.gaurish.outlinelite.transfer.CameraSessionPhase
+import dev.gaurish.outlinelite.transfer.CameraSessionState
 import dev.gaurish.outlinelite.transfer.ClusterPeer
 import dev.gaurish.outlinelite.transfer.RelayLinkPhase
 import dev.gaurish.outlinelite.transfer.RelayManager
@@ -187,6 +190,7 @@ fun LanAccessRow(
 fun ClusterSharingSection(
     onOpenSettings: () -> Unit,
     onBrowsePeer: (ClusterPeer) -> Unit,
+    onOpenCameraPreview: () -> Unit,
     modifier: Modifier = Modifier,
     embedded: Boolean = false,
     showHeader: Boolean = true,
@@ -196,6 +200,7 @@ fun ClusterSharingSection(
     val scheme = MaterialTheme.colorScheme
     val peers by RelayManager.peers.collectAsStateWithLifecycle()
     val token by KeyRepository.observeClusterToken(context).collectAsStateWithLifecycle(initialValue = "")
+    val cameraSession by CameraSessionState.session.collectAsStateWithLifecycle()
     val motionEnabled = rememberMotionEnabled()
 
     var targetPeerForPicker by remember { mutableStateOf<ClusterPeer?>(null) }
@@ -300,6 +305,60 @@ fun ClusterSharingSection(
                             )
                         }
                         Spacer(Modifier.height(8.dp))
+                    }
+
+                    // The camera row only exists while there is something to
+                    // say: a live stream, or a request waiting for an answer.
+                    // It is the one row that names someone watching, and it
+                    // opens the preview screen where the controls live.
+                    val cameraStreaming = cameraSession.phase == CameraSessionPhase.STREAMING
+                    if (cameraStreaming || cameraSession.phase == CameraSessionPhase.REQUEST_PENDING) {
+                        val requester = cameraSession.requesterName.ifBlank { "a device" }
+                        Reveal(order = 0, enabled = motionEnabled) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(MaterialTheme.shapes.medium)
+                                    .benchSurface(
+                                        shape = MaterialTheme.shapes.medium,
+                                        color = scheme.surfaceContainerHigh,
+                                        onClickLabel = if (cameraStreaming) {
+                                            "Open the camera preview"
+                                        } else {
+                                            "Review the camera request"
+                                        },
+                                        role = Role.Button,
+                                    ) { onOpenCameraPreview() }
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                            ) {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_eye),
+                                    contentDescription = null,
+                                    tint = scheme.primary,
+                                    modifier = Modifier.size(16.dp),
+                                )
+                                Text(
+                                    if (cameraStreaming) {
+                                        "Camera streaming to $requester"
+                                    } else {
+                                        "$requester wants to view your camera"
+                                    },
+                                    style = BenchType.Body,
+                                    color = scheme.onSurface,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_chevron_right),
+                                    contentDescription = null,
+                                    tint = scheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        Spacer(Modifier.height(10.dp))
                     }
 
                     if (otherPeers.isEmpty()) {
