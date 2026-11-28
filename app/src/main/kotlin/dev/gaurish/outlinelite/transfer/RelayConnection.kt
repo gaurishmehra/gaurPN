@@ -193,28 +193,41 @@ internal object RelayConnection {
 }
 
 /**
- * The platform's default socket factory with TCP_NODELAY on every socket it
- * hands out. Everything else about each socket stays the platform default,
- * so the shared client keeps its connect-timeout and streaming read/write
- * behavior.
+ * The platform's default socket factory with TCP_NODELAY and bounded socket
+ * buffers on every socket it hands out. NODELAY keeps per-frame writes from
+ * waiting on Nagle; the 256 KiB buffers are the phone's share of the live
+ * latency budget — a default multi-megabyte send buffer silently holds
+ * seconds of camera frames when the path is slow, and the viewer watches
+ * the past. Bounded here, backpressure reaches the frame queue (and the
+ * adaptive bitrate) within a few hundred milliseconds instead. Best-effort
+ * per socket: a stack that refuses a buffer size keeps its default rather
+ * than failing the connection.
  */
 private class NoDelaySocketFactory : SocketFactory() {
 
     private val delegate: SocketFactory = SocketFactory.getDefault()
 
-    private fun Socket.withNoDelay(): Socket = apply { tcpNoDelay = true }
+    private fun Socket.tuned(): Socket = apply {
+        tcpNoDelay = true
+        runCatching { sendBufferSize = LIVE_SOCKET_BUFFER_BYTES }
+        runCatching { receiveBufferSize = LIVE_SOCKET_BUFFER_BYTES }
+    }
 
-    override fun createSocket(): Socket = delegate.createSocket().withNoDelay()
+    override fun createSocket(): Socket = delegate.createSocket().tuned()
 
     override fun createSocket(host: String, port: Int): Socket =
-        delegate.createSocket(host, port).withNoDelay()
+        delegate.createSocket(host, port).tuned()
 
     override fun createSocket(host: String, port: Int, localHost: InetAddress, localPort: Int): Socket =
-        delegate.createSocket(host, port, localHost, localPort).withNoDelay()
+        delegate.createSocket(host, port, localHost, localPort).tuned()
 
     override fun createSocket(host: InetAddress, port: Int): Socket =
-        delegate.createSocket(host, port).withNoDelay()
+        delegate.createSocket(host, port).tuned()
 
     override fun createSocket(address: InetAddress, port: Int, localAddress: InetAddress, localPort: Int): Socket =
-        delegate.createSocket(address, port, localAddress, localPort).withNoDelay()
+        delegate.createSocket(address, port, localAddress, localPort).tuned()
+
+    private companion object {
+        const val LIVE_SOCKET_BUFFER_BYTES = 256 * 1024
+    }
 }

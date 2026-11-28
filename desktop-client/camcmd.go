@@ -37,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -476,9 +477,42 @@ func camWSPump(ctx context.Context, sess *requesterSession, requestID string, de
 }
 
 // camStreamClient has no timeout on purpose: a connected stream legitimately
-// runs for hours, and each rendezvous attempt is bounded by the relay's own
-// 504. The request context cancels the dial when the command ends.
-var camStreamClient = &http.Client{}
+// camStreamClient is the receiver's dedicated client. It never times out: a
+// session runs for hours, and each rendezvous attempt is bounded by the
+// relay's own 504. The request context cancels the dial when the command
+// ends. The dialer bounds both socket buffers: a default multi-megabyte
+// receive buffer silently stages seconds of camera frames in the kernel
+// when the reader falls behind, and the viewer watches the past. 256 KiB
+// keeps the desktop's share of the live latency budget under half a second
+// at stream bitrates, matching the relay's low-latency pipe and the
+// phone's bounded send buffer.
+var camStreamClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := &net.Dialer{
+				Control: func(network, address string, c syscall.RawConn) error {
+					_ = c.Control(func(fd uintptr) {
+						setCamSocketBuffers(int(fd))
+					})
+					return nil
+				},
+			}
+			conn, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				_ = tcp.SetNoDelay(true)
+			}
+			return conn, nil
+		},
+	},
+}
+
+// camSocketBufferBytes bounds the receiver's kernel socket queue. Best
+// effort: a stack that refuses the size keeps its default rather than
+// failing the connection.
+const camSocketBufferBytes = 256 * 1024
 
 // camPipeURL is the desktop's receiver address on the relay's existing /pipe
 // endpoint; transfer_id is the derived camera session id.

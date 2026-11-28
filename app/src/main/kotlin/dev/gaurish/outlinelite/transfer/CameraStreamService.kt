@@ -365,6 +365,7 @@ class CameraStreamService : Service() {
         targetBitrate.set(bitrate)
         currentBitrate.set(bitrate)
         cleanWrites.set(0)
+        lastSyncRequestFrame = 0L
         val thread = HandlerThread("gaur-camera-encoder").apply { start() }
         encoderThread = thread
         val handler = Handler(thread.looper)
@@ -448,14 +449,19 @@ class CameraStreamService : Service() {
     /** Paces one encoded frame into the bounded queue; drops on a full queue. */
     private fun enqueueFrame(frame: ByteArray) {
         if (frameQueue.trySend(frame).isFailure) {
-            // The socket is behind; drop this frame and ask the encoder for
-            // an IDR so the receiver resynchronizes on the next frame. The
-            // dropped frame never reaches the writer, so it never consumes
-            // a frame index.
-            runCatching {
-                codec?.setParameters(
-                    Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) },
-                )
+            // The socket is behind; drop this frame. The receiver needs a
+            // keyframe to resynchronize — but asking for one on EVERY drop
+            // is an IDR storm that multiplies the wire rate exactly when
+            // the path is already saturated, so at most one request per
+            // SYNC_REQUEST_FRAME_GAP frames (~0.5 s at 30 fps).
+            val sent = sentFrames.get()
+            if (sent - lastSyncRequestFrame >= SYNC_REQUEST_FRAME_GAP) {
+                lastSyncRequestFrame = sent
+                runCatching {
+                    codec?.setParameters(
+                        Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) },
+                    )
+                }
             }
             // Backpressure is also the congestion signal: the socket could
             // not keep up with this frame, so the bitrate steps down before
@@ -463,6 +469,10 @@ class CameraStreamService : Service() {
             adaptiveStepDown()
         }
     }
+
+    /** Frame index of the last forced sync request; guards the IDR storm. */
+    @Volatile
+    private var lastSyncRequestFrame = 0L
 
     // ------------------------------------------------ adaptive bitrate
 
@@ -1050,6 +1060,9 @@ class CameraStreamService : Service() {
 
         /** Clean writes before the ladder steps back up (~1 s at 30 fps). */
         private const val ADAPTIVE_RECOVERY_FRAMES = 90
+
+        /** Minimum frames between forced sync requests; caps the IDR storm. */
+        private const val SYNC_REQUEST_FRAME_GAP = 15
 
         private val OCTET_STREAM: MediaType = "application/octet-stream".toMediaType()
 
